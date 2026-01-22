@@ -5,7 +5,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import 'xterm/css/xterm.css';
 
-// 簡易的なID生成
 function generateId(): string {
   return Math.random().toString(36).substring(2, 15);
 }
@@ -14,9 +13,9 @@ export class RobsidianTerminal {
   private term: Terminal;
   private fitAddon: FitAddon;
   private container: HTMLElement;
-  private ptyId: string;
+  public ptyId: string; // IDは外部から参照したいのでpublicに
   private unlistenFn: UnlistenFn | null = null;
-  private resizeObserver: ResizeObserver; // 追加
+  private resizeObserver: ResizeObserver;
 
   constructor(parentId: string) {
     const parent = document.getElementById(parentId);
@@ -25,17 +24,24 @@ export class RobsidianTerminal {
     this.ptyId = generateId();
 
     this.container = document.createElement('div');
-    this.container.className = 'terminal-instance'; 
+    this.container.className = 'terminal-instance';
+    // 初期状態は非表示にする（タブ切り替えで表示するため）
+    this.container.style.display = 'none';
+    this.container.style.width = '100%';
+    this.container.style.height = '100%';
     parent.appendChild(this.container);
 
     this.term = new Terminal({
       cursorBlink: true,
       fontFamily: '"JetBrains Mono", "Fira Code", Consolas, monospace',
       fontSize: 14,
-      lineHeight: 1.2, // 行間を少し調整
-      background: '#1e1e1e',
-      foreground: '#d4d4d4',
-      cursor: '#aeafad',
+      lineHeight: 1.2,
+      // ★修正: themeオブジェクトの中に色設定を入れる
+      theme: {
+        background: '#1e1e1e',
+        foreground: '#d4d4d4',
+        cursor: '#aeafad',
+      },
       allowProposedApi: true,
     });
 
@@ -44,23 +50,37 @@ export class RobsidianTerminal {
     
     this.term.open(this.container);
     
-    // ★修正: ResizeObserverを使って、コンテナのサイズ変化を完璧に検知する
     this.resizeObserver = new ResizeObserver(() => {
-        // サイズ変更を検知したらFitを実行
-        this.fit();
+        // 表示されているときだけfitする
+        if (this.container.style.display !== 'none') {
+            this.fit();
+        }
     });
     this.resizeObserver.observe(this.container);
 
-    // Backend接続
     this.initBackend();
   }
 
-  // サイズ合わせ処理を切り出し
+  // ★追加: 表示切替
+  public show() {
+    this.container.style.display = 'block';
+    this.fit();
+    this.term.focus();
+  }
+
+  // ★追加: 表示切替
+  public hide() {
+    this.container.style.display = 'none';
+  }
+
+  // ★追加: フォーカス用ラッパー (private termへのアクセスのため)
+  public focus() {
+    this.term.focus();
+  }
+
   public fit() {
     try {
         this.fitAddon.fit();
-        // Backendにも新しいサイズを通知 (ここが重要！)
-        // fitAddon.proposeDimensions() で計算された列数・行数を取得
         const dims = this.fitAddon.proposeDimensions();
         if (dims && !isNaN(dims.cols) && !isNaN(dims.rows)) {
             invoke('resize_terminal', {
@@ -71,6 +91,18 @@ export class RobsidianTerminal {
         }
     } catch (e) {
         console.error("Fit error:", e);
+    }
+  }
+
+  public async sendInput(data: string) {
+    try {
+      await invoke('write_to_terminal', { 
+        id: this.ptyId, 
+        data: data 
+      });
+      this.term.focus();
+    } catch (e) {
+      console.error("Failed to send input:", e);
     }
   }
 
@@ -87,7 +119,6 @@ export class RobsidianTerminal {
         }).catch(err => console.error('Failed to write to pty:', err));
       });
 
-      // xterm内でのリサイズイベント（念の為残す）
       this.term.onResize((size: { cols: number, rows: number }) => {
         invoke('resize_terminal', {
           id: this.ptyId,
@@ -100,12 +131,7 @@ export class RobsidianTerminal {
       
       console.log(`Robsidian Terminal (${this.ptyId}) Connected.`);
       
-      // 初期サイズ合わせとフォーカス
-      setTimeout(() => {
-          this.fit();
-          this.term.focus();
-      }, 200);
-
+      // 生成直後は表示されないかもしれないので、show()でfitさせる
     } catch (e) {
       this.term.writeln(`\r\n\x1b[31mFailed to initialize terminal: ${e}\x1b[0m`);
       console.error(e);
@@ -114,7 +140,7 @@ export class RobsidianTerminal {
 
   public destroy() {
     if (this.unlistenFn) this.unlistenFn();
-    this.resizeObserver.disconnect(); // 監視停止
+    this.resizeObserver.disconnect();
     this.term.dispose();
     this.container.remove();
   }
