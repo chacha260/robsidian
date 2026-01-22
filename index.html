@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Robsidian</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body class="bg-gray-900 text-white overflow-hidden h-screen flex flex-col">
+    
+    <div id="app">
+      <div id="main-layout">
+      
+        <div id="activity-bar">
+            <button id="btn-toggle-sidebar" class="ribbon-btn" title="Toggle Sidebar">◫</button>
+            <div style="height: 10px;"></div> <button id="btn-open-vault" class="ribbon-btn" title="Open Vault">📂</button>
+            
+            <div class="spacer"></div>
+
+            <button id="btn-settings" class="ribbon-btn" title="Settings">⚙️</button>
+        </div>
+
+        <div id="sidebar-area">
+          
+          <div class="sidebar-header">
+            <div class="path-container">
+                <span id="path-display">ROOT</span>
+                <button id="btn-up" title="Up directory">⬆</button>
+            </div>
+            
+            <div class="sidebar-actions">
+                <button id="btn-new-file" title="New File">📄+</button>
+                <button id="btn-new-dir" title="New Folder">📁+</button>
+                <button id="btn-split" title="Split Pane">◫ Split</button>
+            </div>
+          </div>
+          
+          <div class="search-container">
+              <input type="text" id="input-search" placeholder="🔍 Search..." autocomplete="off">
+          </div>
+  
+          <ul id="file-list"></ul>
+        </div>
+  
+        <div id="resizer"></div>
+  
+        <div class="main-content">
+            <div id="panes-container"></div>
+
+            <div id="terminal-wrapper">
+                <div id="term-resizer"></div>
+                <div id="terminal-tabs">
+                    <div id="tabs-container"></div>
+                    <button id="btn-add-tab" title="New Terminal">+</button>
+                </div>
+                <div id="terminal-container"></div>
+            </div>
+        </div>
+  
+        <div id="context-menu">
+          <button id="menu-rename">✏ Rename</button>
+          <button id="menu-delete" class="danger">🗑 Delete</button>
+        </div>
+  
+        <div id="settings-modal">
+          <div class="modal-content">
+            <div class="modal-header">Settings</div>
+            
+            <div class="form-group">
+              <label>Font Family</label>
+              <div id="display-current-font" class="current-value"></div>
+              <input type="text" id="input-font" list="font-list" placeholder="🔍 Search or type new font name..." autocomplete="off">
+              <datalist id="font-list"></datalist>
+            </div>
+
+            <div class="form-group">
+                <label>Font Size (px): <span id="val-font-size">14</span></label>
+                <input type="range" id="input-font-size" min="10" max="32" step="1" value="14">
+            </div>
+
+            <div class="form-group">
+                <label>Line Height: <span id="val-line-height">1.5</span></label>
+                <input type="range" id="input-line-height" min="1.0" max="3.0" step="0.1" value="1.5">
+            </div>
+            
+            <div class="form-group">
+              <label>Theme</label>
+              <button id="btn-toggle-theme" style="width: 100%; text-align: center; padding: 10px;">Switch to Light Mode ☀</button>
+            </div>
+            
+            <div class="form-group" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+                <label style="color: #ff6b6b;">Danger Zone</label>
+                <button id="btn-reset-layout" style="width: 100%; text-align: center; padding: 10px; background-color: #3f1a1a; color: #ff6b6b; border: 1px solid #ff6b6b;">
+                    ⚠️ Reset Layout & Cache
+                </button>
+            </div>
+
+            <div class="modal-footer">
+              <button id="btn-close-settings">Close</button>
+              <button id="btn-save-settings" class="primary">Save</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
