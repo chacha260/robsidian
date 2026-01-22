@@ -1,4 +1,5 @@
 mod terminal;
+mod search;
 
 use std::process::Command;
 use std::fs;
@@ -128,6 +129,7 @@ fn open_in_helix(path: String) -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(terminal::TerminalState::new())
@@ -143,7 +145,8 @@ pub fn run() {
             get_available_fonts,
             terminal::create_terminal,
             terminal::write_to_terminal,
-            terminal::resize_terminal
+            terminal::resize_terminal,
+            search::search_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
