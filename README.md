@@ -1,154 +1,191 @@
-# まずは以下を読んで、セットアップを行ってから、本リポジトリのファイルで上書きをしていってください!!
+# Robsidian 💎
 
----
+**Robsidian** は、Obsidianの拡張性と、Helix / NuShell のパワーを融合させた、Rust + Tauri 製の次世代ノートテイキングアプリです。
+「見た目はObsidian、中身はハッカー仕様」をコンセプトに、軽量かつ強力なプラグインシステムを備えています。
 
-# Tauri + Vanilla TS
+## 🚀 開発環境のセットアップ (Development Setup)
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Typescript.
+Robsidian自体のビルドや開発を行うための手順です。
 
-## Recommended IDE Setup
+### 前提条件 (Prerequisites)
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
----
+* **Node.js**
+* **Rust / Cargo** (最新版)
+* **Tauri CLI** (`npm install -g @tauri-apps/cli`)
+* **WebView2** (Windowsの場合)
 
-# 🛠️ Robsidian 開発環境セットアップガイド (Windows / GCC版)
+### インストール (Installation)
 
-このガイドでは、Visual Studio (MSVC) を使用せず、**GCC (MinGW-w64)** を用いて Robsidian (Tauri v2 + Rust) を開発するための環境構築手順を説明します。
+リポジトリをクローンした後、依存関係をインストールします。
 
-## 1. GCC (MinGW-w64) のインストール
-
-Rust の GNU ツールチェーンを動作させるために、GCC コンパイラを含む MinGW-w64 をインストールします。
-
-### 推奨: パッケージマネージャー (Scoop) を使う場合
-
-管理者権限が不要で、環境汚染が少ない **Scoop** を使うと管理が楽です。
-
-1. PowerShell で Scoop をインストール（未導入の場合）:
-```powershell
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-irm get.scoop.sh | iex
-```
-
-
-2. GCC をインストール:
-```powershell
-scoop install gcc
-```
-
-
-3. インストール確認:
-```powershell
-gcc --version
-```
-
-
-
-### 代替案: 手動でインストールする場合 (Zip解凍)
-
-インターネット接続制限などで Scoop が使えない場合は、手動で配置します。
-
-1. [WinLibs for MinGW-w64](https://winlibs.com/) などの配布サイトから、**UCRT runtime** 版の Zip ファイル（例: `GCC 13.x.x + MinGW-w64 ...`）をダウンロードします。
-2. 任意の場所（例: `C:\mingw64`）に解凍します。
-3. `bin` フォルダ（例: `C:\mingw64\bin`）をユーザー環境変数の **PATH** に追加します。
-4. ターミナルを再起動し、`gcc --version` で確認します。
-
-## 2. Rust のインストール (GNU Toolchain)
-
-デフォルトの MSVC ではなく、**GNU (GCC)** 向けの Rust 環境を構築します。
-
-1. [rustup.rs](https://rustup.rs/) から `rustup-init.exe` をダウンロードして実行します。
-2. 画面に選択肢が表示されたら、`2` (Customize installation) を入力して Enter を押します。
-3. **Default host triple?** と聞かれるので、以下を入力して Enter を押します（ここが最重要です）。
-```text
-x86_64-pc-windows-gnu
-```
-
-4. 残りの質問（toolchain, profile, modify PATH）はデフォルトのままで Enter を押して進めます。
-5. インストール完了後、ターミナルを再起動して以下を確認します。
-
-```powershell
-rustc --version
-# 出力に (xxxx-xx-xx) だけでなく windows-gnu が含まれている、
-# または `rustup show` で `stable-x86_64-pc-windows-gnu` が active になっていることを確認
-```
-
-> **既にRustをインストール済みの場合:**
-> 以下のコマンドで GNU 版に切り替えられます。
-> ```powershell
-> rustup toolchain install stable-x86_64-pc-windows-gnu
-> rustup default stable-x86_64-pc-windows-gnu
-> ```
-
-
-## 3. Node.js のインストール
-
-フロントエンドのビルドに必要です。
-
-1. [Node.js 公式サイト](https://nodejs.org/) から **LTS版** をダウンロードしてインストールします。
-2. 確認:
-```powershell
-node -v
-npm -v
-```
-
-## 4. WebView2 ランタイムの確認
-
-Tauri は Windows の UI 描画に Edge (WebView2) を使用します。
-Windows 10/11 であれば通常は標準搭載されていますが、サーバーOSや軽量化版OSを使用している場合は、[WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) のインストールが必要になる場合があります。
-
-## 5. エディタの設定 (VS Code)
-
-Visual Studio IDE は不要ですが、コードエディタとして VS Code は推奨されます。
-
-* 必須拡張機能:
-* **rust-analyzer**: GCC環境でも問題なく動作し、強力な補完を提供します。
-
-
-
-## 6. プロジェクトの動作確認
-
-### 依存関係のインストール
-
-プロジェクトフォルダで実行します。
-
-```powershell
+```bash
 npm install
 ```
 
-### 開発サーバーの起動
+### 開発モードでの実行 (Run in Development Mode)
 
-GCC 環境でコンパイルと起動を行います。
+ホットリロード対応の開発サーバーを立ち上げます。
 
-```powershell
-cargo tauri dev
+```bash
+npm run tauri dev
+
 ```
 
-> **注意点:**
-> GCC (GNU) ビルドは、MSVC ビルドに比べてコンパイル後のバイナリサイズが若干大きくなる傾向がありますが、機能的な差はありません。また、初回ビルド時に `cc` クレートなどが `gcc.exe` を使用して C 言語依存ライブラリをコンパイルします。
+### ビルド (Build for Production)
 
-### アイコンの適用
-- `app-icon.png`をアイコンにしたい場合、以下のコマンドを実行してからビルドを行ってください。
-```powershell
-cargo tauri icon ./app-icon.png
+配布用の実行ファイル（`.exe` や `.dmg`）を生成します。
+
+```bash
+cargo tauri build
+# または
+npm run tauri build
 ```
 
 ---
 
-### 💡 GCC環境でのトラブルシューティング
+## 🧩 拡張機能の作成ガイド (Extension Guide)
 
-* **`CreateProcess error=2, The system cannot find the file specified`**:
-* `gcc` コマンドへのパスが通っていません。環境変数 PATH を確認してください。
+Robsidianは **「機能プラグイン」** と **「外観テーマ」** の2種類の拡張に対応しています。
+これらは現在開いているVault（フォルダ）の中にある `.robsidian` フォルダで管理されます。
 
+### 📂 フォルダ構成
 
-* **リンクエラー (`ld: cannot find -lxxxx`)**:
-* システムライブラリが見つからない場合に発生します。通常の Tauri アプリ開発では稀ですが、MinGW-w64 のバージョンや種類（Mingw-builds, WinLibs, MSYS2等）を変えると解決することがあります。
+Vaultのルートに以下のフォルダを作成してください。
 
+```text
+[Vault Root]
+  └─ .robsidian
+       ├─ plugins/       <-- 機能プラグイン用
+       │    └─ my-plugin/
+       │         ├─ manifest.json
+       │         └─ main.js
+       │
+       └─ themes/        <-- テーマ用
+            └─ my-theme/
+                 ├─ manifest.json
+                 └─ styles.css
 
-* **実行時に `libgcc_s_seh-1.dll` 等が見つからないと言われる**:
-* ビルドされた `.exe` を配布する際、MinGW の DLL が必要になる場合があります。これを避けるには、`Cargo.toml` や `.cargo/config` に静的リンクの設定を追加する必要があります（開発中はPATHが通っていれば問題ありません）。
-
-
+```
 
 ---
 
-これで、Visual Studio レスな「完全 GCC 環境」での開発準備は完了です！
+### 1. テーマの作成 (Creating Themes)
+
+テーマはCSS変数（Custom Properties）を上書きすることで適用されます。
+
+**manifest.json:**
+
+```json
+{
+    "id": "ocean-dark",
+    "name": "Ocean Dark Theme",
+    "version": "1.0.0",
+    "type": "theme",
+    "description": "Deep blue theme inspired by the ocean.",
+    "author": "Your Name"
+}
+
+```
+
+**styles.css:**
+
+```css
+:root {
+    /* 必須のオーバーライド変数 */
+    --bg-main: #0f172a;       /* メイン背景色 */
+    --bg-sidebar: #1e293b;    /* サイドバー背景色 */
+    --text-main: #f1f5f9;     /* メイン文字色 */
+    --text-muted: #94a3b8;    /* 薄い文字色 */
+    --border-color: #334155;  /* ボーダー色 */
+    --accent-color: #38bdf8;  /* アクセントカラー */
+    --active-item-bg: #1e293b;/* 選択中のアイテム背景 */
+}
+
+```
+
+---
+
+### 2. プラグインの作成 (Creating Plugins)
+
+JavaScriptを使ってアプリの機能を拡張できます。
+
+**manifest.json:**
+
+```json
+{
+    "id": "daily-calendar",
+    "name": "Daily Calendar",
+    "version": "1.0.0",
+    "type": "plugin",
+    "description": "Adds a calendar for managing daily notes.",
+    "main": "main.js"
+}
+
+```
+
+**main.js の基本構造:**
+
+```javascript
+return {
+    // ロード時に呼ばれる
+    async onload(app) {
+        console.log("Plugin loaded!");
+        
+        // 設定の読み込み
+        const settings = await app.plugin.loadData();
+
+        // 設定画面の追加
+        app.plugin.addSettingTab("My Plugin", (container) => {
+            container.innerHTML = "<h3>Settings</h3>";
+            // ...設定UIの構築
+        });
+    },
+
+    // アンロード時（無効化時）に呼ばれる
+    onunload() {
+        console.log("Plugin unloaded!");
+        // イベントリスナーの解除やDOMの削除を行う
+    }
+}
+
+```
+
+### 🛠️ Robsidian API (`window.app`)
+
+プラグインからは `app` 引数を通じて以下の機能にアクセスできます。
+
+#### `app.vault` (ファイル操作)
+
+* `read(path)`: ファイルの内容をテキストとして読み込む。
+* `write(path, content)`: ファイルにテキストを書き込む（上書き）。
+* `create(path)`: 空のファイルを作成する。
+* `createDir(path)`: フォルダを作成する。
+* `delete(path)`: ファイルまたはフォルダを削除する。
+* `rename(oldPath, newPath)`: ファイル名変更または移動。
+* `list(folderPath)`: 指定フォルダ内のファイル一覧を取得。
+* `exists(path)`: ファイルの存在確認（簡易実装）。
+* `getResourcePath(path)`: 画像表示用のローカルパスを取得。
+
+#### `app.workspace` (画面操作)
+
+* `openFile(path)`: 指定したパスのファイルをエディタで開く。
+* `openTerminal(title, command)`: 新しいターミナルタブを開く。
+* `split()`: ペインを分割する。
+
+#### `app.plugin` (設定管理)
+
+* `loadData()`: プラグイン固有の保存された設定データを取得。
+* `saveData(data)`: 設定データを保存（永続化）。
+* `addSettingTab(name, handler)`: 設定画面に専用タブを追加する。
+
+#### `app.utils` (ユーティリティ)
+
+* `notice(message)`: 画面右上にトースト通知を表示する。
+* `clipboardWrite(text)`: クリップボードにコピー。
+
+---
+
+### 📝 Tips
+
+* **開発中のデバッグ**: アプリ上で `F12` キーを押すと DevTools が開き、`console.log` の内容やDOM構造を確認できます。
+* **パスの区切り文字**: WindowsとMac/Linuxの互換性のため、パス結合時は `app.vault.root.includes("/") ? "/" : "\\"` のようにセパレータを判定することを推奨します。

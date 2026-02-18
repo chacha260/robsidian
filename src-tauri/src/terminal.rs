@@ -34,10 +34,12 @@ impl TerminalState {
 #[tauri::command]
 pub async fn create_terminal(
     id: String,
+    shell: Option<String>, // 追加
     app_handle: AppHandle,
     state: tauri::State<'_, TerminalState>,
 ) -> Result<(), String> {
-    match spawn_pty_process(id, app_handle, state) {
+    // spawn_pty_process に shell を渡す
+    match spawn_pty_process(id, shell, app_handle, state) {
         Ok(_) => Ok(()),
         Err(e) => Err(format!("Failed to create terminal: {}", e)),
     }
@@ -87,6 +89,7 @@ pub async fn resize_terminal(
 
 fn spawn_pty_process(
     id: String,
+    shell: Option<String>,
     app_handle: AppHandle,
     state: tauri::State<'_, TerminalState>,
 ) -> Result<()> {
@@ -101,10 +104,17 @@ fn spawn_pty_process(
     }).context("Failed to open PTY")?;
 
     // 2. シェルコマンドの決定
-    #[cfg(target_os = "windows")]
-    let cmd = CommandBuilder::new("powershell.exe");
-    #[cfg(not(target_os = "windows"))]
-    let cmd = CommandBuilder::new("bash");
+    let cmd = if let Some(custom_shell) = shell.filter(|s| !s.trim().is_empty()) {
+        // 設定があればそれを使う
+        CommandBuilder::new(custom_shell)
+    } else {
+        // 設定がなければOSのデフォルト
+        #[cfg(target_os = "windows")]
+        let cmd = CommandBuilder::new("powershell.exe");
+        #[cfg(not(target_os = "windows"))]
+        let cmd = CommandBuilder::new("bash");
+        cmd
+    };
 
     // 3. 子プロセス起動
     let _child = pair.slave.spawn_command(cmd).context("Failed to spawn shell")?;

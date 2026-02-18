@@ -12,31 +12,28 @@ function generateId(): string {
 export class RobsidianTerminal {
   private term: Terminal;
   private fitAddon: FitAddon;
-  private container: HTMLElement;
-  public ptyId: string; // IDは外部から参照したいのでpublicに
+  public container: HTMLElement; // 外部からアクセス可能にする
+  public ptyId: string;
   private unlistenFn: UnlistenFn | null = null;
   private resizeObserver: ResizeObserver;
 
-  constructor(parentId: string) {
-    const parent = document.getElementById(parentId);
-    if (!parent) throw new Error(`Parent element ${parentId} not found`);
-
+  // コンストラクタ引数から parentId を削除
+  constructor() {
     this.ptyId = generateId();
 
+    // コンテナ作成（親にはまだ追加しない）
     this.container = document.createElement('div');
     this.container.className = 'terminal-instance';
-    // 初期状態は非表示にする（タブ切り替えで表示するため）
-    this.container.style.display = 'none';
     this.container.style.width = '100%';
     this.container.style.height = '100%';
-    parent.appendChild(this.container);
+    // 背景色を明示（チラつき防止）
+    this.container.style.backgroundColor = '#1e1e1e';
 
     this.term = new Terminal({
       cursorBlink: true,
-      fontFamily: '"JetBrains Mono", "Fira Code", Consolas, monospace',
+      fontFamily: '"HackGen", "Fira Code", Consolas, monospace',
       fontSize: 14,
       lineHeight: 1.2,
-      // ★修正: themeオブジェクトの中に色設定を入れる
       theme: {
         background: '#1e1e1e',
         foreground: '#d4d4d4',
@@ -48,11 +45,13 @@ export class RobsidianTerminal {
     this.fitAddon = new FitAddon();
     this.term.loadAddon(this.fitAddon);
     
+    // コンテナにxtermを開く
     this.term.open(this.container);
     
+    // リサイズ監視
     this.resizeObserver = new ResizeObserver(() => {
-        // 表示されているときだけfitする
-        if (this.container.style.display !== 'none') {
+        // DOMに接続されていて表示されている場合のみFit
+        if (this.container.isConnected && this.container.offsetParent !== null) {
             this.fit();
         }
     });
@@ -61,21 +60,21 @@ export class RobsidianTerminal {
     this.initBackend();
   }
 
-  // ★追加: 表示切替
-  public show() {
-    this.container.style.display = 'block';
-    this.fit();
-    this.term.focus();
+  // ★重要: 指定された要素に自身をアタッチする
+  public attachTo(parent: HTMLElement) {
+    parent.appendChild(this.container);
+    // レンダリング待ちをしてからfit
+    requestAnimationFrame(() => {
+        this.fit();
+        this.term.focus();
+    });
   }
 
-  // ★追加: 表示切替
-  public hide() {
-    this.container.style.display = 'none';
-  }
-
-  // ★追加: フォーカス用ラッパー (private termへのアクセスのため)
-  public focus() {
-    this.term.focus();
+  // ★重要: 親から自身を切り離す（インスタンスは破棄しない）
+  public detach() {
+    if (this.container.parentElement) {
+        this.container.parentElement.removeChild(this.container);
+    }
   }
 
   public fit() {
@@ -90,7 +89,7 @@ export class RobsidianTerminal {
             }).catch(console.error);
         }
     } catch (e) {
-        console.error("Fit error:", e);
+        // console.warn("Fit skipped:", e);
     }
   }
 
@@ -127,14 +126,19 @@ export class RobsidianTerminal {
         }).catch(err => console.error('Resize failed:', err));
       });
 
-      await invoke('create_terminal', { id: this.ptyId });
+      // ★修正: localStorageからシェル設定を取得して渡す
+      const savedShell = localStorage.getItem("robsidian-shell-path") || "";
       
-      console.log(`Robsidian Terminal (${this.ptyId}) Connected.`);
+      // 第2引数 shell を追加
+      await invoke('create_terminal', { 
+          id: this.ptyId,
+          shell: savedShell 
+      });
+      // 初期化完了後、少し待ってからFit（タイミング問題回避）
+      setTimeout(() => this.fit(), 100);
       
-      // 生成直後は表示されないかもしれないので、show()でfitさせる
     } catch (e) {
       this.term.writeln(`\r\n\x1b[31mFailed to initialize terminal: ${e}\x1b[0m`);
-      console.error(e);
     }
   }
 

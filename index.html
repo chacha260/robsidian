@@ -2,108 +2,257 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="stylesheet" href="./src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Robsidian</title>
-    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
   </head>
-  <body class="bg-gray-900 text-white overflow-hidden h-screen flex flex-col">
-    
+
+  <body>
     <div id="app">
-      <div id="main-layout">
-      
-        <div id="activity-bar">
-            <button id="btn-toggle-sidebar" class="ribbon-btn" title="Toggle Sidebar">◫</button>
-            <div style="height: 10px;"></div> <button id="btn-open-vault" class="ribbon-btn" title="Open Vault">📂</button>
-            
-            <div class="spacer"></div>
-
-            <button id="btn-settings" class="ribbon-btn" title="Settings">⚙️</button>
-        </div>
-
-        <div id="sidebar-area">
-          
-          <div class="sidebar-header">
-            <div class="path-container">
-                <span id="path-display">ROOT</span>
-                <button id="btn-up" title="Up directory">⬆</button>
-            </div>
-            
-            <div class="sidebar-actions">
-                <button id="btn-new-file" title="New File">📄+</button>
-                <button id="btn-new-dir" title="New Folder">📁+</button>
-                <button id="btn-split" title="Split Pane">◫ Split</button>
-            </div>
-          </div>
-          
-          <div class="search-container">
-              <input type="text" id="input-search" placeholder="🔍 Search..." autocomplete="off">
-          </div>
-  
-          <ul id="file-list"></ul>
-        </div>
-  
-        <div id="resizer"></div>
-  
-        <div class="main-content">
-            <div id="panes-container"></div>
-
-            <div id="terminal-wrapper">
-                <div id="term-resizer"></div>
-                <div id="terminal-tabs">
-                    <div id="tabs-container"></div>
-                    <button id="btn-add-tab" title="New Terminal">+</button>
-                </div>
-                <div id="terminal-container"></div>
-            </div>
-        </div>
-  
-        <div id="context-menu">
-          <button id="menu-rename">✏ Rename</button>
-          <button id="menu-delete" class="danger">🗑 Delete</button>
-        </div>
-  
-        <div id="settings-modal">
-          <div class="modal-content">
-            <div class="modal-header">Settings</div>
-            
-            <div class="form-group">
-              <label>Font Family</label>
-              <div id="display-current-font" class="current-value"></div>
-              <input type="text" id="input-font" list="font-list" placeholder="🔍 Search or type new font name..." autocomplete="off">
-              <datalist id="font-list"></datalist>
-            </div>
-
-            <div class="form-group">
-                <label>Font Size (px): <span id="val-font-size">14</span></label>
-                <input type="range" id="input-font-size" min="10" max="32" step="1" value="14">
-            </div>
-
-            <div class="form-group">
-                <label>Line Height: <span id="val-line-height">1.5</span></label>
-                <input type="range" id="input-line-height" min="1.0" max="3.0" step="0.1" value="1.5">
-            </div>
-            
-            <div class="form-group">
-              <label>Theme</label>
-              <button id="btn-toggle-theme" style="width: 100%; text-align: center; padding: 10px;">Switch to Light Mode ☀</button>
-            </div>
-            
-            <div class="form-group" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-color);">
-                <label style="color: #ff6b6b;">Danger Zone</label>
-                <button id="btn-reset-layout" style="width: 100%; text-align: center; padding: 10px; background-color: #3f1a1a; color: #ff6b6b; border: 1px solid #ff6b6b;">
-                    ⚠️ Reset Layout & Cache
-                </button>
-            </div>
-
-            <div class="modal-footer">
-              <button id="btn-close-settings">Close</button>
-              <button id="btn-save-settings" class="primary">Save</button>
-            </div>
+      <div id="sidebar">
+        <div class="sidebar-header">
+          <div class="vault-name" id="path-display">NO VAULT</div>
+          <div class="sidebar-actions">
+            <button id="btn-open-vault" title="Open Vault">📂</button>
+            <button id="btn-settings" title="Settings">⚙️</button>
           </div>
         </div>
 
+        <div class="file-actions" style="padding: 10px; display: flex; gap: 5px;">
+            <button id="btn-new-file" style="flex:1;">📄 New Note</button>
+            <button id="btn-new-dir" style="flex:1;">📁 New Folder</button>
+        </div>
+
+        <div class="search-box">
+            <input type="text" id="input-search" placeholder="Search files...">
+        </div>
+
+        <div class="file-explorer">
+            <div class="nav-header">
+                <button id="btn-up" disabled>⬆ Up</button>
+                <span style="font-size: 0.8em; color: #666; margin-left: auto;">Files</span>
+            </div>
+            <ul id="file-list"></ul>
+        </div>
       </div>
+
+      <div id="resizer"></div>
+
+      <div id="panes-container"></div>
     </div>
-    <script type="module" src="/src/main.ts"></script>
+
+    <div id="context-menu" class="context-menu" style="display: none;">
+        <div class="menu-item" id="menu-rename">Rename</div>
+        <div class="menu-item delete" id="menu-delete">Delete</div>
+    </div>
+
+    <button id="btn-add-tab" class="fab" title="New Terminal Tab">+</button>
+    <button id="btn-split" class="fab sub-fab" title="Split Pane">◫</button>
+
+    <div id="settings-modal" class="modal-overlay" style="display: none;">
+        <div class="settings-window">
+          <div class="settings-sidebar">
+            <div class="settings-header">Robsidian</div>
+
+            <div class="sidebar-item active" data-target="tab-general">⚙️ General</div>
+            <div class="sidebar-item" data-target="tab-appearance">🎨 Appearance</div>
+            <div class="sidebar-item" data-target="tab-editor">📝 Editor</div>
+            <div class="sidebar-item" data-target="tab-plugins">🧩 Plugins</div>
+            <div class="sidebar-item" data-target="tab-snippets">✨ Snippets</div>
+
+            <div class="settings-footer-actions">
+                <button id="btn-close-settings" style="width: 100%;">Close</button>
+            </div>
+          </div>
+
+          <div class="settings-content">
+
+            <!-- General Tab -->
+            <div id="tab-general" class="settings-tab active">
+              <h2>General Settings</h2>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Vault Path</div>
+                  <div class="setting-desc">Current working directory for notes and files</div>
+                </div>
+                <div class="setting-control">
+                  <button id="btn-open-vault-settings">Change Vault</button>
+                </div>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Shell Path</div>
+                  <div class="setting-desc">Absolute path to shell (e.g. pwsh, bash, cmd)</div>
+                </div>
+                <div class="setting-control">
+                  <input type="text" id="input-shell-path" placeholder="System Default">
+                </div>
+              </div>
+
+              <h3>Advanced</h3>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Reset Layout</div>
+                  <div class="setting-desc">Clear all saved states, cache, and reset to defaults</div>
+                </div>
+                <div class="setting-control">
+                  <button id="btn-reset-layout" class="danger-btn">Reset App</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Appearance Tab (NEW) -->
+            <div id="tab-appearance" class="settings-tab">
+              <h2>Appearance</h2>
+
+              <h3>Theme</h3>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Base Color Scheme</div>
+                  <div class="setting-desc">Toggle between Light and Dark mode</div>
+                </div>
+                <div class="setting-control">
+                  <button id="btn-toggle-theme">Switch Theme</button>
+                </div>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Community Theme</div>
+                  <div class="setting-desc">Select a custom theme from <code>.robsidian/themes/</code></div>
+                </div>
+              </div>
+              <div id="theme-list-container" style="padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; margin-bottom: 24px; min-height: 80px; background: var(--bg-sidebar);"></div>
+
+              <h3>Font</h3>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Font Family</div>
+                  <div class="setting-desc">Font stack for interface and editor</div>
+                  <div id="display-current-font" style="font-size:0.85em; margin-top:6px; color:var(--text-muted); font-style: italic;"></div>
+                </div>
+                <div class="setting-control">
+                  <input type="text" id="input-font" placeholder="e.g., 'HackGen', sans-serif">
+                </div>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Font Size</div>
+                  <div class="setting-desc">Base font size for UI elements</div>
+                </div>
+                <div class="setting-control" style="display:flex; align-items:center; gap:12px;">
+                  <input type="range" id="input-font-size" min="10" max="24" step="1" style="min-width:150px;">
+                  <span id="val-font-size" style="min-width:50px; font-weight:600; font-family: var(--font-family-code);">14px</span>
+                </div>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Line Height</div>
+                  <div class="setting-desc">Space between lines of text</div>
+                </div>
+                <div class="setting-control" style="display:flex; align-items:center; gap:12px;">
+                  <input type="range" id="input-line-height" min="1.2" max="2.0" step="0.1" style="min-width:150px;">
+                  <span id="val-line-height" style="min-width:50px; font-weight:600; font-family: var(--font-family-code);">1.5</span>
+                </div>
+              </div>
+
+              <h3>Zoom</h3>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">UI Zoom Level</div>
+                  <div class="setting-desc">Use Ctrl+Scroll or Ctrl +/- to zoom. Current: <span id="current-zoom-display" style="font-weight:600;">100%</span></div>
+                </div>
+                <div class="setting-control">
+                  <button id="btn-reset-zoom">Reset to 100%</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Snippets Tab -->
+            <div id="tab-snippets" class="settings-tab">
+              <h2>CSS Snippets</h2>
+              <p style="color:var(--text-muted); font-size:0.9em; margin-bottom:20px;">
+                Customize markdown rendering by placing CSS files in <code>.robsidian/snippets/</code>
+              </p>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Reload Snippets</div>
+                  <div class="setting-desc">Scan the snippets folder for new CSS files</div>
+                </div>
+                <div class="setting-control">
+                  <button id="btn-reload-snippets">🔄 Reload</button>
+                </div>
+              </div>
+
+              <h3>Available Snippets</h3>
+              <div id="snippets-list-container" style="border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; min-height: 100px; background: var(--bg-sidebar);">
+                <p style="color:var(--text-muted); text-align:center;">No snippets found</p>
+              </div>
+            </div>
+
+            <!-- Editor Tab -->
+            <div id="tab-editor" class="settings-tab">
+              <h2>Editor Settings</h2>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Vim Mode</div>
+                  <div class="setting-desc">Enable Vim keybindings in the editor</div>
+                </div>
+                <div class="setting-control">
+                  <input type="checkbox" id="chk-vim-mode">
+                </div>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-info">
+                  <div class="setting-name">Line Wrapping</div>
+                  <div class="setting-desc">Wrap long lines in editor (always enabled)</div>
+                </div>
+                <div class="setting-control">
+                  <span style="color:var(--text-muted); font-size:0.9em;">Enabled</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Plugins Tab -->
+            <div id="tab-plugins" class="settings-tab">
+              <h2>Community Plugins</h2>
+              <p style="color:var(--text-muted); font-size:0.9em; margin-bottom:20px;">
+                Manage plugins installed in <code>.robsidian/plugins/</code>
+              </p>
+              <div id="plugin-list-container" style="border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; min-height: 100px; background: var(--bg-sidebar);"></div>
+            </div>
+
+          </div>
+        </div>
+    </div>
+
+    <div id="command-palette" class="modal-overlay" style="display: none;">
+        <div class="palette-window">
+            <input type="text" id="palette-input" placeholder="Type a command...">
+            <ul id="palette-list"></ul>
+        </div>
+    </div>
+
+    <div id="status-bar">
+        <div class="status-left">
+            <span id="status-mode">NORMAL</span>
+        </div>
+        <div class="status-right">
+            <span id="status-cursor">Ln 1, Col 1</span>
+            <span id="status-plugin-info"></span>
+        </div>
+    </div>
   </body>
 </html>
