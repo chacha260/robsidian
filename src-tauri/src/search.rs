@@ -1,8 +1,7 @@
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
-use walkdir::WalkDir; // 並列処理用
+use walkdir::WalkDir;
 
 #[derive(Serialize)]
 pub struct SearchResult {
@@ -13,14 +12,29 @@ pub struct SearchResult {
 }
 
 #[tauri::command]
-pub fn search_files(root_path: String, query: String) -> Vec<SearchResult> {
-    let query_lower = query.to_lowercase();
+pub fn search_files(root_path: String, query: String) -> Result<Vec<SearchResult>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
 
-    // WalkDirでファイルを列挙し、Rayonで並列処理して検索
-    let results: Vec<SearchResult> = WalkDir::new(&root_path)
+    let query_lower = query.to_lowercase();
+    let max_file_size = 5 * 1024 * 1024; // 5MB制限
+
+    // まず全エントリを収集（並列化前）
+    let entries: Vec<_> = WalkDir::new(&root_path)
+        .max_depth(10)
         .into_iter()
         .filter_map(|e| e.ok())
-        .par_bridge() // 並列イテレータに変換
+        .filter(|entry| {
+            // 早期フィルタリング: 隠しファイルをスキップ
+            let file_name = entry.file_name().to_string_lossy();
+            !file_name.starts_with('.') || file_name == "."
+        })
+        .collect();
+
+    // 並列処理でマッチング
+    let mut results: Vec<SearchResult> = entries
+        .into_par_iter()
         .filter_map(|entry| {
             let path = entry.path();
             let path_str = path.to_string_lossy().to_string();
@@ -41,22 +55,18 @@ pub fn search_files(root_path: String, query: String) -> Vec<SearchResult> {
                 });
             }
 
-            // 2. 全文検索 (ファイルの中身も探す)
+            // 2. 全文検索（ファイルのみ、サイズ制限あり）
             if !is_dir {
-                // テキストファイルっぽくないものや巨大なファイルはスキップする簡易ガード
+                // ファイルサイズチェック
                 if let Ok(metadata) = entry.metadata() {
-                    if metadata.len() > 1024 * 1024 {
+                    if metadata.len() > max_file_size {
                         return None;
-                    } // 1MB以上はスキップ
+                    }
                 }
 
                 if let Ok(content) = fs::read_to_string(path) {
-                    if let Some(idx) = content.to_lowercase().find(&query_lower) {
-                        // マッチした周辺のテキストを切り抜く
-                        let start = if idx > 20 { idx - 20 } else { 0 };
-                        let end = std::cmp::min(idx + 40, content.len());
-                        let snippet = format!("...{}...", &content[start..end].replace("\n", " "));
-
+                    if let Some(byte_idx) = content.to_lowercase().find(&query_lower) {
+                        let snippet = extract_snippet(&content, byte_idx, 30, 40);
                         return Some(SearchResult {
                             path: path_str,
                             name: file_name,
@@ -71,6 +81,46 @@ pub fn search_files(root_path: String, query: String) -> Vec<SearchResult> {
         })
         .collect();
 
-    // 結果を最大100件に制限して返す
-    results.into_iter().take(100).collect()
+    // 結果を最大100件に制限（並列処理の後）
+    results.truncate(100);
+
+    Ok(results)
+}
+/// UTF-8安全なスニペット抽出
+/// 
+/// # Arguments
+/// * `content` - 元のテキスト
+/// * `match_pos` - マッチした位置（バイト単位）
+/// * `before_chars` - マッチ位置の前に含める文字数
+/// * `after_chars` - マッチ位置の後に含める文字数
+fn extract_snippet(content: &str, match_pos: usize, before_chars: usize, after_chars: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+
+    // マッチ位置を文字インデックスに変換
+    let mut byte_count = 0;
+    let mut char_idx = 0;
+
+    for (idx, ch) in content.chars().enumerate() {
+        if byte_count >= match_pos {
+            char_idx = idx;
+            break;
+        }
+        byte_count += ch.len_utf8();
+    }
+
+    // 前後の範囲を計算
+    let start = char_idx.saturating_sub(before_chars);
+    let end = (char_idx + after_chars).min(chars.len());
+
+    // スニペットを構築
+    let snippet: String = chars[start..end].iter().collect();
+
+    // 改行をスペースに置換
+    let snippet = snippet.replace('\n', " ").replace('\r', " ");
+
+    // 前後に省略記号を追加
+    let prefix = if start > 0 { "..." } else { "" };
+    let suffix = if end < chars.len() { "..." } else { "" };
+
+    format!("{}{}{}", prefix, snippet.trim(), suffix)
 }

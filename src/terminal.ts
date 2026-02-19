@@ -63,10 +63,22 @@ export class RobsidianTerminal {
   // ★重要: 指定された要素に自身をアタッチする
   public attachTo(parent: HTMLElement) {
     parent.appendChild(this.container);
-    // レンダリング待ちをしてからfit
-    requestAnimationFrame(() => {
+
+    // 複数のタイミングでfitを試行（レンダリング遅延対策）
+    const tryFit = () => {
+      if (this.container.offsetParent !== null) {
         this.fit();
         this.term.focus();
+        return true;
+      }
+      return false;
+    };
+
+    requestAnimationFrame(() => {
+      if (!tryFit()) {
+        // 最初の試行が失敗したら再試行
+        setTimeout(tryFit, 50);
+      }
     });
   }
 

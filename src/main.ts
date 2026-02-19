@@ -1,3 +1,9 @@
+import { 
+  FileText, Search, Terminal, FilePlus, FolderPlus, 
+  ArrowUp, FolderOpen, Settings, List, Link,
+  ChevronLeft, ChevronRight, ChevronDown, ChevronUp,
+  Folder, File, X, Plus, Menu, Palette, Puzzle, Code, RotateCw
+} from 'lucide-static';
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -29,12 +35,12 @@ import "highlight.js/styles/atom-one-dark.css";
 // --- Global Variables ---
 let draggingTabState: { paneId: string; tabId: string } | null = null;
 let saveSessionTimeout: number | null = null;
-let searchTimeout: number | null = null;
 const expandedPaths = new Set<string>();
 let currentZoom = parseFloat(localStorage.getItem("robsidian-zoom") || "1.0");
 let currentFilesCache: FileEntry[] = [];
 let layoutDirection: "row" | "column" = "row";
 let isVimMode = localStorage.getItem("robsidian-vim-mode") === "true";
+let globalSidebarManager: SidebarManager | null = null;
 
 let globalPluginManager: PluginManager | null = null;
 let globalSnippetManager: SnippetManager | null = null;
@@ -43,6 +49,18 @@ let globalCommandManager: CommandManager | null = null;
 let currentPath = localStorage.getItem("robsidian-last-path") || ".";
 
 let loadFilesGlobal: (path: string) => Promise<void> = async () => {};
+
+// ★デバウンス用ヘルパー関数を追加
+function debounce<T extends (...args: any[]) => any>(
+  func: T,
+  wait: number
+): (...args: Parameters<T>) => void {
+  let timeout: number | null = null;
+  return (...args: Parameters<T>) => {
+    if (timeout) clearTimeout(timeout);
+    timeout = window.setTimeout(() => func(...args), wait);
+  };
+}
 
 // ★ デバッグ用カウンター
 let saveCounter = 0;
@@ -110,6 +128,11 @@ interface RobsidianApp {
     getResourcePath: (path: string) => string;
     exists: (path: string) => boolean;
     root: string;
+  };
+    sidebar?: { // ★追加
+    registerView: (view: SidebarView) => void;
+    showView: (side: "left" | "right", viewId: string) => void;
+    toggleSidebar: (side: "left" | "right") => void;
   };
   commands: {
     register: (command: Command) => void;
@@ -184,6 +207,262 @@ interface SavedSession {
   sidebarClosed: boolean;
   layoutDirection?: "row" | "column";
 }
+// --- Sidebar Manager ---
+interface SidebarView {
+  id: string;
+  name: string;
+  icon: string;
+  side: "left" | "right";
+  render: (container: HTMLElement) => void;
+  onShow?: () => void;
+  onHide?: () => void;
+}
+
+class SidebarManager {
+  private views: Map<string, SidebarView> = new Map();
+  private activeViews: { left: string | null; right: string | null } = {
+    left: "files",
+    right: "outline",
+  };
+
+  constructor() {
+    this.loadState();
+    this.initializeUI();
+    this.initializeToggleButtons();
+  }
+
+  private initializeToggleButtons() {
+    // 左サイドバー開閉ボタン
+    const toggleLeft = document.getElementById('toggle-sidebar-left');
+    if (toggleLeft) {
+      const iconSvg = toggleLeft.querySelector('svg');
+      if (iconSvg) {
+        this.updateToggleIcon('left');
+      }
+
+      toggleLeft.onclick = () => {
+        this.toggleSidebar('left');
+        this.updateToggleIcon('left');
+      };
+    }
+
+    // 右サイドバー開閉ボタン
+    const toggleRight = document.getElementById('toggle-sidebar-right');
+    if (toggleRight) {
+      const iconSvg = toggleRight.querySelector('svg');
+      if (iconSvg) {
+        this.updateToggleIcon('right');
+      }
+
+      toggleRight.onclick = () => {
+        this.toggleSidebar('right');
+        this.updateToggleIcon('right');
+      };
+    }
+  }
+
+  private updateToggleIcon(side: 'left' | 'right') {
+    const isClosed = document.body.classList.contains(`sidebar-${side}-closed`);
+    const button = document.getElementById(`toggle-sidebar-${side}`);
+    if (!button) return;
+
+    const iconSvg = button.querySelector('svg');
+    if (!iconSvg) return;
+
+    // アイコンの方向を決定
+    let iconName: string;
+    if (side === 'left') {
+      iconName = isClosed ? 'chevron-right' : 'chevron-left';
+    } else {
+      iconName = isClosed ? 'chevron-left' : 'chevron-right';
+    }
+
+    // アイコンを置き換え
+    const newIcon = createLucideIcon(iconName);
+    iconSvg.innerHTML = newIcon.innerHTML;
+    Array.from(newIcon.attributes).forEach((attr) => {
+      if (attr.name !== 'class') {
+        iconSvg.setAttribute(attr.name, attr.value);
+      }
+    });
+  }
+
+  public toggleSidebar(side: "left" | "right") {
+    document.body.classList.toggle(`sidebar-${side}-closed`);
+    this.updateToggleIcon(side);
+    this.saveState();
+  }
+
+  private loadState() {
+    const saved = localStorage.getItem("robsidian-sidebar-state");
+    if (saved) {
+      try {
+        const state = JSON.parse(saved);
+        this.activeViews = state.activeViews || this.activeViews;
+
+        if (state.leftClosed) document.body.classList.add("sidebar-left-closed");
+        if (state.rightClosed) document.body.classList.add("sidebar-right-closed");
+
+        if (state.leftWidth) {
+          document.documentElement.style.setProperty("--sidebar-left-width", state.leftWidth);
+        }
+        if (state.rightWidth) {
+          document.documentElement.style.setProperty("--sidebar-right-width", state.rightWidth);
+        }
+      } catch (e) {
+        console.error("Failed to load sidebar state", e);
+      }
+    }
+  }
+
+  private saveState() {
+    const state = {
+      activeViews: this.activeViews,
+      leftClosed: document.body.classList.contains("sidebar-left-closed"),
+      rightClosed: document.body.classList.contains("sidebar-right-closed"),
+      leftWidth: getComputedStyle(document.documentElement).getPropertyValue("--sidebar-left-width"),
+      rightWidth: getComputedStyle(document.documentElement).getPropertyValue("--sidebar-right-width"),
+    };
+    localStorage.setItem("robsidian-sidebar-state", JSON.stringify(state));
+  }
+
+  private initializeUI() {
+    // 左サイドバータブ
+    document.querySelectorAll("#sidebar-left .sidebar-tab").forEach((tab) => {
+      tab.addEventListener("click", (e) => {
+        const viewId = (e.target as HTMLElement).getAttribute("data-view");
+        if (viewId) this.showView("left", viewId);
+      });
+    });
+
+    // 右サイドバータブ
+    document.querySelectorAll("#sidebar-right .sidebar-tab").forEach((tab) => {
+      tab.addEventListener("click", (e) => {
+        const viewId = (e.target as HTMLElement).getAttribute("data-view");
+        if (viewId) this.showView("right", viewId);
+      });
+    });
+
+    // 右サイドバー閉じるボタン
+    const btnToggleRight = document.getElementById("btn-toggle-right");
+    if (btnToggleRight) {
+      btnToggleRight.onclick = () => this.toggleSidebar("right");
+    }
+
+    // リサイザー（左）
+    this.initResizer("left");
+    this.initResizer("right");
+  }
+
+  private initResizer(side: "left" | "right") {
+    const resizer = document.getElementById(`resizer-${side}`);
+    if (!resizer) return;
+
+    let isResizing = false;
+
+    resizer.addEventListener("mousedown", () => {
+      isResizing = true;
+      document.body.style.cursor = "col-resize";
+      resizer.classList.add("resizing");
+    });
+
+    document.addEventListener("mousemove", (e) => {
+      if (!isResizing) return;
+
+      if (side === "left") {
+        const newWidth = Math.max(200, Math.min(e.clientX, 600));
+        document.documentElement.style.setProperty("--sidebar-left-width", `${newWidth}px`);
+      } else {
+        const newWidth = Math.max(200, Math.min(window.innerWidth - e.clientX, 600));
+        document.documentElement.style.setProperty("--sidebar-right-width", `${newWidth}px`);
+      }
+    });
+
+    document.addEventListener("mouseup", () => {
+      if (isResizing) {
+        isResizing = false;
+        document.body.style.cursor = "default";
+        resizer.classList.remove("resizing");
+        this.saveState();
+      }
+    });
+  }
+
+  public registerView(view: SidebarView) {
+    this.views.set(view.id, view);
+    this.addTab(view);
+    console.log(`📌 [Sidebar] Registered view: ${view.name} (${view.side})`);
+  }
+
+  private addTab(view: SidebarView) {
+    const sidebar = document.getElementById(`sidebar-${view.side}`);
+    if (!sidebar) return;
+
+    const tabsContainer = sidebar.querySelector(".sidebar-tabs");
+    const viewsContainer = sidebar.querySelector(".sidebar-views");
+    if (!tabsContainer || !viewsContainer) return;
+
+    // タブボタン作成
+    const tab = document.createElement("button");
+    tab.className = "sidebar-tab";
+    tab.setAttribute("data-view", view.id);
+    tab.innerHTML = `${view.icon} ${view.name}`;
+    tab.onclick = () => this.showView(view.side, view.id);
+    tabsContainer.appendChild(tab);
+
+    // ビューコンテナ作成
+    const viewDiv = document.createElement("div");
+    viewDiv.className = "sidebar-view";
+    viewDiv.setAttribute("data-view", view.id);
+    view.render(viewDiv);
+    viewsContainer.appendChild(viewDiv);
+  }
+
+  public showView(side: "left" | "right", viewId: string) {
+    const sidebar = document.getElementById(`sidebar-${side}`);
+    if (!sidebar) return;
+
+    // タブのアクティブ切り替え
+    sidebar.querySelectorAll(".sidebar-tab").forEach((tab) => {
+      if (tab.getAttribute("data-view") === viewId) {
+        tab.classList.add("active");
+      } else {
+        tab.classList.remove("active");
+      }
+    });
+
+    // ビューの表示切り替え
+    const oldViewId = this.activeViews[side];
+    if (oldViewId) {
+      const oldView = this.views.get(oldViewId);
+      if (oldView?.onHide) oldView.onHide();
+    }
+
+    sidebar.querySelectorAll(".sidebar-view").forEach((view) => {
+      if (view.getAttribute("data-view") === viewId) {
+        view.classList.add("active");
+      } else {
+        view.classList.remove("active");
+      }
+    });
+
+    this.activeViews[side] = viewId;
+
+    const newView = this.views.get(viewId);
+    if (newView?.onShow) newView.onShow();
+
+    this.saveState();
+  }
+
+  public getSidebarAPI() {
+    return {
+      registerView: (view: SidebarView) => this.registerView(view),
+      showView: (side: "left" | "right", viewId: string) => this.showView(side, viewId),
+      toggleSidebar: (side: "left" | "right") => this.toggleSidebar(side),
+    };
+  }
+}
+
 // --- Snippet Manager ---
 interface SnippetFile {
   name: string;
@@ -304,6 +583,88 @@ class SnippetManager {
       JSON.stringify(Array.from(this.enabledSnippets))
     );
   }
+}
+
+// アイコンマップに追加のアイコンを登録
+function initializeLucideIcons() {
+  const iconMap: Record<string, string> = {
+    'file-text': FileText,
+    'search': Search,
+    'terminal': Terminal,
+    'file-plus': FilePlus,
+    'folder-plus': FolderPlus,
+    'arrow-up': ArrowUp,
+    'folder-open': FolderOpen,
+    'settings': Settings,
+    'list': List,
+    'link': Link,
+    'chevron-left': ChevronLeft,
+    'chevron-right': ChevronRight,
+    'chevron-down': ChevronDown,
+    'chevron-up': ChevronUp,
+    'folder': Folder,
+    'file': File,
+    'x': X,
+    'plus': Plus,
+    'menu': Menu,
+    'palette': Palette,
+    'puzzle': Puzzle,
+    'code': Code,
+    'rotate-cw': RotateCw,
+  };
+
+  document.querySelectorAll('svg[data-icon]').forEach((svg) => {
+    const iconName = svg.getAttribute('data-icon');
+    if (iconName && iconMap[iconName]) {
+      svg.outerHTML = iconMap[iconName];
+    }
+  });
+
+  console.log('✨ [Icons] Lucide icons initialized');
+}
+
+function createLucideIcon(iconName: string): SVGElement {
+  const iconMap: Record<string, string> = {
+    'file-text': FileText,
+    'search': Search,
+    'terminal': Terminal,
+    'file-plus': FilePlus,
+    'folder-plus': FolderPlus,
+    'arrow-up': ArrowUp,
+    'folder-open': FolderOpen,
+    'settings': Settings,
+    'list': List,
+    'link': Link,
+    'chevron-left': ChevronLeft,
+    'chevron-right': ChevronRight,
+    'chevron-down': ChevronDown,
+    'chevron-up': ChevronUp,
+    'folder': Folder,
+    'file': File,
+    'x': X,
+    'plus': Plus,
+    'menu': Menu,
+  };
+
+  const svgString = iconMap[iconName];
+
+  if (svgString) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(svgString, 'image/svg+xml');
+    const svgElement = doc.documentElement as unknown as SVGElement;
+    svgElement.classList.add('lucide-icon');
+    return svgElement;
+  }
+
+  const fallback = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  fallback.classList.add('lucide-icon');
+  fallback.setAttribute('width', '24');
+  fallback.setAttribute('height', '24');
+  fallback.setAttribute('viewBox', '0 0 24 24');
+  fallback.setAttribute('fill', 'none');
+  fallback.setAttribute('stroke', 'currentColor');
+  fallback.setAttribute('stroke-width', '2');
+  return fallback;
 }
 
 // --- Helpers ---
@@ -633,18 +994,26 @@ class PluginManager {
   public async enablePlugin(id: string) {
     console.log("🔌 [Plugin] Enabling:", id);
     console.log(
-      "  📊 Panes before enable:",
+      " 📊 Panes before enable:",
       this.app.workspace.getLeaves().length,
     );
 
-    if (this.loadedPlugins.has(id)) return;
+    if (this.loadedPlugins.has(id)) {
+      console.warn(`Plugin ${id} is already loaded`);
+      return;
+    }
+
     const data = this.availablePlugins.get(id);
-    if (!data) return;
+    if (!data) {
+      console.error(`Plugin ${id} not found`);
+      return;
+    }
+
     const sep = data.dir.includes("/") ? "/" : "\\";
 
-    if (data.type === "theme") {
-      const cssPath = `${data.dir}${sep}styles.css`;
-      try {
+    try {
+      if (data.type === "theme") {
+        const cssPath = `${data.dir}${sep}styles.css`;
         const cssContent = (await invoke("read_file_content", {
           path: cssPath,
         })) as string;
@@ -658,20 +1027,23 @@ class PluginManager {
         this.loadedPlugins.set(id, { type: "theme", el: styleEl });
         this.enabledPluginIds.add(id);
         this.saveSettings();
-        console.log("  ✅ Theme loaded:", id);
-      } catch (e) {
-        console.error(`Failed to load theme css`, e);
+        console.log(" ✅ Theme loaded:", id);
+        return;
       }
-      return;
-    }
 
-    if (!data.manifest.main) return;
-    const mainJsPath = `${data.dir}${sep}${data.manifest.main}`;
-    try {
+      if (!data.manifest.main) return;
+
+      const mainJsPath = `${data.dir}${sep}${data.manifest.main}`;
       const jsContent = (await invoke("read_file_content", {
         path: mainJsPath,
       })) as string;
-      const pluginFactory = new Function("app", jsContent);
+
+      // セキュリティ: strictモードで実行
+      const pluginFactory = new Function(
+        "app",
+        '"use strict";\n' + jsContent
+      );
+
       const pluginApi: RobsidianApp = {
         ...this.app,
         plugin: {
@@ -693,22 +1065,34 @@ class PluginManager {
           },
         },
       };
+
       const pluginInstance = pluginFactory(pluginApi);
+
       if (pluginInstance && typeof pluginInstance.onload === "function") {
-        console.log("  🚀 Calling onload for:", id);
-        await pluginInstance.onload(pluginApi);
+        console.log(" 🚀 Calling onload for:", id);
+
+        // タイムアウト付きでonloadを呼ぶ（10秒制限）
+        await Promise.race([
+          pluginInstance.onload(pluginApi),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Plugin load timeout")), 10000)
+          ),
+        ]);
+
         console.log(
-          "  📊 Panes after onload:",
+          " 📊 Panes after onload:",
           this.app.workspace.getLeaves().length,
         );
         this.loadedPlugins.set(id, pluginInstance);
         this.enabledPluginIds.add(id);
         this.saveSettings();
-        console.log("  ✅ Plugin loaded:", id);
+        console.log(" ✅ Plugin loaded:", id);
       }
     } catch (e) {
       console.error(`[PluginManager] Failed to enable ${id}:`, e);
+      this.enabledPluginIds.delete(id);
       alert(`Failed to enable ${data.type} ${id}: ${e}`);
+      throw e; // エラーを再スロー
     }
   }
 
@@ -754,6 +1138,7 @@ class EditorPane {
   private headerEl: HTMLElement;
   private contentArea: HTMLElement;
   private cmEditor: EditorView | null = null;
+  private editorExtensions: any[] | null = null;
   constructor(private manager: PaneManager) {
     this.id = Math.random().toString(36).substring(2, 9);
     this.container = document.createElement("div");
@@ -885,29 +1270,40 @@ class EditorPane {
   private startPolling(tab: EditorTab) {
     if (!tab.file) return;
     if (tab.pollingId) window.clearInterval(tab.pollingId);
+
     invoke("get_file_mtime", { path: tab.file.path })
       .then((mtime) => {
         tab.lastMtime = mtime as number;
       })
       .catch(() => {});
+
     tab.pollingId = window.setInterval(async () => {
-      if (tab.isEditing) return;
+      // アクティブなタブでない、または編集中の場合はスキップ
+      if (tab.isEditing || this.activeTabId !== tab.id) return;
+
       try {
         const currentMtime = (await invoke("get_file_mtime", {
           path: tab.file!.path,
         })) as number;
+
         if (tab.lastMtime !== currentMtime) {
           tab.lastMtime = currentMtime;
           const newContent = (await invoke("read_file_content", {
             path: tab.file!.path,
           })) as string;
+
           if (newContent !== tab.contentCache) {
             tab.contentCache = newContent;
-            if (this.activeTabId === tab.id) this.renderContent();
+            // アクティブタブの場合のみレンダリング
+            if (this.activeTabId === tab.id) {
+              this.renderContent();
+            }
           }
         }
-      } catch (e) {}
-    }, 1000);
+      } catch (e) {
+        console.error("Polling error:", e);
+      }
+    }, 2000); // 2秒に延長（負荷軽減）
   }
   public switchTab(tabId: string) {
     if (this.activeTabId) {
@@ -959,16 +1355,36 @@ class EditorPane {
       const tabEl = document.createElement("div");
       tabEl.className = `editor-tab ${tab.id === this.activeTabId ? "active" : ""} ${tab.isDirty ? "dirty" : ""}`;
       tabEl.draggable = true;
-      let icon = "📄",
-        title = "Untitled";
+
+      let iconElement: SVGElement;
+      let title = "Untitled";
+
       if (tab.type === "editor" && tab.file) {
-        icon = "📄";
+        iconElement = createLucideIcon('file-text');
         title = tab.file.name;
       } else if (tab.type === "terminal") {
-        icon = "💻";
+        iconElement = createLucideIcon('terminal');
         title = tab.termTitle || "Terminal";
+      } else {
+        iconElement = createLucideIcon('file');
+        title = "Untitled";
       }
-      tabEl.innerHTML = `<span class="tab-title">${icon} ${title}</span><div class="tab-close">×</div>`;
+
+      iconElement.style.width = '16px';
+      iconElement.style.height = '16px';
+      iconElement.style.marginRight = '8px';
+
+      const titleSpan = document.createElement('span');
+      titleSpan.className = 'tab-title';
+      titleSpan.textContent = title;
+
+      const closeBtn = document.createElement('div');
+      closeBtn.className = 'tab-close';
+      closeBtn.innerHTML = '×';
+
+      tabEl.appendChild(iconElement);
+      tabEl.appendChild(titleSpan);
+      tabEl.appendChild(closeBtn);
       tabEl.addEventListener("click", (e) => {
         if ((e.target as HTMLElement).classList.contains("tab-close")) {
           e.stopPropagation();
@@ -1017,6 +1433,92 @@ class EditorPane {
       this.headerEl.appendChild(tabEl);
     });
   }
+    private getEditorExtensions() {
+    // キャッシュがあり、Vim/テーマ設定が変わっていなければ再利用
+    if (this.editorExtensions) {
+      return this.editorExtensions;
+    }
+
+    const exts = [
+      basicSetup,
+      markdown(),
+      javascript(),
+      rust(),
+      python(),
+      html(),
+      css(),
+      autocompletion({ override: [wikiLinkCompletion] }),
+      EditorView.lineWrapping,
+      proseTheme,
+      keymap.of([
+        ...defaultKeymap,
+        ...historyKeymap,
+        {
+          key: "Mod-s",
+          run: () => {
+            const tab = this.tabs.find((t) => t.id === this.activeTabId);
+            if (tab && tab.type === "editor") {
+              this.saveCurrentTab();
+            }
+            return true;
+          },
+        },
+        {
+          key: "Escape",
+          run: () => {
+            const tab = this.tabs.find((t) => t.id === this.activeTabId);
+            if (tab && this.cmEditor) {
+              tab.contentCache = this.cmEditor.state.doc.toString();
+              tab.isEditing = false;
+              this.renderContent();
+            }
+            return true;
+          },
+        },
+      ]),
+      EditorView.updateListener.of((u) => {
+        const tab = this.tabs.find((t) => t.id === this.activeTabId);
+        if (!tab) return;
+
+        if (u.docChanged) tab.isDirty = true;
+        const pos = u.state.selection.main.head;
+        const line = u.state.doc.lineAt(pos);
+        const statusCursor = document.getElementById("status-cursor");
+        if (statusCursor)
+          statusCursor.innerText = `Ln ${line.number}, Col ${pos - line.from + 1}`;
+      }),
+    ];
+
+    if (!document.body.classList.contains("light-theme")) exts.push(oneDark);
+    if (isVimMode) exts.push(vim());
+
+    this.editorExtensions = exts;
+    return exts;
+  }
+
+  private saveCurrentTab() {
+    const tab = this.tabs.find((t) => t.id === this.activeTabId);
+    if (!tab || !tab.file || !this.cmEditor) return;
+
+    const save = async () => {
+      try {
+        const c = this.cmEditor!.state.doc.toString();
+        await invoke("save_file_content", {
+          path: tab.file!.path,
+          content: c,
+        });
+        tab.contentCache = c;
+        tab.isEditing = false;
+        tab.isDirty = false;
+        this.cmEditor!.destroy();
+        this.cmEditor = null;
+        this.renderContent();
+      } catch (e) {
+        alert("Save failed: " + e);
+      }
+    };
+    save();
+  }
   private async renderContent() {
     const tab = this.tabs.find((t) => t.id === this.activeTabId);
     if (!tab) {
@@ -1043,76 +1545,14 @@ class EditorPane {
         ".editor-wrapper",
       ) as HTMLElement;
 
-      const exts = [
-        basicSetup,
-        markdown(),
-        javascript(),
-        rust(),
-        python(),
-        html(),
-        css(),
-        autocompletion({ override: [wikiLinkCompletion] }),
-        EditorView.lineWrapping,
-        proseTheme,
-        keymap.of([
-          ...defaultKeymap,
-          ...historyKeymap,
-          {
-            key: "Mod-s",
-            run: () => {
-              save();
-              return true;
-            },
-          },
-          {
-            key: "Escape",
-            run: () => {
-              tab.contentCache = this.cmEditor!.state.doc.toString();
-              tab.isEditing = false;
-              this.renderContent();
-              return true;
-            },
-          },
-        ]),
-        EditorView.updateListener.of((u) => {
-          if (u.docChanged) tab.isDirty = true;
-          const pos = u.state.selection.main.head;
-          const line = u.state.doc.lineAt(pos);
-          const statusCursor = document.getElementById("status-cursor");
-          if (statusCursor)
-            statusCursor.innerText = `Ln ${line.number}, Col ${pos - line.from + 1}`;
-        }),
-      ];
-
-      if (!document.body.classList.contains("light-theme")) exts.push(oneDark);
-      if (isVimMode) exts.push(vim());
-
-      this.cmEditor = new EditorView({
-        doc: tab.contentCache || "",
-        extensions: exts,
-        parent: wrapper,
-      });
-      const save = async () => {
-        if (!tab.file) return;
-        try {
-          const c = this.cmEditor!.state.doc.toString();
-          await invoke("save_file_content", {
-            path: tab.file.path,
-            content: c,
-          });
-          tab.contentCache = c;
-          tab.isEditing = false;
-          tab.isDirty = false;
-          this.cmEditor!.destroy();
-          this.cmEditor = null;
-          this.renderContent();
-        } catch (e) {
-          alert("Save failed: " + e);
-        }
-      };
-      this.contentArea
-        .querySelector(".btn-save")
-        ?.addEventListener("click", save);
+    this.cmEditor = new EditorView({
+      doc: tab.contentCache || "",
+      extensions: this.getEditorExtensions(),
+      parent: wrapper,
+    });
+    this.contentArea
+      .querySelector(".btn-save")
+      ?.addEventListener("click", () => this.saveCurrentTab());
     } else if (tab.type === "editor" && tab.file) {
       const toolbar = document.createElement("div");
       toolbar.style.cssText =
@@ -1308,36 +1748,38 @@ function saveSession(immediate = false) {
     return;
   }
 
+  // 復元中は immediate=true の場合のみ許可
   if (isRestoring && !immediate) {
-    return; // 復元中は静かにスキップ
-  }
-
-  const currentCount = globalPaneManager.panes.length;
-  const callId = ++saveCounter;
-
-  const doSave = () => {
-    const now = Date.now();
-    if (!immediate && now - lastSaveTime < 100) {
-      return;
-    }
-
-    lastSaveTime = now;
-    const state = globalPaneManager!.saveState();
-    console.log(`💾 [${callId}] Saving session:`, {
-      panes: state.panes.length,
-      layout: state.layoutDirection,
-    });
-    localStorage.setItem("robsidian-session", JSON.stringify(state));
-  };
-
-  if (immediate) {
-    console.log(`⚡ [${callId}] Immediate save (${currentCount} panes)`);
-    doSave();
     return;
   }
 
-  if (saveSessionTimeout) clearTimeout(saveSessionTimeout);
-  saveSessionTimeout = window.setTimeout(doSave, 300);
+  const doSave = () => {
+    const now = Date.now();
+    // 最後の保存から100ms以内ならスキップ（immediate=falseの場合）
+    if (!immediate && now - lastSaveTime < 100) {
+      return;
+    }
+    lastSaveTime = now;
+
+    const state = globalPaneManager!.saveState();
+    try {
+      localStorage.setItem("robsidian-session", JSON.stringify(state));
+      console.log(`💾 [${++saveCounter}] Saved session:`, {
+        panes: state.panes.length,
+        layout: state.layoutDirection,
+      });
+    } catch (e) {
+      console.error("Failed to save session:", e);
+    }
+  };
+
+  if (immediate) {
+    if (saveSessionTimeout) clearTimeout(saveSessionTimeout);
+    doSave();
+  } else {
+    if (saveSessionTimeout) clearTimeout(saveSessionTimeout);
+    saveSessionTimeout = window.setTimeout(doSave, 300);
+  }
 }
 
 async function restoreSession(manager: PaneManager) {
@@ -1478,11 +1920,17 @@ function createDebugPanel() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   console.log("🚀 [App] Starting Robsidian...");
+  // Lucide Icons初期化
+  initializeLucideIcons();
+  // サイドバーマネージャー初期化
+  console.log("📌 [App] Initializing SidebarManager...");
+  globalSidebarManager = new SidebarManager();
   console.log("✨ [App] Initializing SnippetManager...");
   globalSnippetManager = new SnippetManager();
   if (currentPath) {
     await globalSnippetManager.scanSnippets(currentPath);
   }
+  console.log("✅ [App] Initialization complete.");
 
   // Reload Snippets Button
   const btnReloadSnippets = document.getElementById("btn-reload-snippets");
@@ -1646,37 +2094,31 @@ window.addEventListener("DOMContentLoaded", async () => {
     hotkeys: [],
   });
   globalCommandManager.register({
-    id: "app:toggle-debug-panel",
-    name: "Toggle Debug Panel",
+    id: "editor:toggle-vim",
+    name: "Toggle Vim Mode",
     callback: () => {
-      const panel = document.getElementById("debug-panel");
-      if (panel) {
-        const isHidden = panel.style.display === "none";
-        panel.style.display = isHidden ? "block" : "none";
-        localStorage.setItem("robsidian-show-debug", String(isHidden));
-        
-        // 即座に一度更新をかける（非表示→表示のときのため）
-        if (isHidden) {
-            // パネルの中身の update ロジックは setInterval 内にあるが、
-            // UX向上のため Notice を出す
-            showNotice("Debug Panel: ON");
-        } else {
-            showNotice("Debug Panel: OFF");
+      isVimMode = !isVimMode;
+      localStorage.setItem("robsidian-vim-mode", String(isVimMode));
+      showNotice(`Vim Mode: ${isVimMode ? "ON" : "OFF"}`);
+
+      // エディタ設定のキャッシュをクリア
+      if (globalPaneManager) {
+        globalPaneManager.panes.forEach((pane: any) => {
+          if (pane.editorExtensions) {
+            pane.editorExtensions = null;
+          }
+        });
+
+        // アクティブなタブを再レンダリング
+        if (globalPaneManager.activePane && globalPaneManager.activePane.activeTabId) {
+          globalPaneManager.activePane.switchTab(
+            globalPaneManager.activePane.activeTabId
+          );
         }
       }
     },
-    hotkeys: [{ modifiers: ["Mod", "Shift"], key: "d" }],
+    hotkeys: [],
   });
-
-  const sidebarHeader = document.querySelector(".sidebar-header");
-  if (sidebarHeader) {
-    const bigTermBtn = document.createElement("button");
-    bigTermBtn.id = "btn-big-terminal";
-    bigTermBtn.className = "primary-action-btn";
-    bigTermBtn.innerHTML = `<span style="font-size:1.2em">💻</span> Open Terminal`;
-    bigTermBtn.onclick = () => globalPaneManager?.openTerminalInActive();
-    sidebarHeader.after(bigTermBtn);
-  }
 
   const sidebarActions = document.querySelector(".sidebar-actions");
   if (sidebarActions) {
@@ -1693,6 +2135,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   const btnUp = getEl("btn-up") as HTMLButtonElement;
   const inputSearch = getEl("input-search") as HTMLInputElement;
   const btnSplit = getEl("btn-split");
+  const btnOpenTerminalTab = getEl("btn-open-terminal-tab");
   const listEl = getEl("file-list");
   const pathDisplay = getEl("path-display");
   const btnSettings = getEl("btn-settings");
@@ -1707,6 +2150,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   const contextMenu = getEl("context-menu");
   const btnAddTab = getEl("btn-add-tab");
   const resizer = getEl("resizer");
+  if (!listEl) {
+    console.error("Critical: file-list element not found!");
+  }
+  if (!pathDisplay) {
+    console.error("Critical: path-display element not found!");
+  }
   const inputFontSize = getEl("input-font-size") as HTMLInputElement;
   const inputLineHeight = getEl("input-line-height") as HTMLInputElement;
   const valFontSize = getEl("val-font-size");
@@ -1950,6 +2399,9 @@ if (btnSettings)
     if (modalSettings) modalSettings.style.display = "flex";
   };
 
+  if (btnOpenTerminalTab)
+    btnOpenTerminalTab.onclick = () => globalPaneManager?.openTerminalInActive();
+
   if (btnCloseSettings)
     btnCloseSettings.onclick = () => {
       if (modalSettings) modalSettings.style.display = "none";
@@ -2086,37 +2538,94 @@ if (btnSettings)
     };
   if (btnAddTab)
     btnAddTab.onclick = () => globalPaneManager?.openTerminalInActive();
+
   if (inputSearch && listEl) {
-    inputSearch.addEventListener("input", () => {
+    const debouncedSearch = debounce(async () => {
       const query = inputSearch.value.trim();
-      if (searchTimeout) clearTimeout(searchTimeout);
-      searchTimeout = window.setTimeout(async () => {
-        if (!query) {
-          loadFiles(currentPath);
-          return;
-        }
+
+      if (!query) {
+        loadFiles(currentPath);
+        return;
+      }
+
+      try {
         const results = (await invoke("search_files", {
           rootPath: currentPath,
           query,
         })) as SearchResult[];
+
+        if (!listEl) return;
+
         listEl.innerHTML = "";
-        if (results.length === 0) listEl.innerHTML = "<li>No results</li>";
+        if (results.length === 0) {
+          listEl.innerHTML = "<li style='padding:12px; color:var(--text-muted); text-align:center;'>No results found</li>";
+          return;
+        }
+
         results.forEach((r) => {
           const li = document.createElement("li");
-          li.style.padding = "5px";
-          li.style.borderBottom = "1px solid var(--border-color)";
-          li.style.cursor = "pointer";
-          li.innerHTML = `<div>📄 <b>${r.name}</b></div><div style="font-size:0.8em;color:#888">${r.snippet}</div>`;
-          li.onclick = () =>
-            globalPaneManager?.openFileInActive({
-              name: r.name,
-              path: r.path,
-              is_dir: false,
-            });
+          li.className = "file-item";
+          const row = document.createElement("div");
+          row.className = "tree-node";
+          row.style.flexDirection = "column";
+          row.style.alignItems = "flex-start";
+          row.style.padding = "8px 12px";
+          row.style.gap = "4px";
+
+          const nameRow = document.createElement("div");
+          nameRow.style.display = "flex";
+          nameRow.style.alignItems = "center";
+          nameRow.style.gap = "8px";
+          nameRow.style.width = "100%";
+
+          const iconEl = document.createElement("span");
+          iconEl.className = "tree-icon";
+          const icon = createLucideIcon(r.is_dir ? 'folder' : 'file-text');
+          icon.style.width = '16px';
+          icon.style.height = '16px';
+          iconEl.appendChild(icon);
+
+          const nameEl = document.createElement("span");
+          nameEl.style.fontWeight = "500";
+          nameEl.textContent = r.name;
+
+          nameRow.appendChild(iconEl);
+          nameRow.appendChild(nameEl);
+
+          const snippetEl = document.createElement("div");
+          snippetEl.style.fontSize = "11px";
+          snippetEl.style.color = "var(--text-muted)";
+          snippetEl.style.marginLeft = "24px";
+          snippetEl.style.overflow = "hidden";
+          snippetEl.style.textOverflow = "ellipsis";
+          snippetEl.style.whiteSpace = "nowrap";
+          snippetEl.textContent = r.snippet;
+
+          row.appendChild(nameRow);
+          row.appendChild(snippetEl);
+
+          row.onclick = () => {
+            if (!r.is_dir) {
+              globalPaneManager?.openFileInActive({
+                name: r.name,
+                path: r.path,
+                is_dir: false,
+              });
+            }
+          };
+
+          li.appendChild(row);
           listEl.appendChild(li);
         });
-      }, 300);
-    });
+      } catch (error) {
+        console.error("Search failed:", error);
+        if (listEl) {
+          listEl.innerHTML = "<li style='padding:12px; color:#ff3b30; text-align:center;'>Search failed. Check console for details.</li>";
+        }
+      }
+    }, 300);
+
+    inputSearch.addEventListener("input", debouncedSearch);
   }
 
   let fileMenuActions: MenuItem[] = [
@@ -2182,25 +2691,46 @@ if (btnSettings)
   function createTreeNode(entry: FileEntry): HTMLLIElement {
     const li = document.createElement("li");
     li.className = "file-item";
+
     const row = document.createElement("div");
     row.className = "tree-node";
+
     const arrow = document.createElement("span");
     if (entry.is_dir) {
       arrow.className = "tree-arrow";
-      arrow.innerText = "▶";
-      if (expandedPaths.has(entry.path)) arrow.classList.add("open");
+      const chevron = createLucideIcon('chevron-right');
+      chevron.style.width = '14px';
+      chevron.style.height = '14px';
+      arrow.appendChild(chevron);
+
+      if (expandedPaths.has(entry.path)) {
+        arrow.classList.add('open');
+        arrow.innerHTML = '';
+        const chevronDown = createLucideIcon('chevron-down');
+        chevronDown.style.width = '14px';
+        chevronDown.style.height = '14px';
+        arrow.appendChild(chevronDown);
+      }
     } else {
       arrow.className = "tree-spacer";
     }
+
     row.appendChild(arrow);
+
     const icon = document.createElement("span");
     icon.className = "tree-icon";
-    icon.innerText = entry.is_dir ? "📂" : "📄";
+    const iconElement = createLucideIcon(entry.is_dir ? 'folder' : 'file');
+    iconElement.style.width = '16px';
+    iconElement.style.height = '16px';
+    icon.appendChild(iconElement);
+
     row.appendChild(icon);
+
     const label = document.createElement("span");
     label.className = "tree-label";
-    label.innerText = entry.name;
+    label.textContent = entry.name;
     row.appendChild(label);
+
     li.appendChild(row);
     let childrenContainer: HTMLUListElement | null = null;
     if (entry.is_dir) {
@@ -2381,6 +2911,7 @@ if (btnSettings)
       exists: () => true,
       root: currentPath,
     },
+    sidebar: globalSidebarManager?.getSidebarAPI(),
     commands: {
       register: (cmd) => globalCommandManager?.register(cmd),
       execute: (id) => globalCommandManager?.execute(id),

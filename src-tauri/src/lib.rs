@@ -1,31 +1,23 @@
-use tauri_plugin_shell::ShellExt;
-
 mod search;
 mod terminal; 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // ★重要: State管理を追加
         .manage(terminal::TerminalState::new())
-        
-        // プラグイン初期化
+
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        
-        // ハンドラー登録
+
         .invoke_handler(tauri::generate_handler![
-            // Terminal
             terminal::create_terminal,
             terminal::write_to_terminal,
             terminal::resize_terminal,
-            
-            // Search
+
             search::search_files,
-            
-            // File System
+
             read_file_content,
             save_file_content,
             create_file,
@@ -41,7 +33,6 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-// ... (以下、前回と同じファイル操作関数群。変更なし) ...
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;

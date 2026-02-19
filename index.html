@@ -10,36 +10,121 @@
 
   <body>
     <div id="app">
-      <div id="sidebar">
+      <!-- 左サイドバー開閉ボタン -->
+      <button id="toggle-sidebar-left" class="sidebar-toggle-btn left" title="Toggle Left Sidebar">
+        <svg class="lucide-icon"></svg>
+      </button>
+
+      <!-- 左サイドバー -->
+      <div id="sidebar-left" class="sidebar sidebar-left">
         <div class="sidebar-header">
           <div class="vault-name" id="path-display">NO VAULT</div>
           <div class="sidebar-actions">
-            <button id="btn-open-vault" title="Open Vault">📂</button>
-            <button id="btn-settings" title="Settings">⚙️</button>
+            <button id="btn-open-vault" title="Open Vault">
+              <svg class="lucide-icon" data-icon="folder-open"></svg>
+            </button>
+            <button id="btn-settings" title="Settings">
+              <svg class="lucide-icon" data-icon="settings"></svg>
+            </button>
           </div>
         </div>
 
-        <div class="file-actions" style="padding: 10px; display: flex; gap: 5px;">
-            <button id="btn-new-file" style="flex:1;">📄 New Note</button>
-            <button id="btn-new-dir" style="flex:1;">📁 New Folder</button>
+        <!-- タブとTerminalボタンを2分割 -->
+        <div class="sidebar-tabs-split">
+          <button class="sidebar-tab active" data-view="files">
+            <svg class="lucide-icon" data-icon="file-text"></svg>
+            <span>Files</span>
+          </button>
+          <button id="btn-open-terminal-tab" class="sidebar-tab-terminal">
+            <svg class="lucide-icon" data-icon="terminal"></svg>
+            <span>Terminal</span>
+          </button>
         </div>
 
-        <div class="search-box">
-            <input type="text" id="input-search" placeholder="Search files...">
-        </div>
+        <!-- ビューコンテナ -->
+        <div class="sidebar-views">
+          <!-- Files View -->
+          <div class="sidebar-view active" data-view="files">
 
-        <div class="file-explorer">
-            <div class="nav-header">
-                <button id="btn-up" disabled>⬆ Up</button>
-                <span style="font-size: 0.8em; color: #666; margin-left: auto;">Files</span>
+            <div class="file-actions">
+              <button id="btn-new-file">
+                <svg class="lucide-icon" data-icon="file-plus"></svg>
+                New Note
+              </button>
+              <button id="btn-new-dir">
+                <svg class="lucide-icon" data-icon="folder-plus"></svg>
+                New Folder
+              </button>
             </div>
-            <ul id="file-list"></ul>
+
+            <div class="search-box">
+              <input type="text" id="input-search" placeholder="Search files...">
+            </div>
+
+            <div class="file-explorer">
+              <div class="nav-header">
+                <button id="btn-up" disabled>
+                  <svg class="lucide-icon" data-icon="arrow-up"></svg>
+                  Up
+                </button>
+                <span style="font-size: 0.8em; color: #666; margin-left: auto;">Files</span>
+              </div>
+              <ul id="file-list"></ul>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div id="resizer"></div>
+      <div id="resizer-left" class="sidebar-resizer"></div>
 
+      <!-- メインコンテンツエリア -->
       <div id="panes-container"></div>
+
+      <div id="resizer-right" class="sidebar-resizer"></div>
+
+      <!-- 右サイドバー -->
+      <div id="sidebar-right" class="sidebar sidebar-right">
+        <div class="sidebar-header">
+          <div class="vault-name">Outline</div>
+          <div class="sidebar-actions">
+            <!-- 閉じるボタンは削除 -->
+          </div>
+        </div>
+
+        <!-- タブ切り替えUI -->
+        <div class="sidebar-tabs">
+          <button class="sidebar-tab active" data-view="outline">
+            <svg class="lucide-icon" data-icon="list"></svg>
+            <span>Outline</span>
+          </button>
+          <button class="sidebar-tab" data-view="backlinks">
+            <svg class="lucide-icon" data-icon="link"></svg>
+            <span>Links</span>
+          </button>
+        </div>
+
+        <!-- ビューコンテナ -->
+        <div class="sidebar-views">
+          <!-- Outline View -->
+          <div class="sidebar-view active" data-view="outline">
+            <div id="outline-container" style="padding: 12px; color: var(--text-muted);">
+              <p>Open a markdown file to see outline</p>
+            </div>
+          </div>
+
+          <!-- Backlinks View -->
+          <div class="sidebar-view" data-view="backlinks">
+            <div style="padding: 20px; color: var(--text-muted);">
+              <p>Backlinks will appear here</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右サイドバー開閉ボタン -->
+      <button id="toggle-sidebar-right" class="sidebar-toggle-btn right" title="Toggle Right Sidebar">
+        <svg class="lucide-icon"></svg>
+      </button>
     </div>
 
     <div id="context-menu" class="context-menu" style="display: none;">
@@ -55,11 +140,26 @@
           <div class="settings-sidebar">
             <div class="settings-header">Robsidian</div>
 
-            <div class="sidebar-item active" data-target="tab-general">⚙️ General</div>
-            <div class="sidebar-item" data-target="tab-appearance">🎨 Appearance</div>
-            <div class="sidebar-item" data-target="tab-editor">📝 Editor</div>
-            <div class="sidebar-item" data-target="tab-plugins">🧩 Plugins</div>
-            <div class="sidebar-item" data-target="tab-snippets">✨ Snippets</div>
+            <div class="sidebar-item active" data-target="tab-general">
+              <svg class="lucide-icon" data-icon="settings"></svg>
+              General
+            </div>
+            <div class="sidebar-item" data-target="tab-appearance">
+              <svg class="lucide-icon" data-icon="palette"></svg>
+              Appearance
+            </div>
+            <div class="sidebar-item" data-target="tab-editor">
+              <svg class="lucide-icon" data-icon="file-text"></svg>
+              Editor
+            </div>
+            <div class="sidebar-item" data-target="tab-plugins">
+              <svg class="lucide-icon" data-icon="puzzle"></svg>
+              Plugins
+            </div>
+            <div class="sidebar-item" data-target="tab-snippets">
+              <svg class="lucide-icon" data-icon="code"></svg>
+              Snippets
+            </div>
 
             <div class="settings-footer-actions">
                 <button id="btn-close-settings" style="width: 100%;">Close</button>
