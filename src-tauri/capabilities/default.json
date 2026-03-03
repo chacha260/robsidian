@@ -20,6 +20,10 @@
     "dialog:default",
     "opener:default",
     {
+      "identifier": "fs:allow-read",
+      "allow": [{"path": "**"}]
+    },
+    {
       "identifier": "fs:scope",
       "allow": ["$HOME/**", "C:\\**", "D:\\**", "**"]
     }

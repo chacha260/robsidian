@@ -1,5 +1,6 @@
-import { 
-  FileText, Search, Terminal, FilePlus, FolderPlus, 
+// src/main.ts - Robsidianメインコード（セキュリティ強化版）
+import {
+  FileText, Search, Terminal, FilePlus, FolderPlus,
   ArrowUp, FolderOpen, Settings, List, Link,
   ChevronLeft, ChevronRight, ChevronDown, ChevronUp,
   Folder, File, X, Plus, Menu, Palette, Puzzle, Code, RotateCw
@@ -11,6 +12,9 @@ import { marked } from "marked";
 import mermaid from "mermaid";
 import { RobsidianTerminal } from "./terminal";
 import "./styles.css";
+import { extractOutline, renderOutline } from './outline';
+import { renderBacklinks } from './backlinks';
+import { setupImagePasteHandler } from './imageHandler';
 
 // --- CodeMirror Imports ---
 import { EditorView, basicSetup } from "codemirror";
@@ -19,6 +23,7 @@ import { defaultKeymap, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { autocompletion, CompletionContext } from "@codemirror/autocomplete";
+import { foldKeymap } from "@codemirror/language";
 
 // --- Vim & Languages ---
 import { vim } from "@replit/codemirror-vim";
@@ -31,38 +36,27 @@ import { css } from "@codemirror/lang-css";
 // --- Highlight.js Imports ---
 import hljs from "highlight.js";
 import "highlight.js/styles/atom-one-dark.css";
+import { livePreview } from './livePreview';
 
 // --- Global Variables ---
 let draggingTabState: { paneId: string; tabId: string } | null = null;
 let saveSessionTimeout: number | null = null;
 const expandedPaths = new Set<string>();
-let currentZoom = parseFloat(localStorage.getItem("robsidian-zoom") || "1.0");
 let currentFilesCache: FileEntry[] = [];
 let layoutDirection: "row" | "column" = "row";
 let isVimMode = localStorage.getItem("robsidian-vim-mode") === "true";
 let globalSidebarManager: SidebarManager | null = null;
-
 let globalPluginManager: PluginManager | null = null;
 let globalSnippetManager: SnippetManager | null = null;
 let globalPaneManager: PaneManager | null = null;
 let globalCommandManager: CommandManager | null = null;
 let currentPath = localStorage.getItem("robsidian-last-path") || ".";
-
 let loadFilesGlobal: (path: string) => Promise<void> = async () => {};
 
-// ★デバウンス用ヘルパー関数を追加
-function debounce<T extends (...args: any[]) => any>(
-  func: T,
-  wait: number
-): (...args: Parameters<T>) => void {
-  let timeout: number | null = null;
-  return (...args: Parameters<T>) => {
-    if (timeout) clearTimeout(timeout);
-    timeout = window.setTimeout(() => func(...args), wait);
-  };
-}
+// ★設定値の検証
+let currentZoom = parseFloat(localStorage.getItem("robsidian-zoom") || "1.0");
 
-// ★ デバッグ用カウンター
+// ★デバッグ用カウンター
 let saveCounter = 0;
 let lastSaveTime = 0;
 
@@ -129,7 +123,7 @@ interface RobsidianApp {
     exists: (path: string) => boolean;
     root: string;
   };
-    sidebar?: { // ★追加
+  sidebar?: {
     registerView: (view: SidebarView) => void;
     showView: (side: "left" | "right", viewId: string) => void;
     toggleSidebar: (side: "left" | "right") => void;
@@ -162,18 +156,22 @@ interface PluginManifest {
   main?: string;
   author?: string;
 }
+
 type PluginType = "plugin" | "theme";
+
 interface FileEntry {
   name: string;
   path: string;
   is_dir: boolean;
 }
+
 interface SearchResult {
   path: string;
   name: string;
   is_dir: boolean;
   snippet: string;
 }
+
 type TabType = "editor" | "terminal";
 
 interface EditorTab {
@@ -189,24 +187,28 @@ interface EditorTab {
   pollingId?: number;
   lastMtime?: number;
 }
+
 interface SavedTabState {
   type?: TabType;
   path?: string;
   name?: string;
   scrollTop: number;
 }
+
 interface SavedPaneState {
   width: string;
   flex: string;
   tabs: SavedTabState[];
   activeTabIndex: number;
 }
+
 interface SavedSession {
   panes: SavedPaneState[];
   sidebarWidth: string;
   sidebarClosed: boolean;
   layoutDirection?: "row" | "column";
 }
+
 // --- Sidebar Manager ---
 interface SidebarView {
   id: string;
@@ -232,28 +234,24 @@ class SidebarManager {
   }
 
   private initializeToggleButtons() {
-    // 左サイドバー開閉ボタン
     const toggleLeft = document.getElementById('toggle-sidebar-left');
     if (toggleLeft) {
       const iconSvg = toggleLeft.querySelector('svg');
       if (iconSvg) {
         this.updateToggleIcon('left');
       }
-
       toggleLeft.onclick = () => {
         this.toggleSidebar('left');
         this.updateToggleIcon('left');
       };
     }
 
-    // 右サイドバー開閉ボタン
     const toggleRight = document.getElementById('toggle-sidebar-right');
     if (toggleRight) {
       const iconSvg = toggleRight.querySelector('svg');
       if (iconSvg) {
         this.updateToggleIcon('right');
       }
-
       toggleRight.onclick = () => {
         this.toggleSidebar('right');
         this.updateToggleIcon('right');
@@ -269,7 +267,6 @@ class SidebarManager {
     const iconSvg = button.querySelector('svg');
     if (!iconSvg) return;
 
-    // アイコンの方向を決定
     let iconName: string;
     if (side === 'left') {
       iconName = isClosed ? 'chevron-right' : 'chevron-left';
@@ -277,7 +274,6 @@ class SidebarManager {
       iconName = isClosed ? 'chevron-left' : 'chevron-right';
     }
 
-    // アイコンを置き換え
     const newIcon = createLucideIcon(iconName);
     iconSvg.innerHTML = newIcon.innerHTML;
     Array.from(newIcon.attributes).forEach((attr) => {
@@ -299,10 +295,8 @@ class SidebarManager {
       try {
         const state = JSON.parse(saved);
         this.activeViews = state.activeViews || this.activeViews;
-
         if (state.leftClosed) document.body.classList.add("sidebar-left-closed");
         if (state.rightClosed) document.body.classList.add("sidebar-right-closed");
-
         if (state.leftWidth) {
           document.documentElement.style.setProperty("--sidebar-left-width", state.leftWidth);
         }
@@ -327,7 +321,6 @@ class SidebarManager {
   }
 
   private initializeUI() {
-    // 左サイドバータブ
     document.querySelectorAll("#sidebar-left .sidebar-tab").forEach((tab) => {
       tab.addEventListener("click", (e) => {
         const viewId = (e.target as HTMLElement).getAttribute("data-view");
@@ -335,7 +328,6 @@ class SidebarManager {
       });
     });
 
-    // 右サイドバータブ
     document.querySelectorAll("#sidebar-right .sidebar-tab").forEach((tab) => {
       tab.addEventListener("click", (e) => {
         const viewId = (e.target as HTMLElement).getAttribute("data-view");
@@ -343,13 +335,11 @@ class SidebarManager {
       });
     });
 
-    // 右サイドバー閉じるボタン
     const btnToggleRight = document.getElementById("btn-toggle-right");
     if (btnToggleRight) {
       btnToggleRight.onclick = () => this.toggleSidebar("right");
     }
 
-    // リサイザー（左）
     this.initResizer("left");
     this.initResizer("right");
   }
@@ -359,29 +349,87 @@ class SidebarManager {
     if (!resizer) return;
 
     let isResizing = false;
+    let dragOverlay: HTMLDivElement | null = null;
 
-    resizer.addEventListener("mousedown", () => {
+    resizer.addEventListener("mousedown", (e) => {
+      e.preventDefault();
       isResizing = true;
+
+      // ★ ドラッグ中のオーバーレイを作成（他の要素の干渉を防ぐ）
+      dragOverlay = document.createElement('div');
+      dragOverlay.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        cursor: col-resize;
+        z-index: 9999;
+        user-select: none;
+      `;
+      document.body.appendChild(dragOverlay);
+
       document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none"; // テキスト選択を防ぐ
       resizer.classList.add("resizing");
     });
 
     document.addEventListener("mousemove", (e) => {
       if (!isResizing) return;
 
+      // ★ Zoom倍率を考慮（ただしサイドバーはZoom対象外にする予定）
+      const zoom = currentZoom || 1.0;
+
       if (side === "left") {
-        const newWidth = Math.max(200, Math.min(e.clientX, 600));
-        document.documentElement.style.setProperty("--sidebar-left-width", `${newWidth}px`);
+        // 左サイドバー: マウスX座標がそのまま幅になる
+        const adjustedX = e.clientX / zoom;
+        const newWidth = Math.max(240, Math.min(adjustedX, 600));
+        document.documentElement.style.setProperty(
+          "--sidebar-left-width",
+          `${newWidth}px`
+        );
       } else {
-        const newWidth = Math.max(200, Math.min(window.innerWidth - e.clientX, 600));
-        document.documentElement.style.setProperty("--sidebar-right-width", `${newWidth}px`);
+        // 右サイドバー: 画面右端からの距離が幅になる
+        const adjustedX = e.clientX / zoom;
+        const adjustedWidth = window.innerWidth / zoom;
+        const newWidth = Math.max(
+          240,
+          Math.min(adjustedWidth - adjustedX, Math.min(600, adjustedWidth * 0.5))
+        );
+        document.documentElement.style.setProperty(
+          "--sidebar-right-width",
+          `${newWidth}px`
+        );
       }
     });
 
     document.addEventListener("mouseup", () => {
       if (isResizing) {
         isResizing = false;
+
+        // ★ オーバーレイを削除
+        if (dragOverlay) {
+          dragOverlay.remove();
+          dragOverlay = null;
+        }
+
         document.body.style.cursor = "default";
+        document.body.style.userSelect = "";
+        resizer.classList.remove("resizing");
+        this.saveState();
+      }
+    });
+
+    // ★ ウィンドウ外にマウスが出た場合の対策
+    document.addEventListener("mouseleave", () => {
+      if (isResizing) {
+        isResizing = false;
+        if (dragOverlay) {
+          dragOverlay.remove();
+          dragOverlay = null;
+        }
+        document.body.style.cursor = "default";
+        document.body.style.userSelect = "";
         resizer.classList.remove("resizing");
         this.saveState();
       }
@@ -402,7 +450,6 @@ class SidebarManager {
     const viewsContainer = sidebar.querySelector(".sidebar-views");
     if (!tabsContainer || !viewsContainer) return;
 
-    // タブボタン作成
     const tab = document.createElement("button");
     tab.className = "sidebar-tab";
     tab.setAttribute("data-view", view.id);
@@ -410,7 +457,6 @@ class SidebarManager {
     tab.onclick = () => this.showView(view.side, view.id);
     tabsContainer.appendChild(tab);
 
-    // ビューコンテナ作成
     const viewDiv = document.createElement("div");
     viewDiv.className = "sidebar-view";
     viewDiv.setAttribute("data-view", view.id);
@@ -422,7 +468,6 @@ class SidebarManager {
     const sidebar = document.getElementById(`sidebar-${side}`);
     if (!sidebar) return;
 
-    // タブのアクティブ切り替え
     sidebar.querySelectorAll(".sidebar-tab").forEach((tab) => {
       if (tab.getAttribute("data-view") === viewId) {
         tab.classList.add("active");
@@ -431,7 +476,6 @@ class SidebarManager {
       }
     });
 
-    // ビューの表示切り替え
     const oldViewId = this.activeViews[side];
     if (oldViewId) {
       const oldView = this.views.get(oldViewId);
@@ -447,7 +491,6 @@ class SidebarManager {
     });
 
     this.activeViews[side] = viewId;
-
     const newView = this.views.get(viewId);
     if (newView?.onShow) newView.onShow();
 
@@ -489,7 +532,6 @@ class SnippetManager {
   public async scanSnippets(vaultPath: string) {
     console.log("✨ [Snippet] Scanning snippets...");
     this.snippets.clear();
-
     const sep = vaultPath.includes("/") ? "/" : "\\";
     const snippetsDir = `${vaultPath}${sep}.robsidian${sep}snippets`;
 
@@ -506,7 +548,6 @@ class SnippetManager {
       }
 
       const entries = (await invoke("list_files", { path: snippetsDir })) as FileEntry[];
-
       for (const entry of entries) {
         if (!entry.is_dir && entry.name.endsWith(".css")) {
           const snippet: SnippetFile = {
@@ -516,13 +557,11 @@ class SnippetManager {
           };
           this.snippets.set(entry.name, snippet);
 
-          // 有効なスニペットを自動ロード
           if (snippet.enabled) {
             await this.enableSnippet(entry.name);
           }
         }
       }
-
       console.log(`✨ [Snippet] Found ${this.snippets.size} snippets`);
     } catch (e) {
       console.error("[SnippetManager] Error scanning snippets:", e);
@@ -548,7 +587,6 @@ class SnippetManager {
       snippet.enabled = true;
       this.enabledSnippets.add(filename);
       this.saveSettings();
-
       console.log("✨ [Snippet] Enabled:", filename);
     } catch (e) {
       console.error(`Failed to enable snippet ${filename}:`, e);
@@ -569,7 +607,6 @@ class SnippetManager {
     snippet.enabled = false;
     this.enabledSnippets.delete(filename);
     this.saveSettings();
-
     console.log("✨ [Snippet] Disabled:", filename);
   }
 
@@ -585,7 +622,7 @@ class SnippetManager {
   }
 }
 
-// アイコンマップに追加のアイコンを登録
+// --- Helper Functions ---
 function initializeLucideIcons() {
   const iconMap: Record<string, string> = {
     'file-text': FileText,
@@ -647,7 +684,6 @@ function createLucideIcon(iconName: string): SVGElement {
   };
 
   const svgString = iconMap[iconName];
-
   if (svgString) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(svgString, 'image/svg+xml');
@@ -667,21 +703,18 @@ function createLucideIcon(iconName: string): SVGElement {
   return fallback;
 }
 
-// --- Helpers ---
 function applyZoom(zoom: number) {
   currentZoom = Math.min(Math.max(zoom, 0.5), 3.0);
   const app = document.getElementById("app");
   if (app) {
-    document.documentElement.style.setProperty(
-      "--ui-zoom",
-      currentZoom.toString(),
-    );
+    document.documentElement.style.setProperty("--ui-zoom", currentZoom.toString());
     app.style.transform = `scale(${currentZoom})`;
     app.style.width = `calc(100vw / ${currentZoom})`;
     app.style.height = `calc(100vh / ${currentZoom})`;
   }
   localStorage.setItem("robsidian-zoom", currentZoom.toString());
 }
+
 window.addEventListener("resize", () => {
   applyZoom(currentZoom);
 });
@@ -700,6 +733,7 @@ const showNotice = (message: string) => {
 
 // --- Markdown Renderer ---
 const renderer = new marked.Renderer();
+
 renderer.image = ({
   href,
   title,
@@ -721,6 +755,7 @@ renderer.image = ({
   }
   return `<img src="${src}" alt="${text}"${titleAttr} style="max-width: 100%; border-radius: 4px;">`;
 };
+
 // @ts-ignore
 renderer.code = (codeOrToken, langIfString) => {
   let text = "",
@@ -736,10 +771,13 @@ renderer.code = (codeOrToken, langIfString) => {
     text = String(codeOrToken);
     lang = String(langIfString || "");
   }
+
   const cleanLang = lang.trim().toLowerCase();
+
   if (cleanLang === "mermaid") {
     return `<div class="mermaid">${text}</div>`;
   }
+
   const language =
     cleanLang && hljs.getLanguage(cleanLang) ? cleanLang : "plaintext";
   try {
@@ -749,6 +787,7 @@ renderer.code = (codeOrToken, langIfString) => {
     return `<pre><code>${text}</code></pre>`;
   }
 };
+
 const wikiLinkExtension = {
   name: "wikiLink",
   level: "inline",
@@ -765,12 +804,14 @@ const wikiLinkExtension = {
     return `<span class="wiki-link" data-target="${token.text}">${token.text}</span>`;
   },
 };
+
 marked.use({ renderer, extensions: [wikiLinkExtension as any] });
 
 function wikiLinkCompletion(context: CompletionContext) {
   const word = context.matchBefore(/\[\[[^\]]*/);
   if (!word) return null;
   if (word.from == word.to && !context.explicit) return null;
+
   return {
     from: word.from + 2,
     options: currentFilesCache
@@ -822,6 +863,7 @@ class CommandManager {
             const matchShift = hk.modifiers.includes("Shift")
               ? e.shiftKey
               : true;
+
             if (matchKey && matchCtrl && matchShift) {
               e.preventDefault();
               cmd.callback();
@@ -841,18 +883,17 @@ class CommandManager {
     if (cmd) cmd.callback();
   }
 
-// CommandManagerクラス内
   showPalette() {
     const overlay = document.getElementById("command-palette");
     const input = document.getElementById("palette-input") as HTMLInputElement;
     const list = document.getElementById("palette-list");
+
     if (!overlay || !input || !list) return;
 
     overlay.style.display = "flex";
     input.value = "";
     input.focus();
 
-    // OS判定（WindowsならCtrl, MacならCmdを表示するため）
     const isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform);
 
     const renderItems = (filter: string) => {
@@ -863,20 +904,20 @@ class CommandManager {
           !cmd.name.toLowerCase().includes(filter.toLowerCase())
         )
           return;
+
         const li = document.createElement("li");
         li.className = "palette-item";
         li.innerHTML = `<span>${cmd.name}</span>`;
-        
+
         if (cmd.hotkeys && cmd.hotkeys.length > 0) {
           const k = cmd.hotkeys[0];
-          // ★修正: "Mod" を環境に合わせて "Ctrl" または "Cmd" に変換して表示
           const displayModifiers = k.modifiers.map(m => {
             if (m === "Mod") return isMac ? "Cmd" : "Ctrl";
             return m;
           });
           li.innerHTML += `<span class="palette-key">${displayModifiers.join("+")}+${k.key.toUpperCase()}</span>`;
         }
-        
+
         li.onclick = () => {
           overlay.style.display = "none";
           cmd.callback();
@@ -886,11 +927,11 @@ class CommandManager {
     };
 
     renderItems("");
-
     input.oninput = () => renderItems(input.value);
     input.onkeydown = (e) => {
       if (e.key === "Escape") overlay.style.display = "none";
     };
+
     overlay.onclick = (e) => {
       if (e.target === overlay) overlay.style.display = "none";
     };
@@ -922,31 +963,37 @@ class PluginManager {
     await this.scanDirectory(vaultPath, "plugins", "plugin");
     await this.scanDirectory(vaultPath, "themes", "theme");
     console.log(
-      `🔌 [Plugin] Found ${this.availablePlugins.size} plugins/themes`,
+      `🔌 [Plugin] Found ${this.availablePlugins.size} plugins/themes`
     );
+
     for (const id of this.enabledPluginIds) {
       if (this.availablePlugins.has(id)) {
         await this.enablePlugin(id);
       }
     }
+
     console.log("🔌 [Plugin] Scan complete");
   }
 
   private async scanDirectory(
     vaultPath: string,
     dirName: string,
-    type: PluginType,
+    type: PluginType
   ) {
     const sep = vaultPath.includes("/") ? "/" : "\\";
     const targetDir = `${vaultPath}${sep}.robsidian${sep}${dirName}`;
+
     try {
       const exists = await invoke("directory_exists", {
         path: targetDir,
       }).catch(() => false);
+
       if (!exists) return;
+
       const entries = (await invoke("list_files", {
         path: targetDir,
       })) as FileEntry[];
+
       for (const entry of entries) {
         if (entry.is_dir) await this.readManifest(entry.path, type);
       }
@@ -958,16 +1005,20 @@ class PluginManager {
   private async readManifest(pluginDir: string, type: PluginType) {
     const sep = pluginDir.includes("/") ? "/" : "\\";
     const manifestPath = `${pluginDir}${sep}manifest.json`;
+
     try {
       const exists = await invoke("file_exists", { path: manifestPath }).catch(
-        () => false,
+        () => false
       );
       if (!exists) return;
+
       const content = (await invoke("read_file_content", {
         path: manifestPath,
       })) as string;
+
       const manifest: PluginManifest = JSON.parse(content);
       if (!manifest.id) return;
+
       this.availablePlugins.set(manifest.id, {
         manifest,
         dir: pluginDir,
@@ -976,7 +1027,7 @@ class PluginManager {
     } catch (e) {
       console.error(
         `[PluginManager] Failed to read manifest in ${pluginDir}`,
-        e,
+        e
       );
     }
   }
@@ -995,7 +1046,7 @@ class PluginManager {
     console.log("🔌 [Plugin] Enabling:", id);
     console.log(
       " 📊 Panes before enable:",
-      this.app.workspace.getLeaves().length,
+      this.app.workspace.getLeaves().length
     );
 
     if (this.loadedPlugins.has(id)) {
@@ -1017,13 +1068,14 @@ class PluginManager {
         const cssContent = (await invoke("read_file_content", {
           path: cssPath,
         })) as string;
+
         let styleEl = document.getElementById(`theme-style`);
         if (!styleEl) {
           styleEl = document.createElement("style");
           styleEl.id = `theme-style`;
           document.head.appendChild(styleEl);
         }
-        styleEl.textContent = cssContent;
+                styleEl.textContent = cssContent;
         this.loadedPlugins.set(id, { type: "theme", el: styleEl });
         this.enabledPluginIds.add(id);
         this.saveSettings();
@@ -1054,12 +1106,12 @@ class PluginManager {
           saveData: async (saveData: any) => {
             localStorage.setItem(
               `robsidian-plugin-data-${id}`,
-              JSON.stringify(saveData),
+              JSON.stringify(saveData)
             );
           },
           addSettingTab: (
             _name: string,
-            handler: (container: HTMLElement) => void,
+            handler: (container: HTMLElement) => void
           ) => {
             this.settingTabs.set(id, handler);
           },
@@ -1070,7 +1122,6 @@ class PluginManager {
 
       if (pluginInstance && typeof pluginInstance.onload === "function") {
         console.log(" 🚀 Calling onload for:", id);
-
         // タイムアウト付きでonloadを呼ぶ（10秒制限）
         await Promise.race([
           pluginInstance.onload(pluginApi),
@@ -1081,8 +1132,9 @@ class PluginManager {
 
         console.log(
           " 📊 Panes after onload:",
-          this.app.workspace.getLeaves().length,
+          this.app.workspace.getLeaves().length
         );
+
         this.loadedPlugins.set(id, pluginInstance);
         this.enabledPluginIds.add(id);
         this.saveSettings();
@@ -1092,7 +1144,7 @@ class PluginManager {
       console.error(`[PluginManager] Failed to enable ${id}:`, e);
       this.enabledPluginIds.delete(id);
       alert(`Failed to enable ${data.type} ${id}: ${e}`);
-      throw e; // エラーを再スロー
+      throw e;
     }
   }
 
@@ -1106,6 +1158,7 @@ class PluginManager {
         } catch (e) {
           console.error(e);
         }
+
       this.settingTabs.delete(id);
       this.loadedPlugins.delete(id);
       this.enabledPluginIds.delete(id);
@@ -1116,20 +1169,22 @@ class PluginManager {
   public isEnabled(id: string): boolean {
     return this.enabledPluginIds.has(id);
   }
+
   public getPluginsByType(type: PluginType) {
     return Array.from(this.availablePlugins.values()).filter(
-      (p) => p.type === type,
+      (p) => p.type === type
     );
   }
+
   private saveSettings() {
     localStorage.setItem(
       "robsidian-enabled-plugins",
-      JSON.stringify(Array.from(this.enabledPluginIds)),
+      JSON.stringify(Array.from(this.enabledPluginIds))
     );
   }
 }
 
-// EditorPane Class
+// --- EditorPane Class ---
 class EditorPane {
   public id: string;
   public container: HTMLElement;
@@ -1139,60 +1194,113 @@ class EditorPane {
   private contentArea: HTMLElement;
   private cmEditor: EditorView | null = null;
   private editorExtensions: any[] | null = null;
+
   constructor(private manager: PaneManager) {
     this.id = Math.random().toString(36).substring(2, 9);
     this.container = document.createElement("div");
     this.container.className = "pane";
     this.container.innerHTML = `<div class="pane-header"></div><div class="pane-content markdown-body"></div>`;
+
     this.headerEl = this.container.querySelector(".pane-header") as HTMLElement;
     this.contentArea = this.container.querySelector(
-      ".pane-content",
+      ".pane-content"
     ) as HTMLElement;
+
     this.container.addEventListener("mousedown", () => {
       this.manager.setActive(this);
     });
+
     this.renderEmpty();
 
     this.contentArea.addEventListener("click", async (e) => {
       const target = e.target as HTMLElement;
-      if (target.classList.contains("wiki-link")) {
-        e.preventDefault();
-        e.stopPropagation();
-        const linkTarget = target.getAttribute("data-target");
-        if (linkTarget) {
-          const targetName = linkTarget.toLowerCase();
-          let match = currentFilesCache.find(
-            (f) =>
-              !f.is_dir &&
-              (f.name.toLowerCase() === targetName ||
-                f.name.toLowerCase() === `${targetName}.md`),
-          );
-          if (match)
+
+      // ★ローカルリンクを開く（または作成する）共通処理
+      const openLocalLink = async (linkTarget: string) => {
+        // URLエンコード（%20など）を元に戻す
+        const decodedTarget = decodeURIComponent(linkTarget);
+        
+        // Vaultのルートパスと結合して絶対パスを作る
+        const root = currentPath;
+        const sep = root.includes("/") ? "/" : "\\";
+        const normalizedTarget = decodedTarget.replace(/[\/\\]/g, sep);
+        
+        // リンクに拡張子がなければ .md を補完する
+        const finalTarget = normalizedTarget.toLowerCase().endsWith('.md') 
+          ? normalizedTarget 
+          : `${normalizedTarget}.md`;
+          
+        const fullPath = `${root}${sep}${finalTarget}`;
+        const fileName = fullPath.split(sep).pop() || finalTarget;
+
+        try {
+          // キャッシュではなく、直接OSにファイルが存在するかチェックする
+          const exists = await invoke("file_exists", { path: fullPath }).catch(() => false);
+
+          if (exists) {
+            // ファイルが存在する場合は開く
             this.manager.openFileInActive({
-              name: match.name,
-              path: match.path,
+              name: fileName,
+              path: fullPath,
               is_dir: false,
             });
-          else if (confirm(`File "${linkTarget}" not found. Create it?`)) {
-            const root = currentPath;
-            const sep = root.includes("/") ? "/" : "\\";
-            const newPath = `${root}${sep}${linkTarget}.md`;
-            try {
-              await invoke("create_file", { path: newPath });
+          } else {
+            // 存在しない場合は作成の確認
+            if (confirm(`File "${decodedTarget}" not found. Create it?`)) {
+              // ★修正: サブディレクトリが含まれている場合、先にフォルダを作成する
+              const dirPath = fullPath.substring(0, fullPath.lastIndexOf(sep));
+              if (dirPath !== root) {
+                try {
+                  await invoke("create_directory", { path: dirPath });
+                } catch (e) {
+                  // 既にフォルダが存在する場合のエラーは無視
+                }
+              }
+
+              // ファイルを作成
+              await invoke("create_file", { path: fullPath });
               await loadFilesGlobal(root);
+              
               this.manager.openFileInActive({
-                name: `${linkTarget}.md`,
-                path: newPath,
+                name: fileName,
+                path: fullPath,
                 is_dir: false,
               });
-            } catch (err) {
-              alert("Failed: " + err);
             }
+          }
+        } catch (err) {
+          alert("Failed to open or create link: " + err);
+        }
+      };
+
+      // 1. [[WikiLink]] のクリック処理
+      if (target.classList.contains("wiki-link")) {
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          const linkTarget = target.getAttribute("data-target");
+          if (linkTarget) {
+            await openLocalLink(linkTarget);
           }
         }
       }
+
+      // 2. [text](link) 形式のクリック処理 (Live Preview内)
+      const linkElement = target.closest('.cm-link-rendered') as HTMLAnchorElement | null;
+      if (linkElement) {
+        const href = linkElement.getAttribute("href");
+        
+        // 外部リンク (httpなど) やページ内リンク (#) ではないローカルパスの場合
+        if (href && !href.startsWith("http") && !href.startsWith("mailto:") && !href.startsWith("#")) {
+          // 通常クリックでもCtrl+クリックでも開くようにする
+          e.preventDefault();
+          e.stopPropagation();
+          await openLocalLink(href);
+        }
+      }
     });
-  }
+    }
+
   public toJSON(): SavedPaneState {
     if (this.activeTabId) {
       const currentTab = this.tabs.find((t) => t.id === this.activeTabId);
@@ -1202,6 +1310,7 @@ class EditorPane {
         currentTab.scrollTop = this.contentArea.scrollTop;
       }
     }
+
     return {
       width: this.container.style.width,
       flex: this.container.style.flex,
@@ -1216,10 +1325,12 @@ class EditorPane {
         : -1,
     };
   }
+
   public setActive(isActive: boolean) {
     if (isActive) this.container.classList.add("active");
     else this.container.classList.remove("active");
   }
+
   public openTerminal(title: string = "Terminal", cmd?: string) {
     const term = new RobsidianTerminal();
     const newTab: EditorTab = {
@@ -1232,19 +1343,24 @@ class EditorPane {
       termTitle: title,
       contentCache: null,
     };
+
     if (cmd) setTimeout(() => term.sendInput(cmd + "\r"), 800);
+
     this.tabs.push(newTab);
     this.switchTab(newTab.id);
     saveSession();
   }
+
   public async openFile(entry: FileEntry, initialScrollTop: number = 0) {
     const existingTab = this.tabs.find(
-      (t) => t.type === "editor" && t.file?.path === entry.path,
+      (t) => t.type === "editor" && t.file?.path === entry.path
     );
+
     if (existingTab) {
       this.switchTab(existingTab.id);
       return;
     }
+
     let content = "";
     try {
       content = (await invoke("read_file_content", {
@@ -1253,6 +1369,7 @@ class EditorPane {
     } catch (e) {
       content = `Cannot read file: ${entry.path}`;
     }
+
     const newTab: EditorTab = {
       id: Math.random().toString(36).substring(2, 9),
       type: "editor",
@@ -1262,11 +1379,13 @@ class EditorPane {
       isEditing: false,
       isDirty: false,
     };
+
     this.startPolling(newTab);
     this.tabs.push(newTab);
     this.switchTab(newTab.id);
     saveSession();
   }
+
   private startPolling(tab: EditorTab) {
     if (!tab.file) return;
     if (tab.pollingId) window.clearInterval(tab.pollingId);
@@ -1305,6 +1424,7 @@ class EditorPane {
       }
     }, 2000); // 2秒に延長（負荷軽減）
   }
+
   public switchTab(tabId: string) {
     if (this.activeTabId) {
       const currentTab = this.tabs.find((t) => t.id === this.activeTabId);
@@ -1322,22 +1442,29 @@ class EditorPane {
           currentTab.terminalInstance.detach();
       }
     }
+
     this.activeTabId = tabId;
     this.renderHeader();
     this.renderContent();
     saveSession();
   }
+
   public closeTab(tabId: string) {
     const tab = this.tabs.find((t) => t.id === tabId);
+
     if (tab && tab.pollingId) {
       window.clearInterval(tab.pollingId);
       tab.pollingId = undefined;
     }
+
     if (tab && tab.type === "terminal" && tab.terminalInstance)
       tab.terminalInstance.destroy();
+
     const tabIndex = this.tabs.findIndex((t) => t.id === tabId);
     if (tabIndex === -1) return;
+
     this.tabs.splice(tabIndex, 1);
+
     if (this.activeTabId === tabId) {
       this.activeTabId = null;
       if (this.tabs.length > 0)
@@ -1347,8 +1474,10 @@ class EditorPane {
         this.renderEmpty();
       }
     } else this.renderHeader();
+
     saveSession();
   }
+
   private renderHeader() {
     this.headerEl.innerHTML = "";
     this.tabs.forEach((tab) => {
@@ -1385,17 +1514,20 @@ class EditorPane {
       tabEl.appendChild(iconElement);
       tabEl.appendChild(titleSpan);
       tabEl.appendChild(closeBtn);
+
       tabEl.addEventListener("click", (e) => {
         if ((e.target as HTMLElement).classList.contains("tab-close")) {
           e.stopPropagation();
           this.closeTab(tab.id);
         } else this.switchTab(tab.id);
       });
+
       tabEl.addEventListener("dragstart", (e) => {
         draggingTabState = { paneId: this.id, tabId: tab.id };
         e.dataTransfer!.setData("text/plain", tab.id);
         requestAnimationFrame(() => tabEl.classList.add("dragging"));
       });
+
       tabEl.addEventListener("dragend", () => {
         tabEl.classList.remove("dragging");
         draggingTabState = null;
@@ -1403,6 +1535,7 @@ class EditorPane {
           .querySelectorAll(".drag-over")
           .forEach((el) => el.classList.remove("drag-over"));
       });
+
       tabEl.addEventListener("dragover", (e) => {
         e.preventDefault();
         if (
@@ -1412,17 +1545,21 @@ class EditorPane {
         )
           tabEl.classList.add("drag-over");
       });
+
       tabEl.addEventListener("dragleave", () => {
         tabEl.classList.remove("drag-over");
       });
+
       tabEl.addEventListener("drop", (e) => {
         e.preventDefault();
         tabEl.classList.remove("drag-over");
         if (!draggingTabState || draggingTabState.paneId !== this.id) return;
+
         const sourceIdx = this.tabs.findIndex(
-          (t) => t.id === draggingTabState!.tabId,
+          (t) => t.id === draggingTabState!.tabId
         );
         const targetIdx = this.tabs.findIndex((t) => t.id === tab.id);
+
         if (sourceIdx > -1 && targetIdx > -1) {
           const [moved] = this.tabs.splice(sourceIdx, 1);
           this.tabs.splice(targetIdx, 0, moved);
@@ -1430,11 +1567,12 @@ class EditorPane {
           saveSession();
         }
       });
+
       this.headerEl.appendChild(tabEl);
     });
   }
-    private getEditorExtensions() {
-    // キャッシュがあり、Vim/テーマ設定が変わっていなければ再利用
+
+  private getEditorExtensions() {
     if (this.editorExtensions) {
       return this.editorExtensions;
     }
@@ -1447,9 +1585,11 @@ class EditorPane {
       python(),
       html(),
       css(),
+      keymap.of(foldKeymap),
       autocompletion({ override: [wikiLinkCompletion] }),
       EditorView.lineWrapping,
       proseTheme,
+      livePreview(),
       keymap.of([
         ...defaultKeymap,
         ...historyKeymap,
@@ -1463,24 +1603,16 @@ class EditorPane {
             return true;
           },
         },
-        {
-          key: "Escape",
-          run: () => {
-            const tab = this.tabs.find((t) => t.id === this.activeTabId);
-            if (tab && this.cmEditor) {
-              tab.contentCache = this.cmEditor.state.doc.toString();
-              tab.isEditing = false;
-              this.renderContent();
-            }
-            return true;
-          },
-        },
       ]),
       EditorView.updateListener.of((u) => {
         const tab = this.tabs.find((t) => t.id === this.activeTabId);
         if (!tab) return;
 
-        if (u.docChanged) tab.isDirty = true;
+        if (u.docChanged) {
+          tab.isDirty = true;
+          this.renderHeader();
+        }
+
         const pos = u.state.selection.main.head;
         const line = u.state.doc.lineAt(pos);
         const statusCursor = document.getElementById("status-cursor");
@@ -1508,83 +1640,194 @@ class EditorPane {
           content: c,
         });
         tab.contentCache = c;
-        tab.isEditing = false;
         tab.isDirty = false;
-        this.cmEditor!.destroy();
-        this.cmEditor = null;
-        this.renderContent();
+        this.renderHeader();
+        showNotice(`Saved: ${tab.file!.name}`);
       } catch (e) {
         alert("Save failed: " + e);
       }
     };
+
     save();
   }
+
   private async renderContent() {
     const tab = this.tabs.find((t) => t.id === this.activeTabId);
     if (!tab) {
       this.renderEmpty();
       return;
     }
+
     this.contentArea.innerHTML = "";
 
     const statusMode = document.getElementById("status-mode");
     if (statusMode)
       statusMode.innerText =
-        tab.type === "terminal" ? "TERMINAL" : isVimMode ? "VIM" : "NORMAL";
+        tab.type === "terminal" ? "TERMINAL" :
+        isVimMode ? "VIM" : "LIVE PREVIEW";
 
     if (tab.type === "terminal" && tab.terminalInstance) {
       this.contentArea.style.overflow = "hidden";
       tab.terminalInstance.attachTo(this.contentArea);
       return;
     }
+
     this.contentArea.style.overflow = "auto";
 
-    if (tab.isEditing && tab.type === "editor" && tab.file) {
-      this.contentArea.innerHTML = `<div class="editor-container"><div style="padding:5px;text-align:right;border-bottom:1px solid var(--border-color);background:var(--bg-sidebar);"><button class="btn-save primary">Save</button></div><div class="editor-wrapper"></div></div>`;
-      const wrapper = this.contentArea.querySelector(
-        ".editor-wrapper",
-      ) as HTMLElement;
-
-    this.cmEditor = new EditorView({
-      doc: tab.contentCache || "",
-      extensions: this.getEditorExtensions(),
-      parent: wrapper,
-    });
-    this.contentArea
-      .querySelector(".btn-save")
-      ?.addEventListener("click", () => this.saveCurrentTab());
-    } else if (tab.type === "editor" && tab.file) {
+    if (tab.type === "editor" && tab.file) {
       const toolbar = document.createElement("div");
       toolbar.style.cssText =
         "position:sticky;top:0;background:var(--bg-main);z-index:10;padding:5px 20px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;";
-      toolbar.innerHTML = `<div style="font-size:0.8em;color:var(--text-muted);">${tab.file.path}</div><div><button class="pane-btn edit-internal">Edit</button><button class="pane-btn edit-helix">Hx</button></div>`;
-      toolbar.querySelector(".edit-internal")?.addEventListener("click", () => {
-        tab.isEditing = true;
-        this.renderContent();
-      });
-      toolbar.querySelector(".edit-helix")?.addEventListener("click", () => {
+
+      const pathInfo = document.createElement('div');
+      pathInfo.style.cssText = "font-size:0.8em;color:var(--text-muted);";
+      pathInfo.textContent = tab.file.path;
+
+      const btnGroup = document.createElement('div');
+      btnGroup.style.cssText = "display:flex;gap:8px;";
+
+      const btnSave = document.createElement('button');
+      btnSave.className = 'pane-btn';
+      btnSave.textContent = '💾 Save';
+      btnSave.onclick = () => this.saveCurrentTab();
+
+      const btnHelix = document.createElement('button');
+      btnHelix.className = 'pane-btn';
+      btnHelix.textContent = 'Hx';
+      btnHelix.onclick = () => {
         if (window.robsidianOpenHelix) window.robsidianOpenHelix(tab.file!);
-      });
+      };
+
+      btnGroup.appendChild(btnSave);
+      btnGroup.appendChild(btnHelix);
+
+      toolbar.appendChild(pathInfo);
+      toolbar.appendChild(btnGroup);
       this.contentArea.appendChild(toolbar);
-      const body = document.createElement("div");
-      body.className = "markdown-body";
-      if (tab.file.name.endsWith(".md"))
-        body.innerHTML = await marked(tab.contentCache || "");
-      else
-        body.innerHTML = `<pre><code>${(tab.contentCache || "").replace(/</g, "&lt;")}</code></pre>`;
-      this.contentArea.appendChild(body);
-      try {
-        if (document.body.contains(body)) {
-          requestAnimationFrame(() =>
-            mermaid.run({ nodes: body.querySelectorAll(".mermaid") }),
-          );
-        }
-      } catch (e) {}
-      setTimeout(() => {
-        this.contentArea.scrollTop = tab.scrollTop;
-      }, 0);
+
+      const editorContainer = document.createElement("div");
+      editorContainer.className = "editor-wrapper";
+      editorContainer.style.cssText = "height: calc(100% - 41px); overflow: hidden;";
+      this.contentArea.appendChild(editorContainer);
+
+      this.cmEditor = new EditorView({
+        doc: tab.contentCache || "",
+        extensions: this.getEditorExtensions(),
+        parent: editorContainer,
+      });
+
+      // ★画像ペースト機能を追加
+      const pasteHandler = await setupImagePasteHandler(this.cmEditor, tab.file.path);
+      editorContainer.addEventListener('paste', pasteHandler);
+
+      // ★アウトライン更新
+      this.updateOutline(tab.contentCache || "");
+
+      // ★バックリンク更新
+      this.updateBacklinks(tab.file.path);
+
+      this.cmEditor.focus();
     }
   }
+
+  // ★アウトライン更新メソッドを追加
+  private updateOutline(content: string) {
+    const outline = extractOutline(content);
+    const container = document.querySelector('#outline-container');
+
+    if (container) {
+      renderOutline(container as HTMLElement, outline, (line) => {
+        // 行にジャンプ
+        if (this.cmEditor) {
+          const pos = this.cmEditor.state.doc.line(line).from;
+          this.cmEditor.dispatch({
+            selection: { anchor: pos, head: pos },
+            effects: EditorView.scrollIntoView(pos, { y: 'center' })
+          });
+          this.cmEditor.focus();
+        }
+      });
+    }
+  }
+
+  // ★バックリンク更新メソッド（全文検索APIを使った最強版）
+  private async updateBacklinks(currentFilePath: string) {
+    const targetName = currentFilePath.split(/[\/\\]/).pop()?.replace(/\.md$/, '') || '';
+    if (!targetName) return;
+
+    const backlinks: any[] = [];
+    const vaultRoot = window.app?.vault?.root || localStorage.getItem("robsidian-last-path") || ".";
+
+    try {
+      // 1. Rust側の検索APIを使って、Vault全体のあらゆるフォルダからリンク記述を探す
+      const results = (await invoke("search_files", {
+        rootPath: vaultRoot,
+        query: targetName,
+      })) as {path: string; name: string; is_dir: boolean; snippet: string}[];
+
+      results.forEach(r => {
+        if (!r.is_dir && r.path !== currentFilePath) {
+          backlinks.push({
+            file: r.name,
+            path: r.path,
+            context: r.snippet.trim() || `Linked in ${r.name}`,
+            line: 1 
+          });
+        }
+      });
+
+      // 2. 現在開いている「未保存」のタブからも検索（リアルタイム反映のため）
+      const openTabs = this.manager.panes.flatMap(p => p.tabs).filter(t => t.type === 'editor' && t.file && t.isDirty && t.file.path !== currentFilePath);
+      
+      for (const tab of openTabs) {
+        if (tab.contentCache && tab.contentCache.includes(targetName)) {
+          // 既に保存済みの検索結果に含まれていなければ追加
+          if (!backlinks.some(b => b.path === tab.file!.path)) {
+            backlinks.push({
+              file: tab.file!.name,
+              path: tab.file!.path,
+              context: "Unsaved changes containing link...",
+              line: 1
+            });
+          }
+        }
+      }
+
+    } catch (e) {
+      console.error("Failed to search backlinks:", e);
+    }
+
+    // 3. HTMLのコンテナを探してレンダリング
+    let container = document.querySelector('#backlinks-container') || document.querySelector('#links-container');
+    
+    // IDが見つからない場合の力技フォールバック（画面の文字を目印に探す）
+    if (!container) {
+      const sidebarRight = document.getElementById('sidebar-right');
+      if (sidebarRight) {
+        const views = sidebarRight.querySelectorAll('.sidebar-view');
+        for (let i = 0; i < views.length; i++) {
+          if (views[i].innerHTML.includes('Backlinks will appear here') || views[i].innerHTML.includes('No backlinks found') || views[i].innerHTML.includes('backlink-item')) {
+            container = views[i];
+            break;
+          }
+        }
+      }
+    }
+
+    if (container) {
+      renderBacklinks(container as HTMLElement, backlinks, (path, _line) => {
+        const fileName = path.split(/[\/\\]/).pop() || "Unknown";
+        globalPaneManager?.openFileInActive({
+          name: fileName,
+          path: path,
+          is_dir: false
+        });
+      });
+    } else {
+      console.warn("Could not find backlinks container in the DOM.");
+    }
+  }
+
   public async renderEmpty() {
     this.activeTabId = null;
     this.headerEl.innerHTML = "";
@@ -1595,22 +1838,26 @@ class EditorPane {
         this.manager.removePane(this);
       });
   }
+
   public destroy() {
     if (this.cmEditor) this.cmEditor.destroy();
     this.container.remove();
   }
 }
 
+// --- PaneManager Class ---
 class PaneManager {
   public panes: EditorPane[] = [];
   public activePane: EditorPane | null = null;
   private container: HTMLElement;
+
   constructor(id: string) {
     const el = document.getElementById(id);
     if (!el) throw new Error("No container");
     this.container = el;
     this.updateLayoutDirection();
   }
+
   public updateLayoutDirection() {
     this.container.style.flexDirection = layoutDirection;
     const btn = document.getElementById("btn-toggle-layout");
@@ -1622,36 +1869,45 @@ class PaneManager {
           : "Split Horizontal (Click to switch)";
     }
   }
+
   public toggleLayout() {
     console.log("🔄 [Layout] Toggle layout from", layoutDirection);
     layoutDirection = layoutDirection === "row" ? "column" : "row";
+
     this.panes.forEach((p) => {
       p.container.style.width = "";
       p.container.style.height = "";
       p.container.style.flex = "1";
     });
+
     this.updateLayoutDirection();
     console.log("🔄 [Layout] New layout:", layoutDirection);
-    saveSession(true); // ★即座に保存
+    saveSession(true);
   }
+
   public addPane() {
     console.trace("📌 [Pane] addPane() called from:");
     const pane = new EditorPane(this);
+
     if (this.panes.length > 0) {
       const r = document.createElement("div");
       r.className = "pane-resizer";
       this.container.appendChild(r);
       this.initResizer(r);
     }
+
     this.panes.push(pane);
     this.container.appendChild(pane.container);
     this.setActive(pane);
+
     console.log("📊 [Pane] Total panes now:", this.panes.length);
     saveSession();
     return pane;
   }
+
   public removePane(p: EditorPane) {
-    console.log("🗑️ [Pane] Removing pane, current count:", this.panes.length);
+    console.log("🗑 [Pane] Removing pane, current count:", this.panes.length);
+
     if (this.panes.length <= 1) {
       p.tabs = [];
       p.renderEmpty();
@@ -1659,15 +1915,19 @@ class PaneManager {
       saveSession(true);
       return;
     }
+
     const idx = this.panes.indexOf(p);
     p.destroy();
     this.panes.splice(idx, 1);
+
     if (this.activePane === p)
       this.setActive(this.panes[Math.min(idx, this.panes.length - 1)]);
+
     this.resetLayout();
     console.log("📊 [Pane] Panes after remove:", this.panes.length);
-    saveSession(true); // ★即座に保存
+    saveSession(true);
   }
+
   private resetLayout() {
     Array.from(this.container.children).forEach((child) => {
       if (child.classList.contains("pane")) {
@@ -1678,19 +1938,23 @@ class PaneManager {
       }
     });
   }
+
   public setActive(p: EditorPane) {
     this.panes.forEach((x) => x.setActive(false));
     this.activePane = p;
     p.setActive(true);
   }
+
   public openFileInActive(e: FileEntry) {
     if (!this.activePane) this.addPane();
     this.activePane!.openFile(e);
   }
+
   public openTerminalInActive() {
     if (!this.activePane) this.addPane();
     this.activePane!.openTerminal();
   }
+
   public saveState(): SavedSession {
     return {
       panes: this.panes.map((p) => p.toJSON()),
@@ -1701,23 +1965,29 @@ class PaneManager {
       layoutDirection,
     };
   }
+
   private initResizer(resizer: HTMLElement) {
     let isResizing = false;
+
     resizer.addEventListener("mousedown", () => {
       isResizing = true;
       document.body.style.cursor =
         layoutDirection === "row" ? "col-resize" : "row-resize";
       resizer.classList.add("resizing");
     });
+
     document.addEventListener("mousemove", (e) => {
       if (!isResizing) return;
+
       const prev = resizer.previousElementSibling as HTMLElement;
       const next = resizer.nextElementSibling as HTMLElement;
       if (!prev || !next) return;
+
       const delta =
         layoutDirection === "row"
           ? e.movementX / currentZoom
           : e.movementY / currentZoom;
+
       if (layoutDirection === "row") {
         prev.style.width = `${prev.offsetWidth + delta}px`;
         next.style.width = `${next.offsetWidth - delta}px`;
@@ -1725,9 +1995,11 @@ class PaneManager {
         prev.style.height = `${prev.offsetHeight + delta}px`;
         next.style.height = `${next.offsetHeight - delta}px`;
       }
+
       prev.style.flex = "none";
       next.style.flex = "none";
     });
+
     document.addEventListener("mouseup", () => {
       if (isResizing) {
         isResizing = false;
@@ -1739,7 +2011,7 @@ class PaneManager {
   }
 }
 
-// ★グローバル変数に追加
+// --- Session Management ---
 let isRestoring = false;
 
 function saveSession(immediate = false) {
@@ -1748,19 +2020,17 @@ function saveSession(immediate = false) {
     return;
   }
 
-  // 復元中は immediate=true の場合のみ許可
   if (isRestoring && !immediate) {
     return;
   }
 
   const doSave = () => {
     const now = Date.now();
-    // 最後の保存から100ms以内ならスキップ（immediate=falseの場合）
     if (!immediate && now - lastSaveTime < 100) {
       return;
     }
-    lastSaveTime = now;
 
+    lastSaveTime = now;
     const state = globalPaneManager!.saveState();
     try {
       localStorage.setItem("robsidian-session", JSON.stringify(state));
@@ -1799,6 +2069,7 @@ async function restoreSession(manager: PaneManager) {
     if (s.sidebarWidth)
       document.documentElement.style.setProperty("--sidebar-width", s.sidebarWidth);
     if (s.sidebarClosed) document.body.classList.add("sidebar-closed");
+
     if (s.layoutDirection) {
       layoutDirection = s.layoutDirection;
       manager.updateLayoutDirection();
@@ -1816,19 +2087,17 @@ async function restoreSession(manager: PaneManager) {
       if (s.layoutDirection === "column") p.container.style.flex = sp.flex;
       else p.container.style.width = sp.width;
 
-      // ★全てのタブ復元を待つ
       for (const t of sp.tabs) {
         if (t.type === "terminal") {
           p.openTerminal(t.name);
         } else if (t.path) {
           await p.openFile(
             { name: t.name!, path: t.path, is_dir: false },
-            t.scrollTop,
+            t.scrollTop
           );
         }
       }
 
-      // ★タブの存在を確認
       if (sp.activeTabIndex >= 0 && sp.activeTabIndex < p.tabs.length) {
         p.switchTab(p.tabs[sp.activeTabIndex].id);
       } else if (p.tabs.length > 0) {
@@ -1842,7 +2111,6 @@ async function restoreSession(manager: PaneManager) {
     if (manager.panes.length === 0) manager.addPane();
   } finally {
     isRestoring = false;
-    // 復元完了後に一度だけ保存
     saveSession(true);
   }
 }
@@ -1854,10 +2122,8 @@ function forceSaveSession() {
   console.log("🚪 [Exit] Final save:", state.panes.length, "panes");
 }
 
-
-// ★デバッグパネルの作成 (改良版)
+// ★デバッグパネル
 function createDebugPanel() {
-  // 保存された設定を読み込み
   let isVisible = localStorage.getItem("robsidian-show-debug") === "true";
 
   const panel = document.createElement("div");
@@ -1876,19 +2142,18 @@ function createDebugPanel() {
     min-width: 280px;
     box-shadow: 0 4px 12px rgba(0,0,0,0.5);
     border: 1px solid #333;
-    display: ${isVisible ? "block" : "none"}; /* 初期表示状態 */
+    display: ${isVisible ? "block" : "none"};
   `;
+
   document.body.appendChild(panel);
 
   const update = () => {
-    // 非表示ならDOM更新をスキップして負荷軽減
     if (panel.style.display === "none") return;
 
     const saved = JSON.parse(
-      localStorage.getItem("robsidian-session") || "{}",
+      localStorage.getItem("robsidian-session") || "{}"
     );
-    
-    // パネルの中身を構築
+
     panel.innerHTML = `
       <div style="font-weight:bold; margin-bottom:8px; color:#0ff; border-bottom:1px solid #333; padding-bottom:4px; display:flex; justify-content:space-between;">
         <span>🔍 Debug Panel</span>
@@ -1901,7 +2166,7 @@ function createDebugPanel() {
       <div style="margin:3px 0;">▸ Last Save: <span style="color:#ff0">${saveCounter}</span></div>
       <div style="margin-top:8px; display:flex; gap:5px;">
         <button id="debug-save-now" style="flex:1; padding:4px 8px; cursor:pointer; background:#282; border:1px solid #4a4; color:#fff; border-radius:4px; font-size:10px;">💾 Save Now</button>
-        <button id="debug-clear" style="flex:1; padding:4px 8px; cursor:pointer; background:#822; border:1px solid #a44; color:#fff; border-radius:4px; font-size:10px;">🗑️ Clear</button>
+        <button id="debug-clear" style="flex:1; padding:4px 8px; cursor:pointer; background:#822; border:1px solid #a44; color:#fff; border-radius:4px; font-size:10px;">🗑 Clear</button>
       </div>
     `;
 
@@ -1918,18 +2183,23 @@ function createDebugPanel() {
   setInterval(update, 500);
 }
 
+// --- DOMContentLoaded: Application Initialization ---
 window.addEventListener("DOMContentLoaded", async () => {
-  console.log("🚀 [App] Starting Robsidian...");
+  console.log("[App] Starting Robsidian...");
+
   // Lucide Icons初期化
   initializeLucideIcons();
+
   // サイドバーマネージャー初期化
   console.log("📌 [App] Initializing SidebarManager...");
   globalSidebarManager = new SidebarManager();
+
   console.log("✨ [App] Initializing SnippetManager...");
   globalSnippetManager = new SnippetManager();
   if (currentPath) {
     await globalSnippetManager.scanSnippets(currentPath);
   }
+
   console.log("✅ [App] Initialization complete.");
 
   // Reload Snippets Button
@@ -1938,26 +2208,29 @@ window.addEventListener("DOMContentLoaded", async () => {
     btnReloadSnippets.onclick = async () => {
       if (globalSnippetManager && currentPath) {
         await globalSnippetManager.scanSnippets(currentPath);
-        renderSettingsUI(); // 再レンダリング
+        renderSettingsUI();
         showNotice("Snippets reloaded");
       }
     };
   }
+
   const getEl = (id: string) => document.getElementById(id);
+
   const defaultFont = "'HackGen', 'HackGen Console', sans-serif";
   let currentFont = localStorage.getItem("robsidian-font") || defaultFont;
   let currentFontSize = localStorage.getItem("robsidian-font-size") || "14";
   let currentLineHeight =
     localStorage.getItem("robsidian-line-height") || "1.5";
+
   document.documentElement.style.setProperty("--font-family-ui", currentFont);
   document.documentElement.style.setProperty("--font-family-code", currentFont);
   document.documentElement.style.setProperty(
     "--base-font-size",
-    `${currentFontSize}px`,
+    `${currentFontSize}px`
   );
   document.documentElement.style.setProperty(
     "--base-line-height",
-    currentLineHeight,
+    currentLineHeight
   );
 
   applyZoom(currentZoom);
@@ -1972,7 +2245,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         applyZoom(newZoom);
       }
     },
-    { passive: false },
+    { passive: false }
   );
 
   window.addEventListener("keydown", (e) => {
@@ -2021,12 +2294,14 @@ window.addEventListener("DOMContentLoaded", async () => {
   createDebugPanel();
 
   globalCommandManager = new CommandManager();
+
   globalCommandManager.register({
     id: "app:split-pane",
     name: "Split Pane",
     callback: () => globalPaneManager?.addPane(),
     hotkeys: [{ modifiers: ["Mod"], key: "\\" }],
   });
+
   globalCommandManager.register({
     id: "app:close-active-pane",
     name: "Close Active Pane",
@@ -2036,6 +2311,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     },
     hotkeys: [],
   });
+
   globalCommandManager.register({
     id: "app:new-file",
     name: "New File",
@@ -2064,6 +2340,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     },
     hotkeys: [{ modifiers: ["Mod"], key: "n" }],
   });
+
   globalCommandManager.register({
     id: "app:toggle-sidebar",
     name: "Toggle Sidebar",
@@ -2073,12 +2350,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     },
     hotkeys: [{ modifiers: ["Mod"], key: "b" }],
   });
+
   globalCommandManager.register({
     id: "app:open-terminal",
     name: "Open Terminal",
     callback: () => globalPaneManager?.openTerminalInActive(),
     hotkeys: [{ modifiers: ["Mod"], key: "j" }],
   });
+
   globalCommandManager.register({
     id: "editor:toggle-vim",
     name: "Toggle Vim Mode",
@@ -2088,11 +2367,12 @@ window.addEventListener("DOMContentLoaded", async () => {
       showNotice(`Vim Mode: ${isVimMode ? "ON" : "OFF"}`);
       if (globalPaneManager?.activePane)
         globalPaneManager.activePane.switchTab(
-          globalPaneManager.activePane.activeTabId!,
+          globalPaneManager.activePane.activeTabId!
         );
     },
     hotkeys: [],
   });
+
   globalCommandManager.register({
     id: "editor:toggle-vim",
     name: "Toggle Vim Mode",
@@ -2100,7 +2380,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       isVimMode = !isVimMode;
       localStorage.setItem("robsidian-vim-mode", String(isVimMode));
       showNotice(`Vim Mode: ${isVimMode ? "ON" : "OFF"}`);
-
       // エディタ設定のキャッシュをクリア
       if (globalPaneManager) {
         globalPaneManager.panes.forEach((pane: any) => {
@@ -2108,7 +2387,6 @@ window.addEventListener("DOMContentLoaded", async () => {
             pane.editorExtensions = null;
           }
         });
-
         // アクティブなタブを再レンダリング
         if (globalPaneManager.activePane && globalPaneManager.activePane.activeTabId) {
           globalPaneManager.activePane.switchTab(
@@ -2150,18 +2428,20 @@ window.addEventListener("DOMContentLoaded", async () => {
   const contextMenu = getEl("context-menu");
   const btnAddTab = getEl("btn-add-tab");
   const resizer = getEl("resizer");
+
   if (!listEl) {
     console.error("Critical: file-list element not found!");
   }
   if (!pathDisplay) {
     console.error("Critical: path-display element not found!");
   }
+
   const inputFontSize = getEl("input-font-size") as HTMLInputElement;
   const inputLineHeight = getEl("input-line-height") as HTMLInputElement;
   const valFontSize = getEl("val-font-size");
   const valLineHeight = getEl("val-line-height");
   const inputShellPath = document.getElementById(
-    "input-shell-path",
+    "input-shell-path"
   ) as HTMLInputElement;
 
   const savedTheme = localStorage.getItem("robsidian-theme");
@@ -2172,6 +2452,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.body.classList.remove("light-theme");
     if (btnToggleTheme) btnToggleTheme.innerText = "Switch to Light Mode ☀";
   }
+
   if (btnToggleTheme) {
     btnToggleTheme.onclick = () => {
       if (document.body.classList.contains("light-theme")) {
@@ -2188,11 +2469,13 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   const renderSettingsUI = () => {
     if (!globalPluginManager) return;
+
     const sidebarContainer = document.querySelector(".settings-sidebar");
     if (sidebarContainer) {
       sidebarContainer
         .querySelectorAll(".sidebar-item.plugin-setting")
         .forEach((el) => el.remove());
+
       globalPluginManager.settingTabs.forEach((handler, pluginId) => {
         const item = document.createElement("div");
         item.className = "sidebar-item plugin-setting";
@@ -2206,6 +2489,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           document
             .querySelectorAll(".settings-tab")
             .forEach((t) => t.classList.remove("active"));
+
           let pluginTab = document.getElementById(`tab-plugin-${pluginId}`);
           const contentContainer = document.querySelector(".settings-content");
           if (!pluginTab && contentContainer) {
@@ -2220,30 +2504,36 @@ window.addEventListener("DOMContentLoaded", async () => {
           }
           if (pluginTab) pluginTab.classList.add("active");
         });
+
         const footer = document.querySelector(".settings-footer-actions");
         sidebarContainer.insertBefore(item, footer);
       });
     }
+
     const renderList = (
       containerId: string,
       type: PluginType,
-      emptyMsg: string,
+      emptyMsg: string
     ) => {
       const container = document.getElementById(containerId);
       if (!container) return;
+
       container.innerHTML = "";
       const items = globalPluginManager!.getPluginsByType(type);
       if (items.length === 0) {
         container.innerHTML = `<p style='color:#888'>${emptyMsg}</p>`;
         return;
       }
+
       items.forEach(({ manifest }) => {
         const item = document.createElement("div");
         item.className = "plugin-item";
         item.style.cssText =
           "display:flex; justify-content:space-between; align-items:center; padding:10px; border-bottom:1px solid var(--border-color);";
+
         const info = document.createElement("div");
         info.innerHTML = `<div style="font-weight:bold">${manifest.name} <span style="font-size:0.8em; color:#888">v${manifest.version}</span></div><div style="font-size:0.8em; color:#aaa">${manifest.description || "No description"}</div>`;
+
         const toggle = document.createElement("input");
         toggle.type = "checkbox";
         toggle.checked = globalPluginManager!.isEnabled(manifest.id);
@@ -2254,16 +2544,19 @@ window.addEventListener("DOMContentLoaded", async () => {
             globalPluginManager!.disablePlugin(manifest.id);
           }
         };
+
         item.appendChild(info);
         item.appendChild(toggle);
         container.appendChild(item);
       });
     };
+
     renderList(
       "plugin-list-container",
       "plugin",
-      "No community plugins installed.",
+      "No community plugins installed."
     );
+
     // ★ Snippet List Rendering
     const renderSnippetList = () => {
       const container = document.getElementById("snippets-list-container");
@@ -2314,15 +2607,19 @@ window.addEventListener("DOMContentLoaded", async () => {
         container.appendChild(item);
       });
     };
+
     const renderThemeList = () => {
       const container = document.getElementById("theme-list-container");
       if (!container) return;
+
       container.innerHTML = "";
       const themes = globalPluginManager!.getPluginsByType("theme");
+
       if (themes.length === 0) {
         container.innerHTML = "<p style='color:#888'>No themes found.</p>";
         return;
       }
+
       const defDiv = document.createElement("div");
       defDiv.style.padding = "5px";
       defDiv.innerHTML = `<label><input type="radio" name="theme-select" value="" ${!themes.some((t) => globalPluginManager!.isEnabled(t.manifest.id)) ? "checked" : ""}> Default Theme</label>`;
@@ -2330,6 +2627,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         .querySelector("input")
         ?.addEventListener("change", () => globalPluginManager!.setTheme(""));
       container.appendChild(defDiv);
+
       themes.forEach(({ manifest }) => {
         const div = document.createElement("div");
         div.style.padding = "5px";
@@ -2337,13 +2635,15 @@ window.addEventListener("DOMContentLoaded", async () => {
         div
           .querySelector("input")
           ?.addEventListener("change", () =>
-            globalPluginManager!.setTheme(manifest.id),
+            globalPluginManager!.setTheme(manifest.id)
           );
         container.appendChild(div);
       });
     };
+
     renderThemeList();
     renderSnippetList();
+
     const editorTab = document.getElementById("tab-editor");
     if (editorTab && !document.getElementById("vim-toggle-container")) {
       const vimDiv = document.createElement("div");
@@ -2355,49 +2655,50 @@ window.addEventListener("DOMContentLoaded", async () => {
         localStorage.setItem("robsidian-vim-mode", String(isVimMode));
         if (globalPaneManager?.activePane)
           globalPaneManager.activePane.switchTab(
-            globalPaneManager.activePane.activeTabId!,
+            globalPaneManager.activePane.activeTabId!
           );
       });
       editorTab.appendChild(vimDiv);
     }
   };
 
-// Zoom reset button
-const btnResetZoom = document.getElementById("btn-reset-zoom");
-if (btnResetZoom) {
-  btnResetZoom.onclick = () => {
-    applyZoom(1.0);
-    const zoomDisplay = document.getElementById("current-zoom-display");
-    if (zoomDisplay) zoomDisplay.innerText = "100%";
-    showNotice("Zoom reset to 100%");
-  };
-}
+  // Zoom reset button
+  const btnResetZoom = document.getElementById("btn-reset-zoom");
+  if (btnResetZoom) {
+    btnResetZoom.onclick = () => {
+      applyZoom(1.0);
+      const zoomDisplay = document.getElementById("current-zoom-display");
+      if (zoomDisplay) zoomDisplay.innerText = "100%";
+      showNotice("Zoom reset to 100%");
+    };
+  }
 
-// Settings modal open時にzoom表示を更新
-if (btnSettings)
-  btnSettings.onclick = () => {
-    if (displayCurrentFont)
-      displayCurrentFont.innerText = `Current: ${currentFont}`;
-    if (inputFontSize) {
-      inputFontSize.value = currentFontSize;
-      if (valFontSize) valFontSize.innerText = `${currentFontSize}px`;
-    }
-    if (inputLineHeight) {
-      inputLineHeight.value = currentLineHeight;
-      if (valLineHeight) valLineHeight.innerText = currentLineHeight;
-    }
-    if (inputShellPath)
-      inputShellPath.value = localStorage.getItem("robsidian-shell-path") || "";
+  // Settings modal open時にzoom表示を更新
+  if (btnSettings)
+    btnSettings.onclick = () => {
+      if (displayCurrentFont)
+        displayCurrentFont.innerText = `Current: ${currentFont}`;
 
-    // Zoom表示を更新
-    const zoomDisplay = document.getElementById("current-zoom-display");
-    if (zoomDisplay) {
-      zoomDisplay.innerText = `${Math.round(currentZoom * 100)}%`;
-    }
+      if (inputFontSize) {
+        inputFontSize.value = currentFontSize;
+        if (valFontSize) valFontSize.innerText = `${currentFontSize}px`;
+      }
+      if (inputLineHeight) {
+        inputLineHeight.value = currentLineHeight;
+        if (valLineHeight) valLineHeight.innerText = currentLineHeight;
+      }
+      if (inputShellPath)
+        inputShellPath.value = localStorage.getItem("robsidian-shell-path") || "";
 
-    renderSettingsUI();
-    if (modalSettings) modalSettings.style.display = "flex";
-  };
+      // Zoom表示を更新
+      const zoomDisplay = document.getElementById("current-zoom-display");
+      if (zoomDisplay) {
+        zoomDisplay.innerText = `${Math.round(currentZoom * 100)}%`;
+      }
+
+      renderSettingsUI();
+      if (modalSettings) modalSettings.style.display = "flex";
+    };
 
   if (btnOpenTerminalTab)
     btnOpenTerminalTab.onclick = () => globalPaneManager?.openTerminalInActive();
@@ -2407,6 +2708,7 @@ if (btnSettings)
       if (modalSettings) modalSettings.style.display = "none";
       saveSettingsValues();
     };
+
   document
     .querySelectorAll(".sidebar-item:not(.plugin-setting)")
     .forEach((item) => {
@@ -2418,6 +2720,7 @@ if (btnSettings)
           .querySelectorAll(".plugin-setting")
           .forEach((i) => i.classList.remove("active"));
         item.classList.add("active");
+
         const targetId = item.getAttribute("data-target");
         document
           .querySelectorAll(".settings-tab")
@@ -2426,51 +2729,59 @@ if (btnSettings)
         if (target) target.classList.add("active");
       });
     });
+
   function saveSettingsValues() {
     if (inputFont && inputFont.value) {
       currentFont = inputFont.value;
       document.documentElement.style.setProperty(
         "--font-family-ui",
-        currentFont,
+        currentFont
       );
       document.documentElement.style.setProperty(
         "--font-family-code",
-        currentFont,
+        currentFont
       );
       localStorage.setItem("robsidian-font", currentFont);
     }
+
     if (inputFontSize) {
       currentFontSize = inputFontSize.value;
       document.documentElement.style.setProperty(
         "--base-font-size",
-        `${currentFontSize}px`,
+        `${currentFontSize}px`
       );
       localStorage.setItem("robsidian-font-size", currentFontSize);
     }
+
     if (inputLineHeight) {
       currentLineHeight = inputLineHeight.value;
       document.documentElement.style.setProperty(
         "--base-line-height",
-        currentLineHeight,
+        currentLineHeight
       );
       localStorage.setItem("robsidian-line-height", currentLineHeight);
     }
+
     if (inputShellPath) {
       localStorage.setItem("robsidian-shell-path", inputShellPath.value.trim());
     }
   }
+
   if (inputFontSize)
     inputFontSize.oninput = () => {
       if (valFontSize) valFontSize.innerText = inputFontSize.value;
       saveSettingsValues();
     };
+
   if (inputLineHeight)
     inputLineHeight.oninput = () => {
       if (valLineHeight) valLineHeight.innerText = inputLineHeight.value;
       saveSettingsValues();
     };
+
   if (inputFont) inputFont.onchange = saveSettingsValues;
   if (inputShellPath) inputShellPath.onchange = saveSettingsValues;
+
   if (btnResetLayout)
     btnResetLayout.onclick = () => {
       if (confirm("Are you sure?")) {
@@ -2478,6 +2789,7 @@ if (btnSettings)
         location.reload();
       }
     };
+
   if (btnOpenVault)
     btnOpenVault.onclick = async () => {
       const selected = await open({ directory: true });
@@ -2486,16 +2798,18 @@ if (btnSettings)
         await loadFiles(selected);
       }
     };
+
   if (btnUp)
     btnUp.onclick = () => {
       if (currentPath.length > 3) {
         const parent = currentPath.substring(
           0,
-          Math.max(currentPath.lastIndexOf("\\"), currentPath.lastIndexOf("/")),
+          Math.max(currentPath.lastIndexOf("\\"), currentPath.lastIndexOf("/"))
         );
         loadFiles(parent || ".");
       }
     };
+
   if (btnNewFile)
     btnNewFile.onclick = async () => {
       const f = prompt("Name:");
@@ -2520,6 +2834,7 @@ if (btnSettings)
         alert(e);
       }
     };
+
   if (btnNewDir)
     btnNewDir.onclick = async () => {
       const d = prompt("Name:");
@@ -2536,13 +2851,24 @@ if (btnSettings)
         alert(e);
       }
     };
+
   if (btnAddTab)
     btnAddTab.onclick = () => globalPaneManager?.openTerminalInActive();
 
   if (inputSearch && listEl) {
+    const debounce = <T extends (...args: any[]) => any>(
+      func: T,
+      wait: number
+    ): ((...args: Parameters<T>) => void) => {
+      let timeout: number | null = null;
+      return (...args: Parameters<T>) => {
+        if (timeout) clearTimeout(timeout);
+        timeout = window.setTimeout(() => func(...args), wait);
+      };
+    };
+
     const debouncedSearch = debounce(async () => {
       const query = inputSearch.value.trim();
-
       if (!query) {
         loadFiles(currentPath);
         return;
@@ -2555,8 +2881,8 @@ if (btnSettings)
         })) as SearchResult[];
 
         if (!listEl) return;
-
         listEl.innerHTML = "";
+
         if (results.length === 0) {
           listEl.innerHTML = "<li style='padding:12px; color:var(--text-muted); text-align:center;'>No results found</li>";
           return;
@@ -2565,6 +2891,7 @@ if (btnSettings)
         results.forEach((r) => {
           const li = document.createElement("li");
           li.className = "file-item";
+
           const row = document.createElement("div");
           row.className = "tree-node";
           row.style.flexDirection = "column";
@@ -2663,6 +2990,7 @@ if (btnSettings)
 
   const renderContextMenu = (x: number, y: number, file: FileEntry) => {
     if (!contextMenu) return;
+
     contextMenu.innerHTML = "";
     fileMenuActions.forEach((action) => {
       const item = document.createElement("div");
@@ -2674,6 +3002,7 @@ if (btnSettings)
       };
       contextMenu.appendChild(item);
     });
+
     contextMenu.style.display = "flex";
     contextMenu.style.left = `${x}px`;
     contextMenu.style.top = `${y}px`;
@@ -2714,7 +3043,6 @@ if (btnSettings)
     } else {
       arrow.className = "tree-spacer";
     }
-
     row.appendChild(arrow);
 
     const icon = document.createElement("span");
@@ -2723,7 +3051,6 @@ if (btnSettings)
     iconElement.style.width = '16px';
     iconElement.style.height = '16px';
     icon.appendChild(iconElement);
-
     row.appendChild(icon);
 
     const label = document.createElement("span");
@@ -2732,33 +3059,41 @@ if (btnSettings)
     row.appendChild(label);
 
     li.appendChild(row);
+
     let childrenContainer: HTMLUListElement | null = null;
+
     if (entry.is_dir) {
       childrenContainer = document.createElement("ul");
       childrenContainer.className = "tree-children";
+
       if (expandedPaths.has(entry.path)) {
         childrenContainer.classList.add("show");
         toggleDirectory(entry, arrow, childrenContainer, true);
       }
+
       li.appendChild(childrenContainer);
     }
+
     row.onclick = (e) => {
       e.stopPropagation();
       document
         .querySelectorAll(".tree-node.selected")
         .forEach((el) => el.classList.remove("selected"));
       row.classList.add("selected");
+
       if (entry.is_dir && childrenContainer) {
         toggleDirectory(entry, arrow, childrenContainer);
       } else {
         globalPaneManager?.openFileInActive(entry);
       }
     };
+
     row.oncontextmenu = (e) => {
       e.preventDefault();
       e.stopPropagation();
       renderContextMenu(e.pageX, e.pageY, entry);
     };
+
     return li;
   }
 
@@ -2766,34 +3101,41 @@ if (btnSettings)
     entry: FileEntry,
     arrow: HTMLElement,
     container: HTMLUListElement,
-    forceOpen = false,
+    forceOpen = false
   ) {
     const isClosed = !container.classList.contains("show");
+
     if (isClosed || forceOpen) {
       container.classList.add("show");
       arrow.classList.add("open");
       expandedPaths.add(entry.path);
+
       if (container.children.length === 0) {
         container.innerHTML = `<li style="padding-left:20px; color:#666;">Loading...</li>`;
+
         try {
           const files = (await invoke("list_files", {
             path: entry.path,
           })) as FileEntry[];
+
           currentFilesCache = [...currentFilesCache, ...files];
           currentFilesCache = Array.from(
-            new Map(currentFilesCache.map((f) => [f.path, f])).values(),
+            new Map(currentFilesCache.map((f) => [f.path, f])).values()
           );
+
           container.innerHTML = "";
+
           files.sort((a, b) => {
             if (a.is_dir && !b.is_dir) return -1;
             if (!a.is_dir && b.is_dir) return 1;
             return a.name.localeCompare(b.name);
           });
+
           if (files.length === 0)
             container.innerHTML = `<li style="padding-left:20px; color:#666; font-size:0.8em;">(Empty)</li>`;
           else
             files.forEach((child) =>
-              container.appendChild(createTreeNode(child)),
+              container.appendChild(createTreeNode(child))
             );
         } catch (e) {
           console.error(e);
@@ -2809,20 +3151,24 @@ if (btnSettings)
 
   async function loadFiles(path: string) {
     if (!listEl || !pathDisplay || !btnUp) return;
+
     try {
       currentPath = path;
       localStorage.setItem("robsidian-last-path", path);
       pathDisplay.innerText =
         path === "." ? "ROOT" : path.split("\\").pop() || path;
       btnUp.disabled = path === "." || path.length < 3;
+
       listEl.innerHTML = "";
       const files = (await invoke("list_files", { path })) as FileEntry[];
       currentFilesCache = files;
+
       files.sort((a, b) => {
         if (a.is_dir && !b.is_dir) return -1;
         if (!a.is_dir && b.is_dir) return 1;
         return a.name.localeCompare(b.name);
       });
+
       files.forEach((entry) => listEl.appendChild(createTreeNode(entry)));
     } catch (e) {
       console.error(e);
@@ -2838,15 +3184,18 @@ if (btnSettings)
       document.body.style.cursor = "col-resize";
       resizer.classList.add("resizing");
     });
+
     document.addEventListener("mousemove", (e) => {
       if (!isResizing) return;
+
       const rawX = e.clientX / currentZoom;
       const newWidth = Math.max(150, Math.min(rawX - 50, 600));
       document.documentElement.style.setProperty(
         "--sidebar-width",
-        `${newWidth}px`,
+        `${newWidth}px`
       );
     });
+
     document.addEventListener("mouseup", () => {
       if (isResizing) {
         isResizing = false;
@@ -2949,18 +3298,21 @@ if (btnSettings)
   window.robsidianOpenHelix = (entry: FileEntry) => {
     if (!globalPaneManager) return;
     if (!globalPaneManager.activePane) globalPaneManager.addPane();
+
     const pane = globalPaneManager.activePane!;
     const shellPath = localStorage.getItem("robsidian-shell-path") || "";
     const isCmd = shellPath.toLowerCase().includes("cmd");
     const normalizedPath = entry.path.replace(/\\/g, "/");
+
     let safePath: string;
     if (isCmd) {
       safePath = `"${normalizedPath}"`;
     } else {
       safePath = `'${normalizedPath}'`;
     }
+
     pane.openTerminal(`Hx: ${entry.name}`, `hx ${safePath}`);
   };
 
-  console.log("✅ [App] Initialization complete. Final panes:", paneManager.panes.length);
+  console.log("✅ [App] Initialization complete. Final panes:", paneManager.panes.length)
 });

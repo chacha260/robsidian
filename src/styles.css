@@ -142,27 +142,6 @@ body.sidebar-closed #sidebar {
   background-color: var(--bg-hover);
 }
 
-.file-actions {
-  padding: 0 16px 12px 16px;
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.file-actions button {
-  flex: 1;
-  background: var(--bg-activity);
-  border: 1px solid var(--border-color);
-  color: var(--text-main);
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: 12px;
-  white-space: nowrap;
-  transition: all var(--transition-fast);
-  font-weight: 500;
-}
-
 .search-box {
   padding: 0 16px 12px 16px;
   flex-shrink: 0;
@@ -477,14 +456,15 @@ ul {
 }
 
 .markdown-body {
-  padding: 32px 48px;
-  max-width: 900px;
-  margin: 0 auto;
+  padding: 0;
+  max-width: 100%;
+  margin: 0;
   user-select: text;
   overflow-y: auto;
   height: 100%;
   width: 100%;
   line-height: 1.7;
+  position: relative;
 }
 
 .markdown-body h1,
@@ -556,6 +536,26 @@ ul {
 .wiki-link:hover {
   color: var(--accent-hover);
   text-decoration: underline;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 2em;
+  margin: 1em 0;
+}
+
+.markdown-body li {
+  margin: 0.25em 0;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 2px solid var(--border-color);
+  margin: 2em 0;
+}
+
+.markdown-body del {
+  opacity: 0.7;
 }
 
 .pane-resizer {
@@ -691,11 +691,59 @@ button {
   opacity: 0;
   transform: translateY(-20px);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 200px;
+  max-width: 400px;
 }
 
 .notice-toast.show {
   opacity: 1;
   transform: translateY(0);
+}
+
+.notice-icon {
+  font-size: 1.2em;
+  flex-shrink: 0;
+}
+
+.notice-message {
+  flex: 1;
+  word-wrap: break-word;
+}
+
+/* 通知タイプ別スタイル */
+.notice-success {
+  border-left: 4px solid #4caf50;
+}
+
+.notice-success .notice-icon {
+  color: #4caf50;
+}
+
+.notice-error {
+  border-left: 4px solid #ff3b30;
+}
+
+.notice-error .notice-icon {
+  color: #ff3b30;
+}
+
+.notice-warning {
+  border-left: 4px solid #ff9800;
+}
+
+.notice-warning .notice-icon {
+  color: #ff9800;
+}
+
+.notice-info {
+  border-left: 4px solid var(--accent-color);
+}
+
+.notice-info .notice-icon {
+  color: var(--accent-color);
 }
 
 /* --- 設定画面 --- */
@@ -1109,6 +1157,7 @@ button {
   margin-top: 8px;
   font-style: italic;
 }
+
 /* サイドバー共通 */
 .sidebar {
   display: flex;
@@ -1169,6 +1218,9 @@ body.sidebar-right-closed #resizer-right {
   white-space: nowrap;
   transition: all var(--transition-fast);
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .sidebar-tab:hover {
@@ -1180,6 +1232,11 @@ body.sidebar-right-closed #resizer-right {
   color: var(--accent-color);
   border-bottom-color: var(--accent-color);
   background: var(--bg-main);
+}
+
+.sidebar-tab .lucide-icon {
+  width: 14px;
+  height: 14px;
 }
 
 /* サイドバービュー */
@@ -1213,19 +1270,177 @@ body.sidebar-right-closed #resizer-right {
   border-radius: 4px;
 }
 
-/* リサイザー */
+/* ============================================================================
+   サイドバーリサイザー - Obsidian風の広い判定エリア
+   ============================================================================ */
+
 .sidebar-resizer {
   width: 1px;
   cursor: col-resize;
   background: var(--border-color);
   flex-shrink: 0;
+  position: relative;
   transition: background var(--transition-fast);
+  z-index: 10;
+}
+
+/* ★ 判定エリアを拡大（見えない当たり判定） */
+.sidebar-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;   /* 左に5px */
+  right: -5px;  /* 右に5px */
+  /* 合計11pxの判定エリア */
+  cursor: col-resize;
 }
 
 .sidebar-resizer:hover,
 .sidebar-resizer.resizing {
   background: var(--accent-color);
   width: 3px;
+  margin-left: -1px; /* 中央揃え */
+}
+
+/* ★ ホバー時のアニメーション */
+.sidebar-resizer:hover::after,
+.sidebar-resizer.resizing::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 40px;
+  background: var(--accent-color);
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(124, 58, 237, 0.4);
+}
+
+/* ============================================================================
+   サイドバートグルボタン - ホバー時のみ表示
+   ============================================================================ */
+
+.sidebar-toggle-btn {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 60px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  transition: opacity var(--transition-base), 
+              width var(--transition-fast),
+              background var(--transition-fast);
+  padding: 0;
+
+  /* ★ デフォルトで非表示 */
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ★ 広い判定エリアを作成（ホバー検知用） */
+.sidebar-toggle-btn::before {
+  content: '';
+  position: absolute;
+  top: -10px;
+  bottom: -10px;
+  width: 30px;
+  pointer-events: auto;
+}
+
+.sidebar-toggle-btn.left {
+  left: calc(var(--sidebar-left-width, 260px) - 1px);
+  border-left: none;
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+}
+
+.sidebar-toggle-btn.left::before {
+  right: 0;
+}
+
+.sidebar-toggle-btn.right {
+  right: calc(var(--sidebar-right-width, 300px) - 1px);
+  border-right: none;
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+}
+
+.sidebar-toggle-btn.right::before {
+  left: 0;
+}
+
+/* ★ サイドバーが閉じている時は薄く表示 */
+body.sidebar-left-closed .sidebar-toggle-btn.left {
+  left: 0;
+  border-left: 1px solid var(--border-color);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  opacity: 0.5;
+  pointer-events: auto;
+}
+
+body.sidebar-right-closed .sidebar-toggle-btn.right {
+  right: 0;
+  border-right: 1px solid var(--border-color);
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+  opacity: 0.5;
+  pointer-events: auto;
+}
+
+/* ★ ホバー時に表示 */
+.sidebar-toggle-btn:hover,
+.sidebar-toggle-btn:focus-visible {
+  opacity: 1 !important;
+  width: 24px;
+  background: var(--bg-hover);
+  pointer-events: auto;
+}
+
+/* ★ リサイザーホバー時も表示 */
+#resizer-left:hover ~ .sidebar-toggle-btn.left,
+#resizer-right:hover ~ .sidebar-toggle-btn.right {
+  opacity: 0.8;
+  pointer-events: auto;
+}
+
+/* ★ サイドバー自体にホバーした時も表示 */
+.sidebar-left:hover ~ .sidebar-toggle-btn.left,
+.sidebar-right:hover ~ .sidebar-toggle-btn.right {
+  opacity: 0.8;
+  pointer-events: auto;
+}
+
+.sidebar-toggle-btn svg {
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  transition: color var(--transition-fast);
+}
+
+.sidebar-toggle-btn:hover svg {
+  color: var(--accent-color);
+}
+
+/* レスポンシブ調整 */
+@media (max-width: 768px) {
+  .sidebar-toggle-btn {
+    width: 16px;
+    height: 50px;
+  }
+
+  .sidebar-toggle-btn:hover {
+    width: 20px;
+  }
+
+  .sidebar-toggle-btn svg {
+    width: 12px;
+    height: 12px;
+  }
 }
 
 /* アウトラインスタイル */
@@ -1287,45 +1502,70 @@ body.sidebar-right-closed #resizer-right {
   z-index: 1000;
   transition: all var(--transition-fast);
   padding: 0;
+
+  /* ★ デフォルトで透明化 */
+  opacity: 0;
+  pointer-events: none;
 }
 
-.sidebar-toggle-btn.left {
-  left: var(--sidebar-left-width, 260px);
-  border-left: none;
+/* ★ エリアホバー時に表示 */
+.sidebar-toggle-btn::before {
+  content: '';
+  position: absolute;
+  top: -20px;
+  bottom: -20px;
+  width: 20px;
+  pointer-events: auto;
 }
 
-.sidebar-toggle-btn.right {
-  right: var(--sidebar-right-width, 300px);
-  border-right: none;
-  border-radius: var(--radius-md) 0 0 var(--radius-md);
-}
-
-body.sidebar-left-closed .sidebar-toggle-btn.left {
-  left: 0;
-  border-left: 1px solid var(--border-color);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-}
-
-body.sidebar-right-closed .sidebar-toggle-btn.right {
+.sidebar-toggle-btn.left::before {
   right: 0;
-  border-right: 1px solid var(--border-color);
-  border-radius: var(--radius-md) 0 0 var(--radius-md);
 }
 
-.sidebar-toggle-btn:hover {
-  background: var(--bg-hover);
-  width: 28px;
+.sidebar-toggle-btn.right::before {
+  left: 0;
 }
 
-.sidebar-toggle-btn svg {
-  width: 16px;
-  height: 16px;
-  color: var(--text-muted);
-  transition: color var(--transition-fast);
+/* ★ ホバー時に表示 */
+.sidebar-toggle-btn:hover,
+.sidebar-toggle-btn:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
 }
 
-.sidebar-toggle-btn:hover svg {
-  color: var(--accent-color);
+/* ★ サイドバー端にマウスが近づいたら表示 */
+body:has(.sidebar-left:hover) .sidebar-toggle-btn.left,
+body:has(#resizer-left:hover) .sidebar-toggle-btn.left {
+  opacity: 1;
+}
+
+body:has(.sidebar-right:hover) .sidebar-toggle-btn.right,
+body:has(#resizer-right:hover) .sidebar-toggle-btn.right {
+  opacity: 1;
+}
+
+/* ★ サイドバーが閉じている時は常に表示 */
+body.sidebar-left-closed .sidebar-toggle-btn.left,
+body.sidebar-right-closed .sidebar-toggle-btn.right {
+  opacity: 0.6;
+  pointer-events: auto;
+}
+
+body.sidebar-left-closed .sidebar-toggle-btn.left:hover,
+body.sidebar-right-closed .sidebar-toggle-btn.right:hover {
+  opacity: 1;
+}
+
+/* レスポンシブ調整 */
+@media (max-width: 768px) {
+  .sidebar-toggle-btn {
+    width: 20px;
+    height: 40px;
+  }
+  .sidebar-toggle-btn svg {
+    width: 14px;
+    height: 14px;
+  }
 }
 
 /* Lucide Icons共通スタイル */
@@ -1342,18 +1582,6 @@ button .lucide-icon {
   height: 16px;
 }
 
-/* タブ内のアイコン */
-.sidebar-tab {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.sidebar-tab .lucide-icon {
-  width: 14px;
-  height: 14px;
-}
-
 /* プライマリボタン */
 .primary-action-btn {
   display: flex !important;
@@ -1364,13 +1592,6 @@ button .lucide-icon {
 .primary-action-btn .lucide-icon {
   width: 18px;
   height: 18px;
-}
-
-/* ファイルアクションボタン */
-.file-actions button {
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
 
 /* サイドバーヘッダーのアイコン */
@@ -1391,31 +1612,6 @@ button .lucide-icon {
     width: 14px;
     height: 14px;
   }
-}
-
-.file-actions {
-  padding: 0 16px 12px 16px;
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.file-actions button {
-  flex: 1;
-  background: var(--bg-activity);
-  border: 1px solid var(--border-color);
-  color: var(--text-main);
-  padding: 6px 8px; /* 左右のpaddingを少し減らす */
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: 12px;
-  white-space: nowrap;
-  transition: all var(--transition-fast);
-  font-weight: 500;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
 }
 
 /* Terminalボタン用のスタイル */
@@ -1444,32 +1640,6 @@ button .lucide-icon {
 .sidebar-tab-action .lucide-icon {
   width: 14px;
   height: 14px;
-}
-
-/* file-actionsを2ボタンに最適化 */
-.file-actions {
-  padding: 0 16px 12px 16px;
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.file-actions button {
-  flex: 1;
-  background: var(--bg-activity);
-  border: 1px solid var(--border-color);
-  color: var(--text-main);
-  padding: 8px 12px; /* パディングを増やす */
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: 12px;
-  white-space: nowrap;
-  transition: all var(--transition-fast);
-  font-weight: 500;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
 }
 
 /* タブ2分割レイアウト */
@@ -1516,7 +1686,214 @@ button .lucide-icon {
   height: 14px;
 }
 
-/* file-actionsも2分割で均等に */
+/* Editor Wrapper */
+.editor-wrapper {
+  height: 100%;
+  overflow: hidden;
+}
+
+.editor-wrapper .cm-editor {
+  height: 100%;
+}
+
+.editor-wrapper .cm-scroller {
+  overflow: auto;
+  height: 100%;
+}
+
+/* Live Preview Enhancements */
+.cm-heading-rendered {
+  display: block;
+  cursor: text;
+  padding: 0.2em 0;
+}
+
+.cm-bold-rendered-inline {
+  font-weight: 700;
+}
+
+.cm-italic-rendered-inline {
+  font-style: italic;
+}
+
+.cm-code-rendered-inline {
+  background: var(--bg-activity);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family-code);
+  font-size: 0.9em;
+}
+
+/* カーソル行のハイライト */
+.cm-activeLine {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.cm-line {
+  padding: 2px 0;
+}
+
+/* Live Preview - Markdown Body Integration */
+.cm-editor .cm-heading-rendered {
+  display: inline-block;
+  width: 100%;
+  cursor: text;
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 0.2em;
+  margin-bottom: 0.1em;
+  color: var(--text-main);
+}
+
+/* 見出しレベル別スタイル（markdown-bodyと同じ） */
+.cm-editor .cm-heading-rendered h1 {
+  font-size: 2em;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0.3em;
+}
+
+.cm-editor .cm-heading-rendered h2 {
+  font-size: 1.5em;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0.25em;
+}
+
+.cm-editor .cm-heading-rendered h3 {
+  font-size: 1.25em;
+}
+
+.cm-editor .cm-heading-rendered h4 {
+  font-size: 1.1em;
+}
+
+.cm-editor .cm-heading-rendered h5 {
+  font-size: 1em;
+}
+
+.cm-editor .cm-heading-rendered h6 {
+  font-size: 0.9em;
+}
+
+/* 太字 */
+.cm-editor .cm-bold-rendered {
+  font-weight: 700;
+}
+
+/* イタリック */
+.cm-editor .cm-italic-rendered {
+  font-style: italic;
+}
+
+/* インラインコード */
+.cm-editor .cm-code-rendered {
+  background: var(--bg-activity);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family-code);
+  font-size: 0.9em;
+}
+
+/* CodeMirrorエディタ全体をmarkdown-bodyっぽく */
+.cm-editor .cm-content {
+  padding: 20px 48px;
+  font-family: var(--font-family-ui);
+  font-size: var(--base-font-size);
+  line-height: var(--base-line-height);
+}
+
+/* 折りたたみプレースホルダーを完全に隠す */
+.cm-foldPlaceholder {
+  display: none !important;
+  visibility: hidden !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+/* 折りたたみガター自体を非表示にする場合 */
+.cm-foldGutter {
+  display: none !important;
+}
+
+/* チェックボックス（タスクリスト） */
+.cm-checkbox-rendered {
+  display: inline-flex;
+  align-items: center;
+  width: 100%;
+  cursor: pointer;
+  user-select: none;
+}
+
+.cm-checkbox-input {
+  width: 16px;
+  height: 16px;
+  margin-right: 8px;
+  cursor: pointer;
+  accent-color: var(--accent-color);
+  flex-shrink: 0;
+}
+
+.cm-checkbox-text {
+  flex: 1;
+  transition: all var(--transition-fast);
+}
+
+.cm-checkbox-rendered:hover .cm-checkbox-text {
+  color: var(--accent-color);
+}
+
+/* キーボードショートカット一覧 */
+.shortcuts-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 20px;
+}
+
+.shortcuts-table thead {
+  background: var(--bg-activity);
+  border-bottom: 2px solid var(--border-color);
+}
+
+.shortcuts-table th {
+  padding: 12px 16px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.9em;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+}
+
+.shortcuts-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.shortcuts-table tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+.shortcuts-table kbd {
+  display: inline-block;
+  padding: 4px 8px;
+  background: var(--bg-activity);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family-code);
+  font-size: 0.85em;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  margin: 0 2px;
+}
+
+body.light-theme .shortcuts-table kbd {
+  background: #f5f5f5;
+  border-color: #d0d0d0;
+}
+
+/* ============================================================================
+   統合スタイル - ファイルアクション
+   ============================================================================ */
 .file-actions {
   padding: 0 16px 12px 16px;
   display: grid;
@@ -1551,4 +1928,246 @@ button .lucide-icon {
 .file-actions button:hover {
   background: var(--bg-hover);
   border-color: var(--text-faint);
+}
+
+/* ============================================================================
+   統合スタイル - Live Preview インライン記法
+   ============================================================================ */
+
+/* リンク */
+.cm-link-rendered {
+  color: var(--accent-color);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+  border-bottom: 1px solid transparent;
+}
+
+.cm-link-rendered:hover {
+  color: var(--accent-hover);
+  border-bottom-color: var(--accent-hover);
+}
+
+/* 打ち消し線 */
+.cm-strikethrough-rendered {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+/* 下線 */
+.cm-underline-rendered {
+  text-decoration: underline;
+  text-decoration-color: var(--accent-color);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 2px;
+}
+
+/* ハイライト/マーカー */
+.cm-highlight-rendered {
+  background: linear-gradient(transparent 50%, rgba(255, 235, 59, 0.5) 50%);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+body.light-theme .cm-highlight-rendered {
+  background: linear-gradient(transparent 50%, rgba(255, 235, 59, 0.8) 50%);
+}
+
+/* 上付き文字 */
+.cm-superscript-rendered {
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+}
+
+/* 下付き文字 */
+.cm-subscript-rendered {
+  font-size: 0.75em;
+  vertical-align: sub;
+  line-height: 0;
+}
+
+/* 箇条書き（インライン） */
+.cm-list-item-rendered {
+  display: inline-block;
+  width: 100%;
+  cursor: text;
+}
+
+.cm-list-marker {
+  color: var(--accent-color);
+  font-weight: 600;
+  margin-right: 6px;
+  user-select: none;
+  font-size: 1.1em;
+}
+
+/* 引用（インライン） */
+.cm-blockquote-inline-rendered {
+  display: inline-block;
+  width: 100%;
+  cursor: text;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.cm-blockquote-marker {
+  color: var(--accent-color);
+  font-weight: 700;
+  margin-right: 8px;
+  font-size: 1.2em;
+}
+
+/* 水平線（インライン） */
+.cm-hr-inline-rendered {
+  display: inline-block;
+  width: 100%;
+  text-align: center;
+  color: var(--border-color);
+  user-select: none;
+  cursor: default;
+  letter-spacing: -1px;
+  font-weight: 300;
+}
+
+/* 箇条書き内のインライン記法スタイル継承 */
+.cm-list-item-rendered strong,
+.cm-list-item-rendered em,
+.cm-list-item-rendered del,
+.cm-list-item-rendered mark,
+.cm-list-item-rendered code,
+.cm-list-item-rendered u,
+.cm-list-item-rendered sup,
+.cm-list-item-rendered sub {
+  cursor: text;
+}
+
+.cm-list-item-rendered a {
+  cursor: pointer;
+}
+
+.cm-list-item-rendered .cm-bold-rendered {
+  font-weight: 700;
+}
+
+.cm-list-item-rendered .cm-italic-rendered {
+  font-style: italic;
+}
+
+.cm-list-item-rendered .cm-code-rendered {
+  background: var(--bg-activity);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family-code);
+  font-size: 0.9em;
+}
+
+.cm-list-item-rendered .cm-link-rendered {
+  color: var(--accent-color);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: color var(--transition-fast);
+}
+
+.cm-list-item-rendered .cm-link-rendered:hover {
+  color: var(--accent-hover);
+  border-bottom-color: var(--accent-hover);
+}
+
+.cm-list-item-rendered .cm-strikethrough-rendered {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+/* アウトラインスタイル */
+.outline-list {
+  padding: 8px;
+}
+
+.outline-item {
+  padding: 6px 12px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast);
+  font-size: 13px;
+  color: var(--text-main);
+}
+
+.outline-item:hover {
+  background: var(--bg-hover);
+}
+
+.outline-item.h1 {
+  font-weight: 600;
+  padding-left: 12px;
+}
+
+.outline-item.h2 {
+  padding-left: 24px;
+}
+
+.outline-item.h3 {
+  padding-left: 36px;
+}
+
+.outline-item.h4 {
+  padding-left: 48px;
+}
+
+.outline-item.h5 {
+  padding-left: 60px;
+}
+
+.outline-item.h6 {
+  padding-left: 72px;
+}
+
+/* バックリンクスタイル */
+.backlink-item {
+  padding: 12px;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.backlink-item:hover {
+  background: var(--bg-hover);
+}
+
+.backlink-item:last-child {
+  border-bottom: none;
+}
+
+/* グラフビュースタイル */
+#graph-container {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+#graph-container svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* ============================================================================
+   Global Scrollbar Styles
+   ============================================================================ */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--bg-activity);
+  border-radius: 6px;
+  border: 3px solid var(--bg-main); /* 背景色と同じボーダーで余白を演出 */
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-muted);
 }

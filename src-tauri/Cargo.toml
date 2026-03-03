@@ -22,6 +22,7 @@ walkdir = "2"
 rayon = "1.8"
 portable-pty = "0.9"
 anyhow = "1.0"
+base64 = "0.22"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
