@@ -142,6 +142,21 @@ rob daily --append "- 14:00 打ち合わせ"
 
 旧Tauri版のコードはgit履歴に残っています。
 
+## リリース
+
+`v` で始まるタグをpushすると、GitHub Actions が3つのOS向けにビルドし、
+実行ファイル（Windowsは `robsidian.exe` と `rob.exe` 入りのzip）を GitHub Releases に添付します。
+
+```bash
+git tag v0.2.0
+```
+
+```bash
+git push origin v0.2.0
+```
+
+Actions画面の「Release」から、タグ名を入力して手動実行することもできます。
+
 ## 開発
 
 ```bash

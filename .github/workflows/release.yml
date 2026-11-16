@@ -1,0 +1,83 @@
+name: Release
+
+# `v0.2.0` のようなタグをpushすると、Windows / macOS / Linux 向けにビルドして
+# GitHub Releases に実行ファイルを添付する。
+# Actions画面から手動実行（タグ名を入力）することもできる。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "リリースするタグ名（例: v0.2.0）。無ければ実行したコミットに作成される"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-latest
+            name: macos-aarch64
+          - os: ubuntu-latest
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          dir="robsidian-${TAG}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/robsidian.exe target/release/rob.exe README.md "$dir/"
+          7z a "$dir.zip" "$dir"
+
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          dir="robsidian-${TAG}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/robsidian target/release/rob README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            robsidian-*.zip
+            robsidian-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --target "$GITHUB_SHA"
+          fi
