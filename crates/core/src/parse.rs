@@ -35,6 +35,10 @@ pub struct Link {
     /// ソース中で `target` が書かれているバイト範囲（リネーム時の書き換え用）
     #[serde(skip)]
     pub span: Range<usize>,
+    /// Wikiリンクでは `[[...]]`（埋め込みなら先頭の `!` も含む）全体、
+    /// Markdownリンクでは `span` と同じ範囲
+    #[serde(skip)]
+    pub full: Range<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -222,7 +226,9 @@ fn scan_inline(line: &str, base: usize, line_no: usize, out: &mut Parsed) {
                     let inner = &line[inner_start..inner_start + close];
                     if !inner.contains('[') {
                         let embed = i > 0 && b[i - 1] == b'!';
-                        push_wikilink(inner, base + inner_start, embed, line_no, out);
+                        let full_start = base + i - usize::from(embed);
+                        let full = full_start..base + inner_start + close + 2;
+                        push_wikilink(inner, base + inner_start, full, embed, line_no, out);
                         i = inner_start + close + 2;
                         continue;
                     }
@@ -262,7 +268,14 @@ fn scan_inline(line: &str, base: usize, line_no: usize, out: &mut Parsed) {
     }
 }
 
-fn push_wikilink(inner: &str, inner_base: usize, embed: bool, line: usize, out: &mut Parsed) {
+fn push_wikilink(
+    inner: &str,
+    inner_base: usize,
+    full: Range<usize>,
+    embed: bool,
+    line: usize,
+    out: &mut Parsed,
+) {
     let (target_part, alias) = match inner.split_once('|') {
         Some((t, a)) => (t, Some(a.trim().to_string())),
         None => (inner, None),
@@ -285,6 +298,7 @@ fn push_wikilink(inner: &str, inner_base: usize, embed: bool, line: usize, out: 
         embed,
         line,
         span: start..start + trimmed.len(),
+        full,
     });
 }
 
@@ -320,6 +334,7 @@ fn finish_mdlink(path: &str, start: usize, embed: bool, line: usize, out: &mut P
         embed,
         line,
         span: start..start + file.len(),
+        full: start..start + file.len(),
     });
 }
 
@@ -371,7 +386,9 @@ mod tests {
         assert_eq!(p.links[0].target, "Note A");
         assert_eq!(p.links[0].alias.as_deref(), Some("alias"));
         assert_eq!(&src[p.links[0].span.clone()], "Note A");
+        assert_eq!(&src[p.links[0].full.clone()], "[[Note A|alias]]");
         assert!(p.links[1].embed);
+        assert_eq!(&src[p.links[1].full.clone()], "![[img.png]]");
         assert_eq!(p.links[2].kind, LinkKind::Markdown);
         assert_eq!(p.links[2].target, "dir/b c.md");
         assert_eq!(p.links[2].heading.as_deref(), Some("sec"));

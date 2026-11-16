@@ -1,191 +1,153 @@
 # Robsidian 💎
 
-**Robsidian** は、Obsidianの拡張性と、Helix / NuShell のパワーを融合させた、Rust + Tauri 製の次世代ノートテイキングアプリです。
-「見た目はObsidian、中身はハッカー仕様」をコンセプトに、軽量かつ強力なプラグインシステムを備えています。
+**Obsidian互換のvaultを、ネイティブRustで速く・軽く・シェルから扱うためのノートアプリ。**
 
-## 🚀 開発環境のセットアップ (Development Setup)
+WebViewもNode.jsも使いません。GUIは [egui](https://github.com/emilk/egui) 製の単一バイナリ、
+中身はGUIに依存しないRustライブラリで、同じ索引をCLI `rob` からも叩けます。
 
-Robsidian自体のビルドや開発を行うための手順です。
+![screenshot](docs/screenshot.png)
 
-### 前提条件 (Prerequisites)
+## なぜ作り直したか
 
-* **Node.js**
-* **Rust / Cargo** (最新版)
-* **Tauri CLI** (`npm install -g @tauri-apps/cli`)
-* **WebView2** (Windowsの場合)
+以前の実装は Tauri + TypeScript + CodeMirror で、Rustはファイル入出力だけ（約600行）でした。
+実態は「WebViewで動く、機能の少ないObsidian」で、Obsidianを置き換える理由がありませんでした。
 
-### インストール (Installation)
+そこで方針を変えました。
 
-リポジトリをクローンした後、依存関係をインストールします。
+- **Obsidianを置き換えない。同じvaultで共存する。** ノートはただのMarkdownファイルのまま。
+  `[[wikilink]]`・`#tag`・frontmatter（`tags` / `aliases`）・`.obsidian/daily-notes.json` をそのまま読みます。
+- **頭脳はすべてRust。** 全ノートをメモリに索引化し、バックリンク・検索・リンク追従リネームをディスクI/Oなしで返します。
+- **GUIは薄く、CLIを一級市民に。** Obsidianに無い「シェルやスクリプトからvaultを照会・操作する」手段を持ちます。
 
-```bash
-npm install
-```
-
-### 開発モードでの実行 (Run in Development Mode)
-
-ホットリロード対応の開発サーバーを立ち上げます。
-
-```bash
-npm run tauri dev
-
-```
-
-### ビルド (Build for Production)
-
-配布用の実行ファイル（`.exe` や `.dmg`）を生成します。
-
-```bash
-cargo tauri build
-# または
-npm run tauri build
-```
-
----
-
-## 🧩 拡張機能の作成ガイド (Extension Guide)
-
-Robsidianは **「機能プラグイン」** と **「外観テーマ」** の2種類の拡張に対応しています。
-これらは現在開いているVault（フォルダ）の中にある `.robsidian` フォルダで管理されます。
-
-### 📂 フォルダ構成
-
-Vaultのルートに以下のフォルダを作成してください。
+## 構成
 
 ```text
-[Vault Root]
-  └─ .robsidian
-       ├─ plugins/       <-- 機能プラグイン用
-       │    └─ my-plugin/
-       │         ├─ manifest.json
-       │         └─ main.js
-       │
-       └─ themes/        <-- テーマ用
-            └─ my-theme/
-                 ├─ manifest.json
-                 └─ styles.css
-
+crates/
+  core/   robsidian-core  vault索引・リンク解決・検索・リネーム（GUI非依存、テスト付き）
+  cli/    rob             コアをシェルから使うCLI
+  app/    robsidian       egui製ネイティブGUI
 ```
 
----
+## ビルド
 
-### 1. テーマの作成 (Creating Themes)
+Rust（stable）だけで足ります。Node.js・npm・WebView2は不要です。
 
-テーマはCSS変数（Custom Properties）を上書きすることで適用されます。
-
-**manifest.json:**
-
-```json
-{
-    "id": "ocean-dark",
-    "name": "Ocean Dark Theme",
-    "version": "1.0.0",
-    "type": "theme",
-    "description": "Deep blue theme inspired by the ocean.",
-    "author": "Your Name"
-}
-
+```bash
+cargo build --release
 ```
 
-**styles.css:**
+`target/release/robsidian`（GUI）と `target/release/rob`（CLI）ができます。
 
-```css
-:root {
-    /* 必須のオーバーライド変数 */
-    --bg-main: #0f172a;       /* メイン背景色 */
-    --bg-sidebar: #1e293b;    /* サイドバー背景色 */
-    --text-main: #f1f5f9;     /* メイン文字色 */
-    --text-muted: #94a3b8;    /* 薄い文字色 */
-    --border-color: #334155;  /* ボーダー色 */
-    --accent-color: #38bdf8;  /* アクセントカラー */
-    --active-item-bg: #1e293b;/* 選択中のアイテム背景 */
-}
-
+```bash
+cargo run --release -p robsidian -- /path/to/vault
 ```
 
----
+日本語はシステムフォント（游ゴシック / ヒラギノ / Noto Sans CJK など）を自動で探して使います。
+見つからない環境では `ROBSIDIAN_FONT=/path/to/font.ttf` で指定してください。
 
-### 2. プラグインの作成 (Creating Plugins)
+## GUI
 
-JavaScriptを使ってアプリの機能を拡張できます。
+| 機能 | 内容 |
+|---|---|
+| エディタ | Markdownシンタックスハイライト、`[[` でノート名補完、Ctrl+クリック / Ctrl+Enter でリンクを辿る（無ければ作成） |
+| プレビュー | 編集 / 分割 / プレビューを切替。コードハイライト・表・タスクリスト・埋め込み画像 `![[img.png]]` |
+| クイックスイッチャー | あいまい検索でノートを開く。無い名前ならその場で新規作成 |
+| 全文検索 | 空白区切りAND、`"フレーズ"`、`tag:名前`、`path:文字列` |
+| バックリンク / アウトライン | 右サイドバーに常時表示、クリックで該当行へ |
+| グラフ | ローカル（2ホップ）/ vault全体。ドラッグ・ズーム・クリックで開く |
+| 改名 / 移動 | vault内のリンク（wikilink・Markdownリンク）を自動で書き換え |
+| 保存 | 自動保存（入力後約1秒・フォーカス喪失時・終了時）、アトミック書き込み |
+| 外部変更の追従 | 別エディタやObsidian本体、`git pull` による変更を監視して即反映 |
+| 削除 | OSのゴミ箱へ移動（完全削除はしない） |
 
-**manifest.json:**
+### ショートカット
 
-```json
-{
-    "id": "daily-calendar",
-    "name": "Daily Calendar",
-    "version": "1.0.0",
-    "type": "plugin",
-    "description": "Adds a calendar for managing daily notes.",
-    "main": "main.js"
-}
+| キー | 動作 |
+|---|---|
+| Ctrl+P | ノートを開く / 作る |
+| Ctrl+Shift+P | コマンドパレット |
+| Ctrl+Shift+F | vault全体を検索 |
+| Ctrl+N / Ctrl+D | 新規ノート / 今日のデイリーノート |
+| Ctrl+E | 編集 → 分割 → プレビュー |
+| Ctrl+G | グラフビュー |
+| Ctrl+Enter | カーソル位置のリンクを開く |
+| F2 | 現在のノートを改名 / 移動 |
+| Ctrl+B / Ctrl+J | 左 / 右サイドバー |
+| Ctrl+Tab / Ctrl+W | 次のタブ / タブを閉じる |
+| Ctrl+O | 別のvaultを開く |
+| Ctrl + `+` / `-` | 全体の拡大縮小 |
 
+macOSでは Ctrl の代わりに Cmd です。
+
+## CLI (`rob`)
+
+vaultは `--vault`、環境変数 `ROBSIDIAN_VAULT`、またはカレントから親を辿って
+`.obsidian` / `.robsidian` のあるフォルダ、の順で決まります。
+出力は1行1件のテキスト（`--json` でJSON）なので、そのままパイプできます。
+
+```bash
+rob search rust tag:memo
 ```
 
-**main.js の基本構造:**
-
-```javascript
-return {
-    // ロード時に呼ばれる
-    async onload(app) {
-        console.log("Plugin loaded!");
-        
-        // 設定の読み込み
-        const settings = await app.plugin.loadData();
-
-        // 設定画面の追加
-        app.plugin.addSettingTab("My Plugin", (container) => {
-            container.innerHTML = "<h3>Settings</h3>";
-            // ...設定UIの構築
-        });
-    },
-
-    // アンロード時（無効化時）に呼ばれる
-    onunload() {
-        console.log("Plugin unloaded!");
-        // イベントリスナーの解除やDOMの削除を行う
-    }
-}
-
+```bash
+rob backlinks "Rust メモ"
 ```
 
-### 🛠️ Robsidian API (`window.app`)
+```bash
+rob mv "notes/old" "archive/New Name"
+```
 
-プラグインからは `app` 引数を通じて以下の機能にアクセスできます。
+```bash
+rob daily --append "- 14:00 打ち合わせ"
+```
 
-#### `app.vault` (ファイル操作)
+| コマンド | 内容 |
+|---|---|
+| `rob list` | ノート一覧 |
+| `rob find <query>` | ノート名のあいまい検索 |
+| `rob search <query>` | 全文検索（`path:line:text` 形式、grep互換） |
+| `rob cat <note>` | 本文を出力（パスでも名前でも指定可） |
+| `rob backlinks <note>` / `rob links <note>` | 被リンク / 発リンク |
+| `rob tags [tag]` | タグ一覧 / そのタグを持つノート |
+| `rob orphans` / `rob unresolved` | 孤立ノート / リンク切れ |
+| `rob new <name> [-c 本文 \| -c -]` | ノート作成（`-` で標準入力） |
+| `rob daily [-a テキスト]` | 今日のデイリーノートのパス（追記も可） |
+| `rob mv <from> <to>` | 改名 / 移動（リンク追従） |
+| `rob graph [-f dot\|json]` | リンクグラフを出力 |
+| `rob stats` | 統計 |
 
-* `read(path)`: ファイルの内容をテキストとして読み込む。
-* `write(path, content)`: ファイルにテキストを書き込む（上書き）。
-* `create(path)`: 空のファイルを作成する。
-* `createDir(path)`: フォルダを作成する。
-* `delete(path)`: ファイルまたはフォルダを削除する。
-* `rename(oldPath, newPath)`: ファイル名変更または移動。
-* `list(folderPath)`: 指定フォルダ内のファイル一覧を取得。
-* `exists(path)`: ファイルの存在確認（簡易実装）。
-* `getResourcePath(path)`: 画像表示用のローカルパスを取得。
+## 性能の目安
 
-#### `app.workspace` (画面操作)
+1万ノート・約40MB（1ノートあたりリンク40本という極端に密なvault）での実測（4コアのLinuxコンテナ）:
 
-* `openFile(path)`: 指定したパスのファイルをエディタで開く。
-* `openTerminal(title, command)`: 新しいターミナルタブを開く。
-* `split()`: ペインを分割する。
+| 項目 | 値 |
+|---|---|
+| CLIの起動〜索引化〜結果出力 | 約0.5秒 |
+| GUIのウィンドウ表示まで | 0.1秒台 |
+| GUIの常駐メモリ（上記vault / 5ノートのvault） | 約340MB / 約125MB（ソフトウェアGL環境での値） |
+| バイナリサイズ | GUI 約14MB、CLI 約3.5MB |
 
-#### `app.plugin` (設定管理)
+本文とリンク索引をすべてメモリに載せる設計なので、メモリはvaultのサイズとリンク数に比例します。
 
-* `loadData()`: プラグイン固有の保存された設定データを取得。
-* `saveData(data)`: 設定データを保存（永続化）。
-* `addSettingTab(name, handler)`: 設定画面に専用タブを追加する。
+## 現状の制限
 
-#### `app.utils` (ユーティリティ)
+正直なところ、まだ次のものはありません。
 
-* `notice(message)`: 画面右上にトースト通知を表示する。
-* `clipboardWrite(text)`: クリップボードにコピー。
+- **モーダル編集（Helix / Vim キーバインド）** — エディタはeguiの標準テキスト編集です
+- **Live Preview（編集中のインライン描画）** — 分割プレビューで代用
+- **プラグイン / テーマ機構** — 旧Tauri版にあったJSプラグインAPIは廃止しました（ダーク/ライト切替のみ）
+- Mermaid・数式・コールアウトの描画、ペイン分割、内蔵ターミナル
+- 動作確認はLinux（X11）のみです。Windows / macOS はCIでビルドとテストを回す設定を入れてありますが、
+  実機での確認（特に日本語IME入力）はこれからです
 
----
+旧Tauri版のコードはgit履歴に残っています。
 
-### 📝 Tips
+## 開発
 
-* **開発中のデバッグ**: アプリ上で `F12` キーを押すと DevTools が開き、`console.log` の内容やDOM構造を確認できます。
-* **パスの区切り文字**: WindowsとMac/Linuxの互換性のため、パス結合時は `app.vault.root.includes("/") ? "/" : "\\"` のようにセパレータを判定することを推奨します。
+```bash
+cargo test --workspace
+```
+
+```bash
+cargo clippy --workspace --all-targets
+```

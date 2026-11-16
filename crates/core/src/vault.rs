@@ -30,8 +30,8 @@ pub struct Note {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Backlink {
     pub source: String,
+    /// リンクが書かれている行（0始まり）。行の内容は [`Vault::line`] で取れる
     pub line: usize,
-    pub context: String,
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +105,19 @@ fn relative_path(from_dir: &str, to: &str) -> String {
     out.join("/")
 }
 
+/// Windowsの `canonicalize` が付ける `\\?\` 接頭辞を、通常のドライブパスなら外す
+/// （表示が読みにくく、`file://` URIや他ツールへの受け渡しでも扱いづらいため）。
+fn simplify_path(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
+}
+
 fn mtime_secs(path: &Path) -> u64 {
     fs::metadata(path)
         .and_then(|m| m.modified())
@@ -153,6 +166,7 @@ impl Vault {
         let root = root.as_ref();
         let root = root
             .canonicalize()
+            .map(simplify_path)
             .with_context(|| format!("vault not found: {}", root.display()))?;
         if !root.is_dir() {
             bail!("vault is not a directory: {}", root.display());
@@ -264,37 +278,51 @@ impl Vault {
                 .push(f.clone());
         }
 
-        let mut backlinks: HashMap<String, Vec<Backlink>> = HashMap::new();
-        let mut unresolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for note in self.notes.values() {
-            if note.parsed.links.is_empty() {
-                continue;
-            }
-            let lines: Vec<&str> = note.text.lines().collect();
-            for link in &note.parsed.links {
-                if let Some(dst) = self.resolve(&link.target, &note.path) {
-                    if dst == note.path {
-                        continue;
-                    }
-                    let list = backlinks.entry(dst.to_string()).or_default();
-                    // 同じ行からの重複リンクは1件にまとめる
-                    if list
-                        .last()
-                        .is_some_and(|b| b.source == note.path && b.line == link.line)
+        // リンク解決はノートごとに独立なので並列に行い、最後に順序を保って集約する
+        let notes: Vec<&Note> = self.notes.values().collect();
+        // (リンク元, 解決できたリンク[(リンク先, Backlink)], 解決できなかったリンク先)
+        type PerNote<'a> = (&'a str, Vec<(&'a str, Backlink)>, Vec<&'a str>);
+        let per_note: Vec<PerNote> = notes
+            .par_iter()
+            .filter(|note| !note.parsed.links.is_empty())
+            .map(|note| {
+                let mut found: Vec<(&str, Backlink)> = Vec::new();
+                let mut missing: Vec<&str> = Vec::new();
+                for link in &note.parsed.links {
+                    if let Some(dst) = self.resolve(&link.target, &note.path) {
+                        // 自己リンクと、同じ行からの重複リンクは数えない
+                        if dst == note.path
+                            || found.iter().any(|(d, b)| *d == dst && b.line == link.line)
+                        {
+                            continue;
+                        }
+                        found.push((
+                            dst,
+                            Backlink {
+                                source: note.path.clone(),
+                                line: link.line,
+                            },
+                        ));
+                    } else if self.resolve_file(&link.target, &note.path).is_none()
+                        && !missing.contains(&link.target.as_str())
                     {
-                        continue;
-                    }
-                    list.push(Backlink {
-                        source: note.path.clone(),
-                        line: link.line,
-                        context: lines.get(link.line).unwrap_or(&"").trim().to_string(),
-                    });
-                } else if self.resolve_file(&link.target, &note.path).is_none() {
-                    let sources = unresolved.entry(link.target.clone()).or_default();
-                    if sources.last() != Some(&note.path) {
-                        sources.push(note.path.clone());
+                        missing.push(&link.target);
                     }
                 }
+                (note.path.as_str(), found, missing)
+            })
+            .collect();
+        let mut backlinks: HashMap<String, Vec<Backlink>> = HashMap::new();
+        let mut unresolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (source, found, missing) in per_note {
+            for (dst, b) in found {
+                backlinks.entry(dst.to_string()).or_default().push(b);
+            }
+            for target in missing {
+                unresolved
+                    .entry(target.to_string())
+                    .or_default()
+                    .push(source.to_string());
             }
         }
         self.backlinks = backlinks;
@@ -391,6 +419,14 @@ impl Vault {
 
     pub fn backlinks(&self, rel: &str) -> &[Backlink] {
         self.backlinks.get(rel).map_or(&[], Vec::as_slice)
+    }
+
+    /// ノートの指定行（前後の空白を除く）。バックリンクの文脈表示用。
+    pub fn line(&self, rel: &str, line: usize) -> &str {
+        self.notes
+            .get(rel)
+            .and_then(|n| n.text.lines().nth(line))
+            .map_or("", str::trim)
     }
 
     /// ノートから出ているリンクと、その解決先。

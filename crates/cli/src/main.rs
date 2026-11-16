@@ -54,13 +54,13 @@ enum Cmd {
     /// ノートを作成する（本文は --content か標準入力 `-`）
     New {
         name: String,
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         content: Option<String>,
     },
     /// 今日のデイリーノートを（無ければ作って）パスを表示する
     Daily {
         /// 追記するテキスト
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         append: Option<String>,
     },
     /// ノートやフォルダを移動/改名し、vault内のリンクを追従させる
@@ -181,10 +181,15 @@ fn run(cli: Cli) -> Result<()> {
             let rel = note_arg(&vault, &note)?;
             let links = vault.backlinks(&rel);
             if out.json {
-                out.value(&serde_json::to_value(links)?)?;
+                let v: Vec<_> = links
+                    .iter()
+                    .map(|b| json!({"source": b.source, "line": b.line + 1, "context": vault.line(&b.source, b.line)}))
+                    .collect();
+                out.value(&json!(v))?;
             } else {
                 for b in links {
-                    writeln!(out.w, "{}:{}:{}", b.source, b.line + 1, b.context)?;
+                    let context = vault.line(&b.source, b.line);
+                    writeln!(out.w, "{}:{}:{context}", b.source, b.line + 1)?;
                 }
             }
         }
