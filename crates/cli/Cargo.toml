@@ -1,0 +1,17 @@
+[package]
+name = "robsidian-cli"
+description = "Command line interface to a Robsidian/Obsidian vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rob"
+path = "src/main.rs"
+
+[dependencies]
+robsidian-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
