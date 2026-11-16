@@ -1,25 +1,62 @@
 name: Release
 
-# `v0.2.0` のようなタグをpushすると、Windows / macOS / Linux 向けにビルドして
-# GitHub Releases に実行ファイルを添付する。
-# Actions画面から手動実行（タグ名を入力）することもできる。
+# mainが更新されるたびに走り、Cargo.toml のバージョン（例: 0.2.0）に対応するリリース
+# `v0.2.0` がまだ無ければ、Windows / macOS / Linux 向けにビルドして GitHub Releases に
+# 実行ファイルを添付する。つまり「バージョンを上げてmainにマージ」だけでリリースされる。
+# `v*` タグのpushや、Actions画面からの手動実行（タグ名を入力）でもリリースできる。
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "リリースするタグ名（例: v0.2.0）。無ければ実行したコミットに作成される"
-        required: true
+        description: "リリースするタグ名（例: v0.2.0）。空ならCargo.tomlのバージョンを使う"
+        required: false
 
 permissions:
   contents: write
 
-env:
-  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          release=true
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v$version"
+            # mainへのpushでは、そのバージョンが未リリースのときだけリリースする
+            if [ "$GITHUB_EVENT_NAME" = push ] && gh release view "$tag" >/dev/null 2>&1; then
+              release=false
+              echo "::notice::$tag はリリース済みです。新しく出すには Cargo.toml の version を上げてください"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,8 +101,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
         with:

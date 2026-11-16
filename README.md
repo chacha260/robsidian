@@ -144,18 +144,14 @@ rob daily --append "- 14:00 打ち合わせ"
 
 ## リリース
 
-`v` で始まるタグをpushすると、GitHub Actions が3つのOS向けにビルドし、
+リリースは自動です。`main` が更新されるたびに GitHub Actions が走り、`Cargo.toml` の
+`version` に対応するリリース（`0.2.0` なら `v0.2.0`）がまだ無ければ、3つのOS向けにビルドして
 実行ファイル（Windowsは `robsidian.exe` と `rob.exe` 入りのzip）を GitHub Releases に添付します。
 
-```bash
-git tag v0.2.0
-```
+新しいバージョンを出すには、ルートの `Cargo.toml` の `version` を上げて `main` にマージするだけです。
+同じバージョンのままの更新ではリリースは作られません。
 
-```bash
-git push origin v0.2.0
-```
-
-Actions画面の「Release」から、タグ名を入力して手動実行することもできます。
+`v` で始まるタグのpushや、Actions画面の「Release」からの手動実行でもリリースできます。
 
 ## 開発
 
