@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ViewMode {
+    /// Live Preview: 編集しながら、カーソルの無い行は整形して見せる
     #[default]
+    Live,
+    /// ソース表示: 記法をすべてそのまま見せる
     Edit,
     Split,
     Preview,
@@ -14,15 +17,17 @@ pub enum ViewMode {
 impl ViewMode {
     pub fn next(self) -> Self {
         match self {
+            Self::Live => Self::Edit,
             Self::Edit => Self::Split,
             Self::Split => Self::Preview,
-            Self::Preview => Self::Edit,
+            Self::Preview => Self::Live,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Edit => "編集",
+            Self::Live => "ライブ",
+            Self::Edit => "ソース",
             Self::Split => "分割",
             Self::Preview => "プレビュー",
         }
@@ -51,7 +56,7 @@ impl Default for Config {
             open_tabs: Vec::new(),
             active_tab: 0,
             dark: true,
-            view_mode: ViewMode::Edit,
+            view_mode: ViewMode::Live,
             show_left: true,
             show_right: true,
             font_size: 15.0,
