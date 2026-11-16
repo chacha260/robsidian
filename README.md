@@ -140,6 +140,8 @@ rob daily --append "- 14:00 打ち合わせ"
 - 動作確認はLinux（X11）のみです。Windows / macOS はCIでビルドとテストを回す設定を入れてありますが、
   実機での確認（特に日本語IME入力）はこれからです
 
+今後の機能追加案と実装方針は [docs/ROADMAP.md](docs/ROADMAP.md) にまとめています。
+
 旧Tauri版のコードはgit履歴に残っています。
 
 ## リリース
