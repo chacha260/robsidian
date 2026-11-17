@@ -60,7 +60,11 @@ pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
                         (_, Some(h)) => format!("{} › {h}", link.target),
                         _ => link.target.clone(),
                     };
-                    format!("[{label}]({SCHEME}{})", encode(&link.target))
+                    let target = match &link.heading {
+                        Some(h) => format!("{}#{h}", link.target),
+                        None => link.target.clone(),
+                    };
+                    format!("[{label}]({SCHEME}{})", encode(&target))
                 };
                 out.replace_range(link.full.clone(), &replacement);
             }

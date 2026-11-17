@@ -43,6 +43,13 @@ enum Cmd {
     Cat { note: String },
     /// このノートにリンクしているノート
     Backlinks { note: String },
+    /// このノートの名前がリンクにならずに書かれている箇所（未リンクの言及）
+    Mentions {
+        note: String,
+        /// 見つかった言及をすべて `[[リンク]]` に書き換える
+        #[arg(long)]
+        link: bool,
+    },
     /// このノートから出ているリンク
     Links { note: String },
     /// タグ一覧。タグを指定するとそのタグを持つノート
@@ -56,7 +63,12 @@ enum Cmd {
         name: String,
         #[arg(short, long, allow_hyphen_values = true)]
         content: Option<String>,
+        /// テンプレート名（テンプレートフォルダ内のノート）。本文の前に展開する
+        #[arg(short, long)]
+        template: Option<String>,
     },
+    /// テンプレートの一覧
+    Templates,
     /// 今日のデイリーノートを（無ければ作って）パスを表示する
     Daily {
         /// 追記するテキスト
@@ -193,6 +205,37 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Mentions { note, link } => {
+            let rel = note_arg(&vault, &note)?;
+            let mentions = vault.unlinked_mentions(&rel);
+            if link {
+                // 後ろから書き換えると、同じノート内の前の範囲がずれない
+                let mut changed: Vec<String> = Vec::new();
+                for m in mentions.iter().rev() {
+                    let Some(text) = vault.note(&m.source).map(|n| n.text.clone()) else {
+                        continue;
+                    };
+                    if let Some(new) = vault.link_mention_text(&text, m, &rel) {
+                        vault.write_note(&m.source, &new)?;
+                        if !changed.contains(&m.source) {
+                            changed.push(m.source.clone());
+                        }
+                    }
+                }
+                eprintln!(
+                    "linked {} mentions in {} notes",
+                    mentions.len(),
+                    changed.len()
+                );
+                out.lines(changed)?;
+            } else if out.json {
+                out.value(&serde_json::to_value(&mentions)?)?;
+            } else {
+                for m in &mentions {
+                    writeln!(out.w, "{}:{}:{}", m.source, m.line + 1, m.context)?;
+                }
+            }
+        }
         Cmd::Links { note } => {
             let rel = note_arg(&vault, &note)?;
             let links = vault.outgoing(&rel);
@@ -235,7 +278,11 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::New { name, content } => {
+        Cmd::New {
+            name,
+            content,
+            template,
+        } => {
             let content = match content.as_deref() {
                 Some("-") => {
                     let mut s = String::new();
@@ -245,9 +292,26 @@ fn run(cli: Cli) -> Result<()> {
                 Some(c) => c.to_string(),
                 None => String::new(),
             };
+            let content = match template {
+                Some(t) => {
+                    let tpl = vault
+                        .find_template(&t)
+                        .with_context(|| format!("template not found: {t}"))?
+                        .to_string();
+                    let title = name
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&name)
+                        .trim_end_matches(".md");
+                    let body = vault.render_template(&tpl, title).unwrap_or_default();
+                    body + &content
+                }
+                None => content,
+            };
             let rel = vault.create_note(&name, &content)?;
             out.lines([vault.abs(&rel).display().to_string()])?;
         }
+        Cmd::Templates => out.lines(vault.templates())?,
         Cmd::Daily { append } => {
             let rel = vault.daily()?;
             if let Some(text) = append {
@@ -283,7 +347,8 @@ fn run(cli: Cli) -> Result<()> {
                     out.value(&json!({ "nodes": nodes, "edges": edges }))?;
                 }
                 GraphFormat::Dot => {
-                    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+                    let q =
+                        |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
                     writeln!(out.w, "digraph vault {{")?;
                     for n in vault.notes() {
                         writeln!(out.w, "  {} [label={}];", q(&n.path), q(&n.name))?;
@@ -297,7 +362,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Stats => {
             let links: usize = vault.notes().map(|n| n.parsed.links.len()).sum();
-            let words: usize = vault.notes().map(|n| n.text.split_whitespace().count()).sum();
+            let words: usize = vault
+                .notes()
+                .map(|n| n.text.split_whitespace().count())
+                .sum();
             let stats = json!({
                 "vault": vault.root().display().to_string(),
                 "notes": vault.note_count(),

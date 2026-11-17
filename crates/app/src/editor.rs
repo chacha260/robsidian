@@ -1,10 +1,10 @@
 //! エディタ用のMarkdownシンタックスハイライトと、カーソル位置まわりの補助関数。
 
-use eframe::egui::text::{LayoutJob, TextFormat};
 use crate::highlight;
+use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{Align, Color32, FontFamily, FontId, Stroke, Vec2};
-use std::ops::Range;
 use robsidian_core::{parse, LinkKind};
+use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Colors {
@@ -19,6 +19,11 @@ pub struct Colors {
     pub code_bg: Color32,
     pub quote: Color32,
     pub mark_bg: Color32,
+    pub diff_add: Color32,
+    pub find_bg: Color32,
+    pub find_current: Color32,
+    pub diff_del: Color32,
+    pub warn_bg: Color32,
 }
 
 impl Colors {
@@ -36,6 +41,11 @@ impl Colors {
                 code_bg: Color32::from_rgb(0x26, 0x29, 0x30),
                 quote: Color32::from_rgb(0xa6, 0xab, 0xb5),
                 mark_bg: Color32::from_rgb(0x5c, 0x4d, 0x12),
+                diff_add: Color32::from_rgb(0x1f, 0x3d, 0x2a),
+                find_bg: Color32::from_rgb(0x4d, 0x43, 0x1a),
+                find_current: Color32::from_rgb(0x9a, 0x6a, 0x10),
+                diff_del: Color32::from_rgb(0x4a, 0x22, 0x26),
+                warn_bg: Color32::from_rgb(0x4a, 0x3a, 0x12),
             }
         } else {
             Self {
@@ -50,6 +60,11 @@ impl Colors {
                 code_bg: Color32::from_rgb(0xee, 0xef, 0xf2),
                 quote: Color32::from_rgb(0x5c, 0x61, 0x6b),
                 mark_bg: Color32::from_rgb(0xff, 0xec, 0x99),
+                diff_add: Color32::from_rgb(0xd8, 0xf5, 0xdf),
+                find_bg: Color32::from_rgb(0xff, 0xf0, 0xa8),
+                find_current: Color32::from_rgb(0xff, 0xb8, 0x4d),
+                diff_del: Color32::from_rgb(0xfb, 0xdd, 0xdd),
+                warn_bg: Color32::from_rgb(0xfd, 0xf0, 0xc8),
             }
         }
     }
@@ -107,6 +122,9 @@ pub struct Options<'a> {
     pub cursor: Option<(usize, usize)>,
     /// 画像リンク先 → 表示サイズ。読み込めない・未読み込みなら None
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
+    /// 検索で一致した範囲（バイト位置）と、そのうち選択中のものの番号
+    pub marks: &'a [Range<usize>],
+    pub current_mark: Option<usize>,
 }
 
 #[derive(Default, Clone)]
@@ -138,12 +156,24 @@ impl Painter<'_> {
 
     /// この文字範囲の記法を畳んでよいか（Live Previewで、カーソルが触れていない）。
     fn hidden(&self, chars: Range<usize>) -> bool {
-        self.live && !self.cursor.is_some_and(|(a, b)| a <= chars.end && chars.start <= b)
+        self.live
+            && !self
+                .cursor
+                .is_some_and(|(a, b)| a <= chars.end && chars.start <= b)
     }
 
     /// いま積んでいる位置から `text` ぶんの文字範囲。
     fn ahead(&self, text: &str) -> Range<usize> {
         self.chars..self.chars + text.chars().count()
+    }
+
+    /// 行頭の字下げ。タブ文字は狭く描かれるので、空白4つぶん程度まで広げる。
+    fn indent_fmt(&self, indent: &str) -> TextFormat {
+        let mut f = self.fmt(self.c.text);
+        if indent.contains('\t') {
+            f.extra_letter_spacing = self.size * 1.2;
+        }
+        f
     }
 
     fn mono(&self, color: Color32) -> TextFormat {
@@ -169,7 +199,11 @@ impl Painter<'_> {
 
     /// 幅は保ったまま見えなくする（上に装飾を描く場所として使う）。
     fn ghost(&self, hide: bool) -> TextFormat {
-        self.fmt(if hide { Color32::TRANSPARENT } else { self.c.dim })
+        self.fmt(if hide {
+            Color32::TRANSPARENT
+        } else {
+            self.c.dim
+        })
     }
 
     fn push(&mut self, text: &str, format: TextFormat) -> Range<usize> {
@@ -246,7 +280,9 @@ impl Painter<'_> {
                         (b'~' | b'=', true) => true,
                         _ => false,
                     };
-                    let opens = b.get(i + n).is_some_and(|c| !c.is_ascii_whitespace() && *c != ch);
+                    let opens = b
+                        .get(i + n)
+                        .is_some_and(|c| !c.is_ascii_whitespace() && *c != ch);
                     if ok && opens {
                         let marker = &line[i..i + n];
                         line[i + n..]
@@ -312,7 +348,7 @@ impl Painter<'_> {
         if trimmed.starts_with("> ") || trimmed == ">" {
             let end = (indent + 2).min(line.len());
             let hide = self.hidden(self.ahead(&line[..end]));
-            self.push(&line[..indent], self.fmt(text));
+            self.push(&line[..indent], self.indent_fmt(&line[..indent]));
             self.push(&line[indent..end], self.ghost(hide));
             return (end, self.c.quote, hide);
         }
@@ -323,7 +359,7 @@ impl Painter<'_> {
             if checked || rest.starts_with("[ ] ") {
                 // `- [ ] ` → 先頭の `- ` を畳み、`[ ]` の位置にチェックボックスを描く
                 let hide = self.hidden(self.ahead(&line[..indent + 5]));
-                self.push(&line[..indent], self.fmt(text));
+                self.push(&line[..indent], self.indent_fmt(&line[..indent]));
                 self.push(&line[indent..indent + 2], self.mark(hide));
                 let range = self.push(&line[indent + 2..indent + 5], self.ghost(hide));
                 if hide {
@@ -333,7 +369,7 @@ impl Painter<'_> {
                 return (indent + 6, if checked { self.c.dim } else { text }, false);
             }
             let hide = self.hidden(self.ahead(&line[..indent + 1]));
-            self.push(&line[..indent], self.fmt(text));
+            self.push(&line[..indent], self.indent_fmt(&line[..indent]));
             let range = self.push(&line[indent..indent + 1], self.ghost(hide));
             if hide {
                 self.deco(DecoKind::Bullet, range);
@@ -371,7 +407,10 @@ fn image_only(line: &str) -> Option<String> {
 fn table_cells(line: &str) -> Vec<String> {
     let t = line.trim();
     let t = t.strip_prefix('|').unwrap_or(t);
-    let t = t.strip_suffix('|').filter(|r| !r.ends_with('\\')).unwrap_or(t);
+    let t = t
+        .strip_suffix('|')
+        .filter(|r| !r.ends_with('\\'))
+        .unwrap_or(t);
     let mut cells = vec![String::new()];
     let mut chars = t.chars().peekable();
     while let Some(c) = chars.next() {
@@ -412,10 +451,10 @@ pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> Lay
 
 fn is_rule(trimmed: &str) -> bool {
     let mut chars = trimmed.chars().filter(|c| !c.is_whitespace());
-    let Some(first) = chars.next() else { return false };
-    matches!(first, '-' | '*' | '_')
-        && chars.clone().all(|c| c == first)
-        && chars.count() >= 2
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    matches!(first, '-' | '*' | '_') && chars.clone().all(|c| c == first) && chars.count() >= 2
 }
 
 pub fn layout(text: &str, opt: &Options) -> Layout {
@@ -463,7 +502,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                 .map(|&c| (c, b.iter().take_while(|&&x| x == c).count()))
                 .filter(|&(_, len)| len >= 3)
         };
-        let closes = matches!((marker, fence), (Some((c, l)), Some((oc, ol))) if c == oc && l >= ol);
+        let closes =
+            matches!((marker, fence), (Some((c, l)), Some((oc, ol))) if c == oc && l >= ol);
         if fence.is_some() || marker.is_some() {
             let opens = fence.is_none();
             let start = p.chars;
@@ -480,7 +520,9 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                 p.push(&line[ticks..], label.clone());
                 p.push(eol, label);
             } else {
-                let colored = code.as_ref().and_then(|(first, spans)| spans.get(n - first));
+                let colored = code
+                    .as_ref()
+                    .and_then(|(first, spans)| spans.get(n - first));
                 match colored {
                     Some(spans) => {
                         // 色分け済みの断片は、行末の改行まで含めて元の行をちょうど覆う
@@ -557,7 +599,9 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         } else if table.is_some() || trimmed.starts_with('|') {
             if table.is_none() {
                 // 表の開始: 2行目が区切り行なら、連続する `|` 行を1つの表として扱う
-                let is_table = lines.get(n + 1).is_some_and(|l| is_table_separator(content(l)));
+                let is_table = lines
+                    .get(n + 1)
+                    .is_some_and(|l| is_table_separator(content(l)));
                 let end = if is_table {
                     (n + 1..lines.len())
                         .take_while(|&i| content(lines[i]).trim_start().starts_with('|'))
@@ -587,7 +631,10 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             format.line_height = row_height;
             let chars = p.push(line, format);
             if pretty && !separator {
-                rows.push(TableRow { chars, cells: table_cells(line) });
+                rows.push(TableRow {
+                    chars,
+                    cells: table_cells(line),
+                });
             }
             if n < end {
                 table = Some((end, pretty, start, rows));
@@ -604,11 +651,57 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         }
         p.push(eol, p.fmt(p.c.text));
     }
-    Layout { job: p.job, decos: p.decos }
+    let mut job = p.job;
+    paint_marks(&mut job, opt.marks, opt.current_mark, opt.colors);
+    Layout {
+        job,
+        decos: p.decos,
+    }
+}
+
+/// 検索の一致範囲に背景色を付ける（区間を一致の境界で分割する）。
+fn paint_marks(job: &mut LayoutJob, marks: &[Range<usize>], current: Option<usize>, c: &Colors) {
+    if marks.is_empty() {
+        return;
+    }
+    let sections = std::mem::take(&mut job.sections);
+    for section in sections {
+        let (s, e) = (section.byte_range.start.0, section.byte_range.end.0);
+        let mut cuts = vec![s, e];
+        // 一致は位置順に並んでいるので、区間に重なるものだけを見る
+        let first = marks.partition_point(|m| m.end <= s);
+        for m in marks[first..].iter().take_while(|m| m.start < e) {
+            cuts.push(m.start.clamp(s, e));
+            cuts.push(m.end.clamp(s, e));
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for (i, w) in cuts.windows(2).enumerate() {
+            let mut piece = section.clone();
+            piece.byte_range = w[0].into()..w[1].into();
+            if i > 0 {
+                piece.leading_space = 0.0;
+            }
+            let hit = marks[first..]
+                .iter()
+                .take_while(|m| m.start < e)
+                .position(|m| m.start <= w[0] && w[1] <= m.end);
+            if let Some(k) = hit {
+                piece.format.background = if current == Some(first + k) {
+                    c.find_current
+                } else {
+                    c.find_bg
+                };
+            }
+            job.sections.push(piece);
+        }
+    }
 }
 
 pub fn byte_of_char(text: &str, char_idx: usize) -> usize {
-    text.char_indices().nth(char_idx).map_or(text.len(), |(b, _)| b)
+    text.char_indices()
+        .nth(char_idx)
+        .map_or(text.len(), |(b, _)| b)
 }
 
 pub fn char_of_byte(text: &str, byte_idx: usize) -> usize {
@@ -625,13 +718,15 @@ pub fn line_start(text: &str, line: usize) -> usize {
         .map_or(text.len(), |(i, _)| i + 1)
 }
 
-/// カーソル位置にあるリンクのリンク先（`#見出し` 付きの場合はそれを除いたもの）。
+/// カーソル位置（文字境界のバイト位置）にあるリンクのリンク先。見出しの指定があれば `ノート#見出し`。
 pub fn link_at(text: &str, byte_pos: usize) -> Option<String> {
     let start = text[..byte_pos].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[byte_pos..].find('\n').map_or(text.len(), |i| byte_pos + i);
+    let end = text[byte_pos..]
+        .find('\n')
+        .map_or(text.len(), |i| byte_pos + i);
     let line = &text[start..end];
     let pos = byte_pos - start;
-    parse::parse(line).links.into_iter().find_map(|l| {
+    let found = parse::parse(line).links.into_iter().find_map(|l| {
         let range = match l.kind {
             LinkKind::Wiki => l.full.clone(),
             LinkKind::Markdown => {
@@ -639,7 +734,19 @@ pub fn link_at(text: &str, byte_pos: usize) -> Option<String> {
                 open..(l.span.end + 1).min(line.len())
             }
         };
-        (range.start <= pos && pos <= range.end).then_some(l.target)
+        let target = match &l.heading {
+            Some(h) => format!("{}#{h}", l.target),
+            None => l.target,
+        };
+        (range.start <= pos && pos <= range.end).then_some(target)
+    });
+    // `[[#見出し]]`（同じノート内のリンク）は索引の対象外なので、ここで拾う
+    found.or_else(|| {
+        let open = line[..pos.min(line.len())].rfind("[[#")?;
+        let close = open + line[open..].find("]]")?;
+        let inner = &line[open + 2..close];
+        (pos <= close + 2 && !inner.contains('['))
+            .then(|| inner.split('|').next().unwrap_or(inner).trim().to_string())
     })
 }
 
@@ -649,7 +756,8 @@ pub fn completion_start(text: &str, cursor: usize) -> Option<usize> {
     let before = &text[line_start..cursor];
     let open = before.rfind("[[")?;
     let typed = &before[open + 2..];
-    if typed.contains(['|', '#', '[', ']']) || typed.len() > 80 {
+    // `#` は見出しの指定として1つだけ許す（`[[ノート#見出し`）
+    if typed.contains(['|', '[', ']']) || typed.matches('#').count() > 1 || typed.len() > 80 {
         return None;
     }
     Some(line_start + open + 2)
@@ -663,6 +771,13 @@ mod tests {
     fn helpers() {
         let t = "あ[[Note A|x]]\n見出し [m](b.md) [[Par";
         assert_eq!(link_at(t, 6).as_deref(), Some("Note A"));
+        let h = "x [[Note#節|別名]] y [[#自分の節]]";
+        assert_eq!(link_at(h, 5).as_deref(), Some("Note#節"));
+        assert_eq!(link_at(h, h.len() - 2).as_deref(), Some("#自分の節"));
+        assert_eq!(link_at(h, 0), None);
+        let k = "[[Note#";
+        assert_eq!(&k[completion_start(k, k.len()).unwrap()..], "Note#");
+        assert_eq!(completion_start("[[a#b#", 6), None);
         assert_eq!(link_at(t, 0), None);
         let md = t.find("b.md").unwrap();
         assert_eq!(link_at(t, md + 1).as_deref(), Some("b.md"));
@@ -676,7 +791,18 @@ mod tests {
     fn run(text: &str, live: bool, cursor: Option<(usize, usize)>) -> Layout {
         let colors = Colors::new(true);
         let image = |t: &str| (t == "pic.png").then_some(Vec2::new(100.0, 50.0));
-        layout(text, &Options { size: 14.0, colors: &colors, live, cursor, image: &image })
+        layout(
+            text,
+            &Options {
+                marks: &[],
+                current_mark: None,
+                size: 14.0,
+                colors: &colors,
+                live,
+                cursor,
+                image: &image,
+            },
+        )
     }
 
     const SAMPLE: &str = "---\na: b\n---\n# H\n- [ ] `c` [[l|別名]] **b** *i* ~~s~~ ==m== #tag [x](y)\n- item\n> quote\n---\n![[pic.png]]\n```\ncode\n```\n| a | b |\n|---|---|\n| 1 | x \\| y |\nsnake_case_name tail";
@@ -686,7 +812,12 @@ mod tests {
         for (live, cursor) in [(false, None), (true, None), (true, Some((20, 60)))] {
             let out = run(SAMPLE, live, cursor);
             assert_eq!(out.job.text, SAMPLE);
-            let total: usize = out.job.sections.iter().map(|s| s.byte_range.end.0 - s.byte_range.start.0).sum();
+            let total: usize = out
+                .job
+                .sections
+                .iter()
+                .map(|s| s.byte_range.end.0 - s.byte_range.start.0)
+                .sum();
             assert_eq!(total, SAMPLE.len());
         }
     }
@@ -707,7 +838,8 @@ mod tests {
             hidden(&live),
             "# ¦- ¦`¦`¦[[l|¦]]¦**¦**¦*¦*¦~~¦~~¦==¦==¦[¦](y)¦![[pic.png]]¦```¦```¦|---|---|"
         );
-        let slice = |r: &Range<usize>| -> String { SAMPLE.chars().skip(r.start).take(r.len()).collect() };
+        let slice =
+            |r: &Range<usize>| -> String { SAMPLE.chars().skip(r.start).take(r.len()).collect() };
         let kinds: Vec<_> = live.decos.iter().map(|d| d.kind.clone()).collect();
         assert_eq!(
             kinds[..8],
@@ -722,9 +854,14 @@ mod tests {
                 DecoKind::Code,
             ]
         );
-        let DecoKind::Table(rows) = &kinds[8] else { panic!("expected a table") };
+        let DecoKind::Table(rows) = &kinds[8] else {
+            panic!("expected a table")
+        };
         assert_eq!(rows.len(), 2);
-        assert_eq!((slice(&rows[0].chars).as_str(), &rows[0].cells), ("| a | b |", &vec!["a".to_string(), "b".into()]));
+        assert_eq!(
+            (slice(&rows[0].chars).as_str(), &rows[0].cells),
+            ("| a | b |", &vec!["a".to_string(), "b".into()])
+        );
         assert_eq!(rows[1].cells, ["1", "x | y"]);
         assert_eq!(slice(&rows[1].chars), "| 1 | x \\| y |");
         // チェックボックスの範囲は `[ ]` の3文字
@@ -744,18 +881,65 @@ mod tests {
         let task = at("- [ ]");
         let on_task = run(SAMPLE, true, Some((task, task)));
         assert!(hidden(&on_task).starts_with("# ¦`¦`¦[[l|"));
-        assert!(!on_task.decos.iter().any(|d| matches!(d.kind, DecoKind::Checkbox(_))));
+        assert!(!on_task
+            .decos
+            .iter()
+            .any(|d| matches!(d.kind, DecoKind::Checkbox(_))));
         // 表の中に置くと、表全体がソース表示に戻る
         let cell = at("| 1 |") + 2;
         let on_table = run(SAMPLE, true, Some((cell, cell)));
         assert!(!hidden(&on_table).contains("|---|"));
-        assert!(!on_table.decos.iter().any(|d| matches!(d.kind, DecoKind::Table(_))));
+        assert!(!on_table
+            .decos
+            .iter()
+            .any(|d| matches!(d.kind, DecoKind::Table(_))));
         // 全選択すればすべての記法が見える。ソース表示では何も畳まない
         let all = run(SAMPLE, true, Some((0, SAMPLE.chars().count())));
         assert_eq!(hidden(&all), "");
         let source = run(SAMPLE, false, None);
         assert_eq!(hidden(&source), "");
         assert!(source.decos.iter().all(|d| d.kind == DecoKind::Code));
+    }
+
+    #[test]
+    fn search_marks_are_painted() {
+        let colors = Colors::new(true);
+        let text = "# Rust\n**rust** and rust";
+        let marks = [2..6, 9..13, 20..24];
+        let image = |_: &str| None;
+        let out = layout(
+            text,
+            &Options {
+                marks: &marks,
+                current_mark: Some(1),
+                size: 14.0,
+                colors: &colors,
+                live: false,
+                cursor: None,
+                image: &image,
+            },
+        );
+        assert_eq!(out.job.text, text);
+        let painted: Vec<(&str, bool)> = out
+            .job
+            .sections
+            .iter()
+            .filter(|s| {
+                s.format.background == colors.find_bg || s.format.background == colors.find_current
+            })
+            .map(|s| {
+                let r = s.byte_range.start.0..s.byte_range.end.0;
+                (&text[r], s.format.background == colors.find_current)
+            })
+            .collect();
+        assert_eq!(painted, [("Rust", false), ("rust", true), ("rust", false)]);
+        // 区間は隙間なく本文全体を覆う
+        let mut at = 0;
+        for s in &out.job.sections {
+            assert_eq!(s.byte_range.start.0, at);
+            at = s.byte_range.end.0;
+        }
+        assert_eq!(at, text.len());
     }
 
     #[test]
@@ -768,21 +952,31 @@ mod tests {
             for section in &out.job.sections {
                 let line = text[..section.byte_range.start.0].matches('\n').count();
                 let size = section.format.font_id.size;
-                let h = section.format.line_height.unwrap_or(if size > 1.0 { size } else { 0.0 });
+                let h = section
+                    .format
+                    .line_height
+                    .unwrap_or(if size > 1.0 { size } else { 0.0 });
                 rows[line] = rows[line].max(Some((h * 100.0) as u32));
             }
             rows
         };
         let unfocused = heights(None);
         for cursor in 0..=text.chars().count() {
-            assert_eq!(heights(Some((cursor, cursor))), unfocused, "cursor at {cursor}");
+            assert_eq!(
+                heights(Some((cursor, cursor))),
+                unfocused,
+                "cursor at {cursor}"
+            );
         }
     }
 
     #[test]
     fn image_only_lines() {
         assert_eq!(image_only(" ![[a b.png|300]] ").as_deref(), Some("a b.png"));
-        assert_eq!(image_only("![alt](img/a%20b.png)").as_deref(), Some("img/a b.png"));
+        assert_eq!(
+            image_only("![alt](img/a%20b.png)").as_deref(),
+            Some("img/a b.png")
+        );
         assert_eq!(image_only("![alt](https://x/y.png)"), None);
         assert_eq!(image_only("text ![[a.png]]"), None);
         assert!(is_rule("---") && is_rule("* * *") && !is_rule("--") && !is_rule("-a-"));

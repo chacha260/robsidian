@@ -2,10 +2,12 @@
 //!
 //! GUI（`robsidian`）とCLI（`rob`）の両方がこのクレートだけに依存する。
 
+pub mod history;
 pub mod parse;
 pub mod search;
+pub mod template;
 pub mod vault;
 
 pub use parse::{Heading, Link, LinkKind, Parsed};
 pub use search::{LineHit, NoteHit};
-pub use vault::{Backlink, Note, Vault};
+pub use vault::{Backlink, Mention, Note, Vault};

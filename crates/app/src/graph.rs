@@ -29,7 +29,10 @@ pub struct Graph {
 
 impl Graph {
     pub fn new(local: bool) -> Self {
-        Self { local, ..Default::default() }
+        Self {
+            local,
+            ..Default::default()
+        }
     }
 
     fn rebuild(&mut self, vault: &Vault, center: Option<&str>) {
@@ -138,7 +141,11 @@ impl Graph {
         let key = (
             generation,
             self.local,
-            if self.local { current.unwrap_or("").to_string() } else { String::new() },
+            if self.local {
+                current.unwrap_or("").to_string()
+            } else {
+                String::new()
+            },
         );
         if self.key.as_ref() != Some(&key) {
             self.rebuild(vault, current);
@@ -169,7 +176,10 @@ impl Graph {
         }
 
         if self.fit && !self.nodes.is_empty() {
-            let extent = self.nodes.iter().fold(Vec2::splat(1.0), |m, n| m.max(n.pos.abs()));
+            let extent = self
+                .nodes
+                .iter()
+                .fold(Vec2::splat(1.0), |m, n| m.max(n.pos.abs()));
             let scale = (rect.size() * 0.5 - Vec2::splat(50.0)).max(Vec2::splat(10.0)) / extent;
             self.zoom = scale.min_elem().clamp(0.05, 2.2);
             self.pan = Vec2::ZERO;
@@ -204,7 +214,11 @@ impl Graph {
                 continue;
             }
             let lit = hovered == Some(a) || hovered == Some(b);
-            let stroke = if lit { Stroke::new(1.5, accent) } else { Stroke::new(1.0, edge_color) };
+            let stroke = if lit {
+                Stroke::new(1.5, accent)
+            } else {
+                Stroke::new(1.0, edge_color)
+            };
             painter.line_segment([pa, pb], stroke);
         }
         let show_labels = self.nodes.len() <= 60 || zoom > 1.6;
@@ -215,7 +229,11 @@ impl Graph {
             }
             let is_current = current == Some(n.path.as_str());
             let is_hovered = hovered == Some(i);
-            let color = if is_current || is_hovered { accent } else { node_color };
+            let color = if is_current || is_hovered {
+                accent
+            } else {
+                node_color
+            };
             painter.circle_filled(p, node_radius(n), color);
             if show_labels || is_hovered || is_current {
                 painter.text(
@@ -223,7 +241,11 @@ impl Graph {
                     egui::Align2::CENTER_TOP,
                     &n.name,
                     egui::FontId::proportional(11.0),
-                    if is_hovered || is_current { text_color } else { node_color },
+                    if is_hovered || is_current {
+                        text_color
+                    } else {
+                        node_color
+                    },
                 );
             }
         }

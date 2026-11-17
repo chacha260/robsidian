@@ -4,7 +4,9 @@
 //! 本文もメモリに保持するので、検索やバックリンク表示はディスクI/Oなしで返る。
 //! Obsidianのvaultとそのまま互換（`[[wikilink]]`、`#tag`、frontmatter）。
 
+use crate::history;
 use crate::parse::{self, Link, LinkKind, Parsed};
+use crate::template;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -34,6 +36,61 @@ pub struct Backlink {
     pub line: usize,
 }
 
+/// リンクになっていない言及（[`Vault::unlinked_mentions`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mention {
+    pub source: String,
+    /// 0始まりの行番号
+    pub line: usize,
+    /// 本文中のバイト範囲
+    pub range: std::ops::Range<usize>,
+    /// 本文中に書かれていた文字列（大文字小文字は本文のまま）
+    pub text: String,
+    /// 前後の空白を除いた行
+    pub context: String,
+    /// `context` の中で言及が始まるバイト位置
+    pub column: usize,
+}
+
+/// 言及として数えない範囲（既存のリンク全体）。Markdownリンクは `[文字](先)` 全体にする。
+fn mention_guard(text: &str, link: &Link) -> std::ops::Range<usize> {
+    match link.kind {
+        LinkKind::Wiki => link.full.clone(),
+        LinkKind::Markdown => {
+            let line_start = text[..link.span.start].rfind('\n').map_or(0, |i| i + 1);
+            let open = text[line_start..link.span.start]
+                .rfind('[')
+                .map_or(link.span.start, |i| line_start + i);
+            let close = text[link.span.end..]
+                .find(')')
+                .map_or(link.span.end, |i| link.span.end + i + 1);
+            open..close
+        }
+    }
+}
+
+/// 行内のインラインコード（`...`）の範囲。
+fn inline_code_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'`' {
+            let n = b[i..].iter().take_while(|&&c| c == b'`').count();
+            let ticks = &line[i..i + n];
+            if let Some(close) = line[i + n..].find(ticks) {
+                out.push(i..i + n + close + n);
+                i += n + close + n;
+                continue;
+            }
+            i += n;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 #[derive(Debug, Default)]
 pub struct Vault {
     root: PathBuf,
@@ -46,6 +103,8 @@ pub struct Vault {
     file_names: HashMap<String, Vec<String>>,
     backlinks: HashMap<String, Vec<Backlink>>,
     unresolved: BTreeMap<String, Vec<String>>,
+    /// 上書き前の内容をローカル履歴に残す量
+    pub history_limits: history::Limits,
 }
 
 pub fn is_note_path(path: &str) -> bool {
@@ -446,6 +505,136 @@ impl Vault {
         &self.unresolved
     }
 
+    /// このノートの名前（またはaliases）が、リンクにならずに本文中に書かれている箇所。
+    /// コードブロック・インラインコード・frontmatter・既存のリンクの中は数えない。
+    /// 短すぎる名前（英数字は3文字未満、それ以外は2文字未満）は誤検出が多いので対象外。
+    pub fn unlinked_mentions(&self, rel: &str) -> Vec<Mention> {
+        const MAX: usize = 300;
+        let Some(target) = self.notes.get(rel) else {
+            return Vec::new();
+        };
+        let long_enough = |t: &str| {
+            let n = t.chars().count();
+            if t.is_ascii() {
+                n >= 3
+            } else {
+                n >= 2
+            }
+        };
+        let mut terms: Vec<String> = std::iter::once(target.name.clone())
+            .chain(target.parsed.aliases.iter().cloned())
+            .filter(|t| long_enough(t.trim()))
+            .map(|t| t.trim().to_string())
+            .collect();
+        // 長い語を先に試し、「Rust」と「Rust Notes」の両方に当たる場合は長い方を採る
+        terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        terms.dedup();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let pattern = terms
+            .iter()
+            .map(|t| regex::escape(t))
+            .collect::<Vec<_>>()
+            .join("|");
+        let Ok(re) = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+        else {
+            return Vec::new();
+        };
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        let notes: Vec<&Note> = self.notes.values().filter(|n| n.path != rel).collect();
+        let mut out: Vec<Mention> = notes
+            .par_iter()
+            .flat_map_iter(|note| {
+                let text = &note.text;
+                let links: Vec<std::ops::Range<usize>> = note
+                    .parsed
+                    .links
+                    .iter()
+                    .map(|l| mention_guard(text, l))
+                    .collect();
+                let mut found = Vec::new();
+                let mut offset = 0;
+                let mut fence = false;
+                for (line_no, raw) in text.split_inclusive('\n').enumerate() {
+                    let start = offset;
+                    offset += raw.len();
+                    if start < note.parsed.body_start {
+                        continue;
+                    }
+                    let t = raw.trim_start();
+                    if t.starts_with("```") || t.starts_with("~~~") {
+                        fence = !fence;
+                        continue;
+                    }
+                    if fence {
+                        continue;
+                    }
+                    let line = raw.trim_end_matches(['\n', '\r']);
+                    let code = inline_code_ranges(line);
+                    for m in re.find_iter(line) {
+                        let (a, b) = (start + m.start(), start + m.end());
+                        let inside = |r: &std::ops::Range<usize>| r.start < b && a < r.end;
+                        if links.iter().any(inside)
+                            || code.iter().any(|r| r.start < m.end() && m.start() < r.end)
+                        {
+                            continue;
+                        }
+                        // 英数字の語は、単語の途中に当たったものを除く
+                        let ascii = m.as_str().is_ascii();
+                        if ascii
+                            && (word(line[..m.start()].chars().next_back())
+                                || word(line[m.end()..].chars().next()))
+                        {
+                            continue;
+                        }
+                        found.push(Mention {
+                            source: note.path.clone(),
+                            line: line_no,
+                            range: a..b,
+                            text: m.as_str().to_string(),
+                            context: line.trim().to_string(),
+                            column: m.start() - (line.len() - line.trim_start().len()),
+                        });
+                    }
+                }
+                found
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then(a.range.start.cmp(&b.range.start))
+        });
+        out.truncate(MAX);
+        out
+    }
+
+    /// 未リンクの言及を `[[リンク]]` に書き換えた本文を返す（書き込みはしない）。
+    /// 本文がその後変わっていて、範囲の文字列が一致しなければ None。
+    pub fn link_mention_text(&self, text: &str, mention: &Mention, target: &str) -> Option<String> {
+        if text.get(mention.range.clone()) != Some(mention.text.as_str()) {
+            return None;
+        }
+        let note = self.notes.get(target)?;
+        let name = if self.resolve(&note.name, &mention.source) == Some(target) {
+            note.name.clone()
+        } else {
+            strip_note_ext(target).to_string()
+        };
+        let link = if mention.text == name {
+            format!("[[{name}]]")
+        } else {
+            format!("[[{name}|{}]]", mention.text)
+        };
+        let mut out = text.to_string();
+        out.replace_range(mention.range.clone(), &link);
+        Some(out)
+    }
+
     /// どこからもリンクされておらず、どこにもリンクしていないノート
     pub fn orphans(&self) -> Vec<&str> {
         self.notes
@@ -506,16 +695,31 @@ impl Vault {
         Ok(self.root.join(rel))
     }
 
-    /// ノートを保存する（アトミック書き込み）。
+    /// ディスク上のノートの現在の内容（索引ではなく実ファイルを読む）。無ければ None。
+    pub fn disk_text(&self, rel: &str) -> Option<String> {
+        let bytes = fs::read(self.checked(rel).ok()?).ok()?;
+        Some(
+            String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        )
+    }
+
+    /// ノートを保存する（アトミック書き込み）。上書きされる内容はローカル履歴に残す。
     pub fn write_note(&mut self, rel: &str, text: &str) -> Result<()> {
         let abs = self.checked(rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
+        if let Some(old) = self.disk_text(rel).filter(|old| old != text) {
+            // 履歴が残せなくても保存自体は止めない
+            let _ = history::snapshot_with(&self.root, rel, &old, self.history_limits);
+        }
         atomic_write(&abs, text.as_bytes()).with_context(|| format!("failed to save {rel}"))?;
         self.register_dirs(rel);
-        self.notes
-            .insert(rel.to_string(), make_note(rel, text.to_string(), mtime_secs(&abs)));
+        self.notes.insert(
+            rel.to_string(),
+            make_note(rel, text.to_string(), mtime_secs(&abs)),
+        );
         self.rebuild_links();
         Ok(())
     }
@@ -623,10 +827,7 @@ impl Vault {
                         if dst_new.is_none() && src_new.is_none() {
                             continue;
                         }
-                        parse::percent_encode_path(&relative_path(
-                            parent_dir(src_final),
-                            dst_final,
-                        ))
+                        parse::percent_encode_path(&relative_path(parent_dir(src_final), dst_final))
                     }
                 };
                 if note.text[link.span.clone()] != replacement {
@@ -648,6 +849,7 @@ impl Vault {
         }
         fs::rename(&old_abs, &new_abs)
             .with_context(|| format!("failed to rename {old} -> {new}"))?;
+        history::rename(&self.root, old, &new);
 
         let mut updated = Vec::new();
         for (path, text) in rewrites {
@@ -661,38 +863,126 @@ impl Vault {
 
     // ---- デイリーノート ----
 
+    /// `.obsidian/<file>` の文字列設定を読む（空文字は無いものとして扱う）。
+    fn obsidian_setting(&self, file: &str, key: &str) -> Option<String> {
+        let text = fs::read_to_string(self.root.join(".obsidian").join(file)).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let s = value.get(key)?.as_str()?.trim().trim_matches('/');
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
+    /// ノートに貼り付ける添付ファイルの保存先パス（vault相対）。Obsidianの設定
+    /// （`.obsidian/app.json` の attachmentFolderPath）に従い、同名があれば番号を付ける。
+    /// 設定が無ければvaultのルート。`./` で始まる設定はノートと同じフォルダからの相対。
+    pub fn attachment_path(&self, note: &str, name: &str) -> String {
+        let setting = self.obsidian_setting("app.json", "attachmentFolderPath");
+        let folder = match setting.as_deref() {
+            None => String::new(),
+            Some(".") => parent_dir(note).to_string(),
+            Some(s) if s.starts_with("./") => {
+                join_normalized(parent_dir(note), &s[2..]).unwrap_or_default()
+            }
+            Some(s) => s.to_string(),
+        };
+        let join = |file: &str| {
+            if folder.is_empty() {
+                file.to_string()
+            } else {
+                format!("{folder}/{file}")
+            }
+        };
+        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+        let mut candidate = join(name);
+        let mut n = 1;
+        while self.abs(&candidate).exists() {
+            candidate = join(&format!("{stem} {n}.{ext}"));
+            n += 1;
+        }
+        candidate
+    }
+
+    /// 添付ファイル（ノート以外）を書き込む。
+    pub fn write_file(&mut self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let abs = self.checked(rel)?;
+        if is_note_path(rel) {
+            bail!("use write_note for notes: {rel}");
+        }
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&abs, bytes).with_context(|| format!("failed to save {rel}"))?;
+        self.register_dirs(rel);
+        self.files.insert(rel.to_string());
+        self.rebuild_links();
+        Ok(())
+    }
+
+    /// テンプレートを置くフォルダ。Obsidianの設定（`.obsidian/templates.json` の folder）、
+    /// 無ければ `templates`。
+    pub fn template_folder(&self) -> String {
+        self.obsidian_setting("templates.json", "folder")
+            .unwrap_or_else(|| "templates".to_string())
+    }
+
+    /// テンプレートフォルダ内のノート（パス順）。
+    pub fn templates(&self) -> Vec<&str> {
+        let prefix = format!("{}/", self.template_folder());
+        self.notes
+            .keys()
+            .filter(|p| p.starts_with(&prefix))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// 名前（テンプレートフォルダからの相対パス、拡張子なしでも可）またはパスでテンプレートを探す。
+    pub fn find_template(&self, name: &str) -> Option<&str> {
+        let name = name.trim().trim_end_matches(".md");
+        let folder = self.template_folder();
+        self.templates().into_iter().find(|p| {
+            let stem = p.trim_end_matches(".md");
+            stem == name
+                || stem
+                    .strip_prefix(&folder)
+                    .map(|s| s.trim_start_matches('/'))
+                    == Some(name)
+                || file_name(stem) == name
+        })
+    }
+
+    /// テンプレートを展開した本文。`title` は作るノートの名前。
+    pub fn render_template(&self, template: &str, title: &str) -> Option<String> {
+        let text = &self.notes.get(template)?.text;
+        Some(template::render(text, title, &chrono::Local::now()))
+    }
+
     /// 指定日のデイリーノートのパス。Obsidianの設定
     /// （`.obsidian/daily-notes.json` の folder / format）があればそれに従う。
     pub fn daily_path(&self, date: chrono::NaiveDate) -> String {
-        let cfg = fs::read_to_string(self.root.join(".obsidian/daily-notes.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let get = |key: &str| {
-            cfg.as_ref()
-                .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        };
-        let format = get("format").unwrap_or("YYYY-MM-DD");
-        let name = format
-            .replace("YYYY", &date.format("%Y").to_string())
-            .replace("MM", &date.format("%m").to_string())
-            .replace("DD", &date.format("%d").to_string());
-        match get("folder").map(|f| f.trim_matches('/')) {
-            Some(folder) if !folder.is_empty() => format!("{folder}/{name}.md"),
-            _ => format!("{name}.md"),
+        let format = self
+            .obsidian_setting("daily-notes.json", "format")
+            .unwrap_or_else(|| "YYYY-MM-DD".to_string());
+        let name = template::format_moment(&date.and_time(chrono::NaiveTime::MIN), &format);
+        match self.obsidian_setting("daily-notes.json", "folder") {
+            Some(folder) => format!("{folder}/{name}.md"),
+            None => format!("{name}.md"),
         }
     }
 
-    /// 今日のデイリーノートを（無ければ作って）返す。
+    /// 今日のデイリーノートを（無ければ作って）返す。作るときは、Obsidianの設定で
+    /// 指定されたテンプレート（`.obsidian/daily-notes.json` の template）を展開する。
     pub fn daily(&mut self) -> Result<String> {
         let rel = self.daily_path(chrono::Local::now().date_naive());
         if !self.notes.contains_key(&rel) {
             if self.abs(&rel).exists() {
                 self.reload(&rel);
             } else {
-                self.write_note(&rel, "")?;
+                let title = strip_note_ext(file_name(&rel)).to_string();
+                let body = self
+                    .obsidian_setting("daily-notes.json", "template")
+                    .and_then(|t| self.find_template(&t).map(str::to_string))
+                    .and_then(|t| self.render_template(&t, &title))
+                    .unwrap_or_default();
+                self.write_note(&rel, &body)?;
             }
         }
         Ok(rel)
@@ -759,7 +1049,10 @@ mod tests {
     #[test]
     fn rename_updates_links() {
         let (d, mut v) = vault(&[
-            ("a.md", "[[old]] [[old#h|alias]] [m](notes/old.md) ![[pic.png]]"),
+            (
+                "a.md",
+                "[[old]] [[old#h|alias]] [m](notes/old.md) ![[pic.png]]",
+            ),
             ("notes/old.md", "[[a]] [rel](../a.md)"),
             ("pic.png", ""),
         ]);
@@ -770,11 +1063,89 @@ mod tests {
             a,
             "[[New Name]] [[New Name#h|alias]] [m](archive/New%20Name.md) ![[pic.png]]"
         );
-        assert_eq!(v.note("archive/New Name.md").unwrap().text, "[[a]] [rel](../a.md)");
+        assert_eq!(
+            v.note("archive/New Name.md").unwrap().text,
+            "[[a]] [rel](../a.md)"
+        );
         assert_eq!(v.backlinks("archive/New Name.md").len(), 1);
 
         v.rename("pic.png", "img/photo.png").unwrap();
         assert!(v.note("a.md").unwrap().text.ends_with("![[photo.png]]"));
+    }
+
+    #[test]
+    fn overwrites_are_kept_in_history() {
+        let (d, mut v) = vault(&[("a.md", "first")]);
+        v.write_note("a.md", "second").unwrap();
+        v.write_note("a.md", "second").unwrap();
+        let versions = history::list(d.path(), "a.md");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].read().unwrap(), "first");
+        // 履歴は索引に載らない
+        assert_eq!(v.note_count(), 1);
+        v.rename("a.md", "b").unwrap();
+        assert_eq!(history::list(d.path(), "b.md").len(), 1);
+        assert_eq!(v.disk_text("b.md").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn unlinked_mentions() {
+        let (_d, mut v) = vault(&[
+            ("Rust Notes.md", "---\naliases: [ラスト]\n---\nbody"),
+            (
+                "a.md",
+                "I like rust notes a lot.\nAlready [[Rust Notes]] linked.\n`Rust Notes` in code\nラストの話 and TrustNotes rust notesy",
+            ),
+            ("b.md", "```\nRust Notes\n```\n[Rust Notes](Rust%20Notes.md)"),
+            ("Go.md", "go go"),
+        ]);
+        let m = v.unlinked_mentions("Rust Notes.md");
+        let found: Vec<(&str, usize, &str)> = m
+            .iter()
+            .map(|m| (m.source.as_str(), m.line, m.text.as_str()))
+            .collect();
+        assert_eq!(found, [("a.md", 0, "rust notes"), ("a.md", 3, "ラスト")]);
+        assert_eq!(&m[0].context[m[0].column..][..10], "rust notes");
+        // 短い名前は対象外
+        assert!(v.unlinked_mentions("Go.md").is_empty());
+
+        let text = v.note("a.md").unwrap().text.clone();
+        let linked = v.link_mention_text(&text, &m[0], "Rust Notes.md").unwrap();
+        assert!(linked.starts_with("I like [[Rust Notes|rust notes]] a lot."));
+        let linked = v.link_mention_text(&linked, &m[1], "Rust Notes.md");
+        assert!(linked.is_none(), "範囲がずれたら書き換えない");
+        v.write_note(
+            "a.md",
+            &v.link_mention_text(&text, &m[1], "Rust Notes.md").unwrap(),
+        )
+        .unwrap();
+        assert!(v
+            .note("a.md")
+            .unwrap()
+            .text
+            .contains("[[Rust Notes|ラスト]]の話"));
+        assert_eq!(v.unlinked_mentions("Rust Notes.md").len(), 1);
+    }
+
+    #[test]
+    fn attachments() {
+        let (d, mut v) = vault(&[("notes/a.md", "")]);
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "p.png");
+        v.write_file("p.png", b"x").unwrap();
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "p 1.png");
+        assert_eq!(v.resolve_file("p.png", "notes/a.md"), Some("p.png"));
+        assert!(v.write_file("x.md", b"").is_err());
+        fs::create_dir_all(d.path().join(".obsidian")).unwrap();
+        let set = |value: &str| {
+            let json = format!(r#"{{"attachmentFolderPath":"{value}"}}"#);
+            fs::write(d.path().join(".obsidian/app.json"), json).unwrap();
+        };
+        set("./");
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "notes/p.png");
+        set("./img");
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "notes/img/p.png");
+        set("assets");
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "assets/p.png");
     }
 
     #[test]
@@ -810,5 +1181,23 @@ mod tests {
         assert_eq!(v.daily_path(date), "Daily/2026/01-05.md");
         let rel = v.daily().unwrap();
         assert!(v.note(&rel).is_some());
+
+        // テンプレートの指定があれば、新しく作るデイリーノートに展開する
+        fs::write(
+            d.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder":"Daily","format":"YYYY-MM-DD","template":"tpl/日記"}"#,
+        )
+        .unwrap();
+        fs::write(
+            d.path().join(".obsidian/templates.json"),
+            r#"{"folder":"tpl"}"#,
+        )
+        .unwrap();
+        v.write_note("tpl/日記.md", "# {{title}}\n- ").unwrap();
+        assert_eq!(v.templates(), ["tpl/日記.md"]);
+        assert_eq!(v.find_template("日記"), Some("tpl/日記.md"));
+        let rel = v.daily().unwrap();
+        let title = rel.trim_start_matches("Daily/").trim_end_matches(".md");
+        assert_eq!(v.note(&rel).unwrap().text, format!("# {title}\n- "));
     }
 }
