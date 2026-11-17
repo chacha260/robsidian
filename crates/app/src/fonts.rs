@@ -25,9 +25,40 @@ const CJK_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 ];
 
+/// 太字の日本語フォントの候補。
+const CJK_BOLD_FONTS: &[&str] = &[
+    "C:/Windows/Fonts/YuGothB.ttc",
+    "C:/Windows/Fonts/meiryob.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W7.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+];
+
+/// 太字の欧文フォントの候補（日本語の太字が無い環境でも、英字だけは太字にする）。
+const LATIN_BOLD_FONTS: &[&str] = &[
+    "C:/Windows/Fonts/segoeuib.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+];
+
+/// エディタの太字・見出しに使うフォントファミリー。太字のフォントが無ければ通常のフォントで描かれる。
+pub fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
+fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
+    paths.iter().find_map(|p| std::fs::read(p).ok())
+}
+
 /// egui同梱フォントにはCJKグリフが無いので、フォールバックとして日本語フォントを足す。
 /// 優先順は 設定で指定したファイル → 環境変数 `ROBSIDIAN_FONT` → システムフォントの候補。
-/// 使ったフォントのパスを返す（見つからなければ None）。
+/// あわせて太字のファミリー（[`bold`]）を用意する。使った日本語フォントのパスを返す。
 pub fn install(ctx: &egui::Context, configured: Option<&Path>) -> Option<PathBuf> {
     let env = std::env::var_os("ROBSIDIAN_FONT").map(PathBuf::from);
     let candidates = configured
@@ -35,17 +66,42 @@ pub fn install(ctx: &egui::Context, configured: Option<&Path>) -> Option<PathBuf
         .into_iter()
         .chain(env)
         .chain(CJK_FONTS.iter().map(PathBuf::from));
-    let (path, bytes) = candidates
+    let found = candidates
         .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
-        .next()?;
+        .next();
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
-    );
-    for family in fonts.families.values_mut() {
-        family.push("cjk".to_owned());
+    let regular = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    if let Some((_, bytes)) = &found {
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes.clone())),
+        );
+        for family in fonts.families.values_mut() {
+            family.push("cjk".to_owned());
+        }
     }
+    // 太字: 欧文の太字 → 日本語の太字 → 通常のフォント の順に字形を探す
+    let mut bold_fonts: Vec<String> = Vec::new();
+    for (name, paths) in [
+        ("latin-bold", LATIN_BOLD_FONTS),
+        ("cjk-bold", CJK_BOLD_FONTS),
+    ] {
+        if let Some(bytes) = first_readable(paths) {
+            fonts
+                .font_data
+                .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            bold_fonts.push(name.to_owned());
+        }
+    }
+    bold_fonts.extend(regular);
+    if found.is_some() {
+        bold_fonts.push("cjk".to_owned());
+    }
+    fonts.families.insert(bold(), bold_fonts);
     ctx.set_fonts(fonts);
-    Some(path)
+    found.map(|(p, _)| p)
 }

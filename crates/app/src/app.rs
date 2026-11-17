@@ -25,6 +25,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// 埋め込んだノートの、まだ測っていないときの高さと、描く高さの上限
+const EMBED_ESTIMATE: f32 = 120.0;
+const EMBED_MAX: f32 = 640.0;
 const RESCAN_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -458,6 +461,10 @@ pub struct App {
     md_cache: CommonMarkCache,
     /// ホバープレビュー用（本文のプレビューとはスクロールなどの状態を分ける）
     hover_cache: CommonMarkCache,
+    /// エディタ内に埋め込んだノートの描画用
+    embed_cache: CommonMarkCache,
+    /// 埋め込んだノートを描いた高さ（次の組版で場所を確保するために覚えておく）
+    embed_heights: HashMap<String, f32>,
     /// 未リンクの言及: (索引の世代, ノートのパス, 結果)
     mentions: Option<(u64, String, Vec<Mention>)>,
     graph: Graph,
@@ -511,6 +518,8 @@ impl App {
             file_dialog: egui_file_dialog::FileDialog::new().title("vaultフォルダを選択"),
             md_cache: CommonMarkCache::default(),
             hover_cache: CommonMarkCache::default(),
+            embed_cache: CommonMarkCache::default(),
+            embed_heights: HashMap::new(),
             mentions: None,
             graph: Graph::new(true),
             show_graph: false,
@@ -2370,6 +2379,8 @@ impl App {
             deferred_events,
             ime_composing,
             hover_cache,
+            embed_cache,
+            embed_heights,
             find: find_bar,
             vim: vim_state,
             ..
@@ -2618,6 +2629,20 @@ impl App {
             (ui.available_width() - 2.0 * side_margin(ui.available_width(), cfg) - 24.0).max(80.0);
         let pending = std::cell::Cell::new(false);
         let note_path = tab.path.clone();
+        let embed_key = |path: &str, heading: Option<&str>| {
+            format!("{path}#{}@{}", heading.unwrap_or(""), max_width as u32)
+        };
+        let note_embed = |target: &str| -> Option<f32> {
+            let (note, heading) = hover::split_target(target);
+            let path = vault.resolve(note, &note_path)?;
+            // 自分自身の埋め込みは無限に入れ子になるので描かない
+            (path != note_path).then(|| {
+                embed_heights
+                    .get(&embed_key(path, heading))
+                    .copied()
+                    .unwrap_or(EMBED_ESTIMATE)
+            })
+        };
         let load_image = |target: &str| -> Option<(egui::TextureId, egui::Vec2)> {
             let rel = vault
                 .resolve_file(target, &note_path)
@@ -2664,6 +2689,7 @@ impl App {
                     live,
                     cursor,
                     image: &image_size,
+                    note_embed: &note_embed,
                     marks,
                     current_mark,
                 };
@@ -2872,6 +2898,68 @@ impl App {
                         painter.vline(*x, a.top()..=b.bottom(), line);
                     }
                 }
+                editor::DecoKind::Callout {
+                    color,
+                    first,
+                    label,
+                } => {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(left - 8.0, a.top() - if *first { 3.0 } else { 0.0 }),
+                        egui::pos2(right + 8.0, b.bottom()),
+                    );
+                    behind.push(egui::Shape::rect_filled(
+                        rect,
+                        0.0,
+                        color.gamma_multiply(0.13),
+                    ));
+                    let bar =
+                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height()));
+                    behind.push(egui::Shape::rect_filled(bar, 0.0, *color));
+                    if let Some((text, at)) = label {
+                        painter.text(
+                            row(*at).left_center(),
+                            Align2::LEFT_CENTER,
+                            text,
+                            egui::FontId::new(size, fonts::bold()),
+                            *color,
+                        );
+                    }
+                }
+                editor::DecoKind::NoteEmbed(target) => {
+                    let (note, heading) = hover::split_target(target);
+                    let Some(path) = vault.resolve(note, &tab.path).map(str::to_string) else {
+                        continue;
+                    };
+                    let key = embed_key(&path, heading);
+                    let reserved = embed_heights.get(&key).copied().unwrap_or(EMBED_ESTIMATE);
+                    let top = a.top() + editor::line_height(size) + 4.0;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, top),
+                        egui::vec2((right - left).max(80.0), reserved),
+                    );
+                    behind.push(egui::Shape::rect_filled(rect, 4.0, colors.code_bg));
+                    let bar =
+                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height()));
+                    behind.push(egui::Shape::rect_filled(bar, 0.0, colors.accent));
+                    let inner = rect.shrink2(egui::vec2(14.0, 8.0));
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                inner.min,
+                                egui::vec2(inner.width(), f32::INFINITY),
+                            ))
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    child.set_clip_rect(rect.intersect(clip));
+                    hover::embed_ui(&mut child, vault, embed_cache, &path, heading);
+                    // 実際の高さを覚え、確保した場所と違えば組版をやり直す
+                    let used = (child.min_rect().height() + 16.0).min(EMBED_MAX);
+                    if (used - reserved).abs() > 1.0 {
+                        embed_heights.insert(key, used);
+                        tab.layout_stale = true;
+                        ctx.request_repaint();
+                    }
+                }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;
@@ -2961,6 +3049,21 @@ impl App {
         if let Some(c) = cursor_char {
             tab.cursor = editor::byte_of_char(&tab.text, c);
         }
+        // 埋め込みの中のリンクのクリックを横取りしてノートを開く
+        ctx.output_mut(|out| {
+            out.commands.retain(|cmd| {
+                if let egui::OutputCommand::OpenUrl(open) = cmd {
+                    if let Some(target) = preview::decode_link(&open.url) {
+                        actions.push(Action::FollowLink {
+                            target,
+                            from: tab.path.clone(),
+                        });
+                        return false;
+                    }
+                }
+                true
+            });
+        });
         // Ctrl+ホバーでリンク先を覗く
         if response.hovered() && ctx.input(|i| i.modifiers.command) {
             if let Some(pointer) = ctx.pointer_hover_pos() {
@@ -3167,6 +3270,7 @@ impl App {
                         ui.set_width((ui.available_width() - side).max(80.0));
                         let width = ui.available_width().max(100.0) as usize;
                         CommonMarkViewer::new()
+                            .alerts(preview::alerts())
                             .max_image_width(Some(width))
                             .show_mut(ui, md_cache, &mut rendered);
                     });

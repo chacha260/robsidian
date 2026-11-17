@@ -29,6 +29,11 @@ fn encode(s: &str) -> String {
     out
 }
 
+/// `rob:` リンクのリンク先部分を作る。
+pub fn encode_target(target: &str) -> String {
+    encode(target)
+}
+
 /// `rob:` リンクから元のリンク先文字列を取り出す。
 pub fn decode_link(url: &str) -> Option<String> {
     url.strip_prefix(SCHEME).map(parse::percent_decode)
@@ -45,7 +50,9 @@ pub fn file_uri(vault: &Vault, rel: &str) -> String {
 
 pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
     let today = chrono::Local::now().date_naive();
-    let expanded = expand_queries(text, vault, today);
+    let expanded = expand_embeds(text, from, vault);
+    let expanded = expand_queries(&expanded, vault, today);
+    let expanded = split_callout_titles(&expanded);
     let text = expanded.as_str();
     let parsed = parse::parse(text);
     let mut out = text.to_string();
@@ -243,5 +250,169 @@ mod tests {
         assert!(task_markers(&out).is_empty());
         let unclosed = "```rob-query\ntask:todo";
         assert!(expand_queries(unclosed, &v, today).contains("rob-query"));
+    }
+}
+
+/// 行が `![[ノート]]` だけなら、そのノートの抜粋を引用ブロックとして展開する（画像は対象外）。
+/// 抜粋の中のタスクは □ / ■ にする（プレビューのチェックボックスと元のノートの対応がずれないように）。
+/// 展開は1段だけ（抜粋の中の埋め込みはリンクになる）。
+pub fn expand_embeds(text: &str, from: &str, vault: &Vault) -> String {
+    if !text.contains("![[") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut fence = false;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = !fence;
+        }
+        let target = (!fence).then(|| crate::editor::embed_only(line)).flatten();
+        let resolved = target.as_deref().and_then(|t| {
+            let (note, heading) = crate::hover::split_target(t);
+            let path = vault.resolve(note, from)?;
+            (path != from).then(|| (path.to_string(), heading.map(str::to_string)))
+        });
+        let Some((path, heading)) = resolved else {
+            out.push_str(line);
+            continue;
+        };
+        let Some(note) = vault.note(&path) else {
+            out.push_str(line);
+            continue;
+        };
+        let excerpt = crate::hover::excerpt(&note.text, heading.as_deref());
+        let title = match &heading {
+            Some(h) => format!("{} › {h}", note.name),
+            None => note.name.clone(),
+        };
+        let stem = path.strip_suffix(".md").unwrap_or(&path);
+        out.push_str(&format!("> **[[{stem}|{title}]]**\n>\n"));
+        for l in excerpt.lines() {
+            let l = match robsidian_core::task::task_in_line(l) {
+                Some((at, status, _)) => {
+                    let mark = if matches!(status, 'x' | 'X' | '-') {
+                        "■"
+                    } else {
+                        "□"
+                    };
+                    format!("{}{mark}{}", &l[..at - 1], &l[at + status.len_utf8() + 1..])
+                }
+                None => l.to_string(),
+            };
+            out.push_str(&format!("> {l}\n"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `> [!note]+ タイトル` を `> [!NOTE]` と `> **タイトル**` の2行に分ける
+/// （プレビューの描画は、行が `[!種類]` だけのときにコールアウトとして扱うため）。
+pub fn split_callout_titles(text: &str) -> String {
+    if !text.contains("[!") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.split_inclusive('\n') {
+        let Some((kind, len)) = crate::editor::callout_kind(line) else {
+            out.push_str(line);
+            continue;
+        };
+        let lead_end = line.find('>').map_or(0, |i| i + 1);
+        let after = &line[lead_end..];
+        let marker_start = lead_end + (after.len() - after.trim_start().len());
+        let quote = &line[..marker_start];
+        let title = line[marker_start + len..].trim();
+        out.push_str(&format!("{}[!{}]\n", quote, kind.to_uppercase()));
+        if !title.is_empty() {
+            // タイトルの後に空の引用行を入れて、本文と別の段落にする
+            out.push_str(&format!("{quote}**{title}**\n{}\n", quote.trim_end()));
+        }
+    }
+    out
+}
+
+/// Obsidianのコールアウトの種類（プレビューの描画に渡す）。
+pub fn alerts() -> egui_commonmark::AlertBundle {
+    const KINDS: [&str; 30] = [
+        "note",
+        "abstract",
+        "summary",
+        "tldr",
+        "info",
+        "todo",
+        "tip",
+        "hint",
+        "important",
+        "success",
+        "check",
+        "done",
+        "question",
+        "help",
+        "faq",
+        "warning",
+        "caution",
+        "attention",
+        "failure",
+        "fail",
+        "missing",
+        "danger",
+        "error",
+        "bug",
+        "example",
+        "quote",
+        "cite",
+        "seealso",
+        "memo",
+        "idea",
+    ];
+    egui_commonmark::AlertBundle::from_alerts(
+        KINDS
+            .iter()
+            .map(|k| egui_commonmark::Alert {
+                accent_color: crate::editor::callout_color(k),
+                icon: '●',
+                identifier: k.to_uppercase(),
+                identifier_rendered: crate::editor::callout_label(k),
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod callout_tests {
+    use super::*;
+
+    #[test]
+    fn callout_titles_are_split() {
+        assert_eq!(
+            split_callout_titles("> [!tip]- 便利\n> 本文\n"),
+            "> [!TIP]\n> **便利**\n>\n> 本文\n"
+        );
+        assert_eq!(split_callout_titles("> [!note]\n> b"), "> [!NOTE]\n> b");
+        assert_eq!(split_callout_titles("plain [!x]"), "plain [!x]");
+    }
+
+    #[test]
+    fn embeds_expand_once_without_checkboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.md"),
+            "# A\n- [ ] 未\n- [x] 済\n## 節\n中身",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.md"),
+            "x\n![[a]]\n![[a#節]]\n```\n![[a]]\n```\n",
+        )
+        .unwrap();
+        let v = Vault::open(dir.path()).unwrap();
+        let out = expand_embeds(&v.note("b.md").unwrap().text, "b.md", &v);
+        assert!(out.contains("> **[[a|a]]**\n>\n> # A\n> - □ 未\n> - ■ 済\n"));
+        assert!(out.contains("> **[[a|a › 節]]**\n>\n> ## 節\n> 中身\n"));
+        // コードブロックの中は展開しない
+        assert!(out.contains("```\n![[a]]\n```"));
+        assert!(task_markers(&out).is_empty());
     }
 }

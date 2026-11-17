@@ -1,5 +1,6 @@
 //! エディタ用のMarkdownシンタックスハイライトと、カーソル位置まわりの補助関数。
 
+use crate::fonts;
 use crate::highlight;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{Align, Color32, FontFamily, FontId, Stroke, Vec2};
@@ -102,6 +103,14 @@ pub enum DecoKind {
     Code,
     /// 画像（範囲は行全体、中身はリンク先）
     Image(String),
+    /// 埋め込んだノート（範囲は行全体、中身は `ノート#見出し`）
+    NoteEmbed(String),
+    /// コールアウトの1行（範囲は行全体）。タイトルが無い最初の行には、種類名を描く位置（文字位置）が付く
+    Callout {
+        color: Color32,
+        first: bool,
+        label: Option<(String, usize)>,
+    },
     /// 表（範囲は表全体。先頭の行が見出し）
     Table(Vec<TableRow>),
 }
@@ -122,6 +131,8 @@ pub struct Options<'a> {
     pub cursor: Option<(usize, usize)>,
     /// 画像リンク先 → 表示サイズ。読み込めない・未読み込みなら None
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
+    /// 埋め込んだノート（`ノート#見出し`）を描く高さ。ノートでなければ None
+    pub note_embed: &'a dyn Fn(&str) -> Option<f32>,
     /// 検索で一致した範囲（バイト位置）と、そのうち選択中のものの番号
     pub marks: &'a [Range<usize>],
     pub current_mark: Option<usize>,
@@ -296,7 +307,10 @@ impl Painter<'_> {
                             .map(|close| {
                                 let mut f = self.fmt(base);
                                 match (ch, double) {
-                                    (b'*', true) => f.color = self.c.strong,
+                                    (b'*', true) => {
+                                        f.color = self.c.strong;
+                                        f.font_id.family = fonts::bold();
+                                    }
                                     (b'~', _) => {
                                         f.strikethrough = Stroke::new(1.0, self.c.dim);
                                         f.color = self.c.dim;
@@ -449,6 +463,62 @@ pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> Lay
     p.job
 }
 
+/// 行が `![[ノート]]`（別名は除く）だけで出来ていれば、`ノート#見出し` を返す。
+pub fn embed_only(line: &str) -> Option<String> {
+    let inner = line.trim().strip_prefix("![[")?.strip_suffix("]]")?;
+    if inner.contains("]]") || inner.contains("[[") {
+        return None;
+    }
+    let target = inner.split('|').next()?.trim();
+    (!target.is_empty()).then(|| target.to_string())
+}
+
+/// コールアウトの最初の行（`> [!種類]` 、折りたたみの `+` `-` 付きも）なら、
+/// (小文字の種類, 引用記号の後ろから数えた記法の長さ)。
+pub fn callout_kind(line: &str) -> Option<(String, usize)> {
+    let t = line.trim_start().strip_prefix('>')?.trim_start();
+    let rest = t.strip_prefix("[!")?;
+    let end = rest.find(']')?;
+    let kind = &rest[..end];
+    if kind.is_empty()
+        || !kind
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let mut len = 2 + end + 1;
+    if matches!(t.as_bytes().get(len), Some(b'+' | b'-')) {
+        len += 1;
+    }
+    Some((kind.to_lowercase(), len))
+}
+
+/// コールアウトの種類ごとの色（Obsidianの既定に近い色）。
+pub fn callout_color(kind: &str) -> Color32 {
+    match kind {
+        "abstract" | "summary" | "tldr" => Color32::from_rgb(0x00, 0xb0, 0xd0),
+        "tip" | "hint" | "important" => Color32::from_rgb(0x00, 0xbf, 0xa5),
+        "success" | "check" | "done" => Color32::from_rgb(0x08, 0xb9, 0x4e),
+        "question" | "help" | "faq" => Color32::from_rgb(0xe0, 0xac, 0x00),
+        "warning" | "caution" | "attention" => Color32::from_rgb(0xec, 0x75, 0x00),
+        "failure" | "fail" | "missing" | "danger" | "error" | "bug" => {
+            Color32::from_rgb(0xe9, 0x31, 0x47)
+        }
+        "example" => Color32::from_rgb(0x7c, 0x4d, 0xff),
+        "quote" | "cite" => Color32::from_rgb(0x9e, 0x9e, 0x9e),
+        _ => Color32::from_rgb(0x44, 0x8a, 0xff),
+    }
+}
+
+/// 表示用の種類名（先頭を大文字にする）。
+pub fn callout_label(kind: &str) -> String {
+    let mut c = kind.chars();
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
+}
+
 fn is_rule(trimmed: &str) -> bool {
     let mut chars = trimmed.chars().filter(|c| !c.is_whitespace());
     let Some(first) = chars.next() else {
@@ -473,6 +543,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
     // 処理中の表: (最後の行, 整形表示するか, 表の開始文字位置, 集めた行) と、その最初の行
     let mut table: Option<(usize, bool, usize, Vec<TableRow>)> = None;
     let mut first_line = 0;
+    // 処理中のコールアウト: (種類, 最初の行)
+    let mut callout: Option<(String, usize)> = None;
     // 処理中のコードブロックの色分け結果: (本文の最初の行, 行ごとの (色, バイト数))
     let mut code: Option<(usize, highlight::Lines)> = None;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -568,6 +640,7 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         if is_heading {
             let scale = [1.6, 1.4, 1.22, 1.1, 1.05, 1.0][level - 1];
             let mut format = p.fmt(p.c.heading);
+            format.font_id.family = fonts::bold();
             format.font_id.size = size * scale;
             format.line_height = Some(size * scale * LINE_HEIGHT);
             let marker_end = (line.len() - trimmed.len() + level + 1).min(line.len());
@@ -596,6 +669,16 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             format.valign = Align::TOP;
             let range = p.push(line, format);
             p.deco(DecoKind::Image(target), range);
+        } else if let Some((target, height)) = embed_only(line)
+            .filter(|_| opt.live)
+            .and_then(|t| (opt.note_embed)(&t).map(|h| (t, h)))
+        {
+            // 画像と同じく、記法の行の下に埋め込みの場所を確保する（高さは前回の描画で測った値）
+            let mut format = if hide { p.mark(true) } else { p.fmt(p.c.dim) };
+            format.line_height = Some(line_height(size) + height + 8.0);
+            format.valign = Align::TOP;
+            let range = p.push(line, format);
+            p.deco(DecoKind::NoteEmbed(target), range);
         } else if table.is_some() || trimmed.starts_with('|') {
             if table.is_none() {
                 // 表の開始: 2行目が区切り行なら、連続する `|` 行を1つの表として扱う
@@ -643,10 +726,47 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             }
         } else {
             let start = p.chars;
+            if !trimmed.starts_with('>') {
+                callout = None;
+            } else if callout.is_none() && opt.live {
+                callout = callout_kind(line).map(|(kind, _)| (kind, n));
+            }
             let (body, color, quote_bar) = p.block_prefix(line);
-            p.inline(&line[body..], color);
-            if quote_bar {
-                p.deco(DecoKind::Quote, start..p.chars);
+            match callout.clone() {
+                Some((kind, first)) => {
+                    let accent = callout_color(&kind);
+                    let mut label = None;
+                    if first == n {
+                        // `[!種類]` はカーソルが触れていなければ畳み、タイトルを太字で見せる
+                        let rest = &line[body..];
+                        let len = callout_kind(line).map_or(0, |(_, l)| l).min(rest.len());
+                        let marker = p.ahead(&rest[..len]);
+                        let hide_marker = p.hidden(marker.clone());
+                        p.push(&rest[..len], p.mark(hide_marker));
+                        let mut title = p.fmt(accent);
+                        title.font_id.family = fonts::bold();
+                        p.push(&rest[len..], title);
+                        if hide_marker && rest[len..].trim().is_empty() {
+                            label = Some((callout_label(&kind), marker.start));
+                        }
+                    } else {
+                        p.inline(&line[body..], p.c.text);
+                    }
+                    p.deco(
+                        DecoKind::Callout {
+                            color: accent,
+                            first: first == n,
+                            label,
+                        },
+                        start..p.chars,
+                    );
+                }
+                None => {
+                    p.inline(&line[body..], color);
+                    if quote_bar {
+                        p.deco(DecoKind::Quote, start..p.chars);
+                    }
+                }
             }
         }
         p.push(eol, p.fmt(p.c.text));
@@ -801,6 +921,7 @@ mod tests {
                 live,
                 cursor,
                 image: &image,
+                note_embed: &|_: &str| None,
             },
         )
     }
@@ -917,6 +1038,7 @@ mod tests {
                 live: false,
                 cursor: None,
                 image: &image,
+                note_embed: &|_: &str| None,
             },
         );
         assert_eq!(out.job.text, text);
@@ -943,9 +1065,60 @@ mod tests {
     }
 
     #[test]
+    fn callouts_and_note_embeds() {
+        let colors = Colors::new(true);
+        let text = "> [!tip]- Title\n> body\nafter\n> [!note]\n> b\n![[Other#h]]\nend";
+        let image = |_: &str| None;
+        let embed = |t: &str| (t == "Other#h").then_some(80.0);
+        let out = layout(
+            text,
+            &Options {
+                marks: &[],
+                current_mark: None,
+                size: 14.0,
+                colors: &colors,
+                live: true,
+                cursor: None,
+                image: &image,
+                note_embed: &embed,
+            },
+        );
+        let kinds: Vec<String> = out
+            .decos
+            .iter()
+            .map(|d| match &d.kind {
+                DecoKind::Callout { first, label, .. } => {
+                    format!(
+                        "callout:{first}:{}",
+                        label.as_ref().map_or("-", |l| l.0.as_str())
+                    )
+                }
+                DecoKind::NoteEmbed(t) => format!("embed:{t}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "callout:true:-",
+                "callout:false:-",
+                "callout:true:Note",
+                "callout:false:-",
+                "embed:Other#h"
+            ]
+        );
+        assert_eq!(callout_kind("> [!TIP]+ x"), Some(("tip".into(), 7)));
+        assert_eq!(callout_kind("> [!] x"), None);
+        assert_eq!(callout_kind("> [link](x)"), None);
+        assert_eq!(embed_only(" ![[a b|alias]] ").as_deref(), Some("a b"));
+        assert_eq!(embed_only("x ![[a]]"), None);
+        assert_eq!(callout_label("warning"), "Warning");
+    }
+
+    #[test]
     fn row_heights_do_not_depend_on_the_cursor() {
         // カーソルの出入りで行の高さが変わると表示が上下に動くので、どの要素でも一定に保つ
-        let text = "# H\n**b** [[l|a]]\n- [ ] t\n> q\n```rust\nfn f() {}\n```\n![[pic.png]]\n| a | b |\n|---|---|\n| 1 | 2 |\nend";
+        let text = "# H\n**b** [[l|a]]\n- [ ] t\n> q\n```rust\nfn f() {}\n```\n![[pic.png]]\n| a | b |\n|---|---|\n| 1 | 2 |\n> [!note]\n> c\nend";
         let heights = |cursor| -> Vec<Option<u32>> {
             let out = run(text, true, cursor);
             let mut rows = vec![None; text.lines().count()];
