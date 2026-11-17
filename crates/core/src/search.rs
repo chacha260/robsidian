@@ -112,6 +112,8 @@ struct Query {
     paths: Vec<String>,
     task: Option<TaskFilter>,
     due: Vec<DueFilter>,
+    /// `[キー:値]` / `[キー]`（frontmatterのプロパティ。値は部分一致、大文字小文字は区別しない）
+    props: Vec<(String, Option<String>)>,
     sort: Option<Sort>,
     limit: Option<usize>,
     /// 解釈できなかった条件（呼び出し側で知らせる）
@@ -125,6 +127,7 @@ impl Query {
             && self.paths.is_empty()
             && self.task.is_none()
             && self.due.is_empty()
+            && self.props.is_empty()
             && self.sort.is_none()
     }
 
@@ -183,7 +186,20 @@ fn parse_query(query: &str) -> Query {
         tokens.push(cur);
     }
     for t in tokens {
-        if let Some(tag) = t.strip_prefix("tag:") {
+        if let Some(inner) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            let (k, v) = match inner.split_once(':') {
+                Some((k, v)) => (
+                    k.trim(),
+                    Some(v.trim().to_lowercase()).filter(|v| !v.is_empty()),
+                ),
+                None => (inner.trim(), None),
+            };
+            if k.is_empty() {
+                q.errors.push(t.clone());
+            } else {
+                q.props.push((k.to_lowercase(), v));
+            }
+        } else if let Some(tag) = t.strip_prefix("tag:") {
             let tag = tag.trim_start_matches('#').to_lowercase();
             if !tag.is_empty() {
                 q.tags.push(tag);
@@ -277,6 +293,27 @@ pub fn run_query(vault: &Vault, query: &str, today: NaiveDate) -> QueryResult {
             let lower_path = note.path.to_lowercase();
             if !q.paths.iter().all(|p| lower_path.contains(p)) {
                 return false;
+            }
+            if !q.props.is_empty() {
+                let props = crate::props::read(&note.text).unwrap_or_default();
+                let ok = q.props.iter().all(|(key, want)| {
+                    props.iter().any(|p| {
+                        if p.key.to_lowercase() != *key {
+                            return false;
+                        }
+                        let Some(want) = want else { return true };
+                        match &p.value {
+                            crate::props::Value::Text(t) => t.to_lowercase().contains(want),
+                            crate::props::Value::List(items) => {
+                                items.iter().any(|i| i.to_lowercase().contains(want))
+                            }
+                            crate::props::Value::Raw(r) => r.to_lowercase().contains(want),
+                        }
+                    })
+                });
+                if !ok {
+                    return false;
+                }
             }
             // `tag:a` は子タグ `a/b` にも一致させる
             q.tags.iter().all(|want| {
@@ -498,11 +535,36 @@ mod tests {
             QueryResult::Tasks(_) => panic!("expected notes"),
         };
         assert_eq!(notes("sort:name"), ["work/a.md", "b.md"]);
+        assert!(notes("[status]").is_empty());
+        assert_eq!(query_errors("[]"), ["[]"]);
         assert_eq!(notes("sort:path limit:1"), ["b.md"]);
         // 検索欄でタスクの条件を使うと、タスクの行が一致行になる
         let hits = search(&v, "task:todo 予算", 10);
         assert_eq!(hits.len(), 2);
         assert!(hits[0].lines[0].text.contains("予算"));
+    }
+
+    #[test]
+    fn property_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.md"),
+            "---\nstatus: Draft\ntags: [x]\n---\nbody",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.md"), "---\nstatus: done\n---\nbody").unwrap();
+        fs::write(dir.path().join("c.md"), "no props").unwrap();
+        let v = Vault::open(dir.path()).unwrap();
+        let paths = |q: &str| {
+            search(&v, q, 10)
+                .into_iter()
+                .map(|h| h.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths("[status:draft]"), ["a.md"]);
+        assert_eq!(paths("[status]"), ["a.md", "b.md"]);
+        assert_eq!(paths("[tags:x] body"), ["a.md"]);
+        assert!(paths("[status:none]").is_empty());
     }
 
     #[test]

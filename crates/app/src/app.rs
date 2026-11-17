@@ -9,6 +9,7 @@ use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
 use crate::hover;
 use crate::preview;
+use crate::props_ui::PropsPanel;
 use crate::settings::SettingsView;
 use crate::vim::{self, Vim};
 use crate::workspace::{self, Workspace};
@@ -61,6 +62,9 @@ enum Command {
     FindPrev,
     Settings,
     ToggleVim,
+    ToggleSplit,
+    SwapPane,
+    AddProperty,
     ToggleTheme,
     Rescan,
 }
@@ -101,6 +105,9 @@ impl Command {
             Command::FindPrev => "find previous match",
             Command::Settings => "settings preferences options config",
             Command::ToggleVim => "vim modal keybindings normal mode",
+            Command::ToggleSplit => "split pane side by side",
+            Command::SwapPane => "switch pane focus other",
+            Command::AddProperty => "add property frontmatter metadata yaml",
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
@@ -190,6 +197,13 @@ const COMMANDS: &[CommandEntry] = &[
     ),
     (Command::Settings, "設定", Some((CTRL, Key::Comma))),
     (Command::ToggleVim, "Vimキーバインドの切り替え", None),
+    (
+        Command::ToggleSplit,
+        "ペインを左右に分割 / 分割を閉じる",
+        None,
+    ),
+    (Command::SwapPane, "もう一方のペインへ移る", None),
+    (Command::AddProperty, "プロパティを追加", None),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
@@ -474,7 +488,14 @@ pub struct App {
     toast: Option<(String, Instant)>,
     applied_style: Option<(bool, f32)>,
     /// 最後に設定ファイルへ書いたタブ構成（変化したら書き直す）
-    saved_session: (Vec<String>, usize),
+    saved_session: (Vec<String>, usize, Option<String>),
+    props_panel: PropsPanel,
+    /// 分割したもう一方のペインに表示しているノート
+    other: Option<String>,
+    /// フォーカスのあるペインが右側か（`active` が右のペインに出ている）
+    focus_right: bool,
+    /// このフレームでクリックされた、フォーカスの無いペイン
+    pane_clicked: bool,
 }
 
 impl App {
@@ -527,7 +548,11 @@ impl App {
             rescan_at: None,
             toast: None,
             applied_style: None,
-            saved_session: (Vec::new(), 0),
+            saved_session: (Vec::new(), 0, None),
+            props_panel: PropsPanel::default(),
+            other: None,
+            focus_right: false,
+            pane_clicked: false,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -543,6 +568,10 @@ impl App {
                     app.open_note(&path, None);
                 }
                 app.active = active.min(app.tabs.len().saturating_sub(1));
+                // 分割の状態を戻す
+                let split = app.cfg.split.clone();
+                app.other = split.filter(|p| app.tabs.iter().any(|t| t.path == *p));
+                app.focus_right = app.cfg.split_focus_right && app.other.is_some();
             }
         }
         app
@@ -553,10 +582,13 @@ impl App {
         let session = (
             self.tabs.iter().map(|t| t.path.clone()).collect(),
             self.active,
+            self.other.clone(),
         );
         if session != self.saved_session {
             self.cfg.open_tabs.clone_from(&session.0);
             self.cfg.active_tab = session.1;
+            self.cfg.split.clone_from(&session.2);
+            self.cfg.split_focus_right = self.focus_right;
             self.cfg.save();
             self.saved_session = session;
         }
@@ -738,6 +770,15 @@ impl App {
     }
 
     fn open_note(&mut self, path: &str, line: Option<usize>) {
+        if self.other.as_deref() == Some(path) {
+            // もう一方のペインに出ているノートなら、そのペインに移る
+            self.swap_panes();
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.jump = line.or(tab.jump);
+                tab.focus = true;
+            }
+            return;
+        }
         if self.vault.as_ref().is_some_and(|v| v.note(path).is_some()) {
             self.record_navigation(path);
             self.workspace.touch(path);
@@ -945,6 +986,11 @@ impl App {
                     .find(|p| vault.note(p).is_some() || vault.abs(p).is_dir())
                     .unwrap_or_else(|| new.to_string());
                 self.workspace.renamed(old, &new_path);
+                if let Some(other) = self.other.as_mut() {
+                    if let Some(moved) = workspace::moved_path(other, old, &new_path) {
+                        *other = moved;
+                    }
+                }
                 for (path, _) in self.nav_back.iter_mut().chain(self.nav_forward.iter_mut()) {
                     if let Some(moved) = workspace::moved_path(path, old, &new_path) {
                         *path = moved;
@@ -1101,6 +1147,19 @@ impl App {
             }
             Command::FindNext | Command::FindPrev => self.find_step(cmd == Command::FindNext),
             Command::Settings => self.settings = Some(SettingsView::new(&self.cfg)),
+            Command::ToggleSplit => self.toggle_split(),
+            Command::SwapPane => {
+                self.swap_panes();
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.focus = true;
+                }
+            }
+            Command::AddProperty => {
+                if current.is_some() {
+                    self.cfg.view_mode = ViewMode::Live;
+                    self.props_panel.start_adding();
+                }
+            }
             Command::ToggleVim => {
                 self.cfg.vim = !self.cfg.vim;
                 self.vim = Vim::default();
@@ -1747,7 +1806,106 @@ impl App {
         });
     }
 
+    /// フォーカスのあるペインと、もう一方のペインを入れ替える。
+    fn swap_panes(&mut self) {
+        let Some(other) = self.other.clone() else {
+            return;
+        };
+        let Some(idx) = self.tabs.iter().position(|t| t.path == other) else {
+            self.other = None;
+            return;
+        };
+        self.other = self.tabs.get(self.active).map(|t| t.path.clone());
+        self.active = idx;
+        self.focus_right = !self.focus_right;
+        self.completion = None;
+    }
+
+    /// ペインを分割する（分割中なら閉じる）。もう一方には、最近開いた別のノートを出す。
+    fn toggle_split(&mut self) {
+        if self.other.take().is_some() {
+            self.focus_right = false;
+            return;
+        }
+        let Some(current) = self.current().map(|t| t.path.clone()) else {
+            self.toast("ノートを開いてから分割してください");
+            return;
+        };
+        let candidate = self
+            .workspace
+            .recent
+            .iter()
+            .chain(self.tabs.iter().map(|t| &t.path))
+            .find(|p| **p != current && self.vault.as_ref().is_some_and(|v| v.note(p).is_some()))
+            .cloned();
+        let Some(path) = candidate else {
+            self.toast("分割して並べる、もう1つのノートを開いてください");
+            return;
+        };
+        if !self.tabs.iter().any(|t| t.path == path) {
+            if let Some(note) = self.vault.as_ref().and_then(|v| v.note(&path)) {
+                self.tabs.push(Tab::new(path.clone(), note.text.clone()));
+            }
+        }
+        self.other = Some(path);
+        self.focus_right = false;
+    }
+
+    /// 1つのペイン（見出しと本文）を描く。`show` が Some なら、フォーカスの無いペインとしてそのタブを描く。
+    fn pane_ui(&mut self, ui: &mut egui::Ui, show: Option<usize>, actions: &mut Vec<Action>) {
+        let idx = show.unwrap_or(self.active);
+        let Some(tab) = self.tabs.get(idx) else {
+            return;
+        };
+        let focused = show.is_none();
+        let title = tab.title().to_string();
+        ui.horizontal(|ui| {
+            let text = if focused {
+                RichText::new(&title).strong()
+            } else {
+                RichText::new(&title).weak()
+            };
+            if ui.add(egui::Button::new(text).frame(false)).clicked() && !focused {
+                self.pane_clicked = true;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("×").on_hover_text("分割を閉じる").clicked() {
+                    actions.push(Action::Run(Command::ToggleSplit));
+                }
+            });
+        });
+        if !focused {
+            // フォーカスの無いペインのエディタが、フォーカスを取らないようにする
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                tab.focus = false;
+            }
+        }
+        let saved = self.active;
+        self.active = idx;
+        self.view_ui(ui, actions);
+        self.active = saved;
+    }
+
+    /// 現在のタブ（`active`）を、表示モードに合わせて描く。
+    fn view_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        match self.cfg.view_mode {
+            ViewMode::Live => self.editor_ui(ui, actions, true),
+            ViewMode::Edit => self.editor_ui(ui, actions, false),
+            ViewMode::Preview => self.preview_ui(ui, actions),
+            ViewMode::Split => {
+                ui.columns(2, |cols| {
+                    self.editor_ui(&mut cols[0], actions, false);
+                    self.preview_ui(&mut cols[1], actions);
+                });
+            }
+        }
+    }
+
     fn close_tab(&mut self, idx: usize) {
+        if self.tabs.get(idx).map(|t| &t.path) == self.other.as_ref() {
+            self.other = None;
+            self.focus_right = false;
+        }
         if idx < self.tabs.len() {
             self.save_tab(idx);
             self.tabs.remove(idx);
@@ -2243,6 +2401,13 @@ impl App {
                 self.cfg.view_mode = mode.next();
             }
             if ui
+                .selectable_label(self.other.is_some(), "分割")
+                .on_hover_text("ペインを左右に分割（もう一度押すと閉じる）")
+                .clicked()
+            {
+                self.toggle_split();
+            }
+            if ui
                 .selectable_label(self.show_graph, "グラフ")
                 .on_hover_text("Ctrl+G")
                 .clicked()
@@ -2334,16 +2499,31 @@ impl App {
         if self.cfg.view_mode != ViewMode::Preview {
             self.find_bar(ui);
         }
-        match self.cfg.view_mode {
-            ViewMode::Live => self.editor_ui(ui, actions, true),
-            ViewMode::Edit => self.editor_ui(ui, actions, false),
-            ViewMode::Preview => self.preview_ui(ui, actions),
-            ViewMode::Split => {
-                ui.columns(2, |cols| {
-                    self.editor_ui(&mut cols[0], actions, false);
-                    self.preview_ui(&mut cols[1], actions);
-                });
-            }
+        let other = self
+            .other
+            .as_ref()
+            .and_then(|p| self.tabs.iter().position(|t| &t.path == p))
+            .filter(|&i| i != self.active);
+        let Some(other) = other else {
+            return self.view_ui(ui, actions);
+        };
+        // 左右に分けて、フォーカスのあるペインとフォーカスの無いペインを描く
+        self.pane_clicked = false;
+        let right_focused = self.focus_right;
+        ui.columns(2, |cols| {
+            let (left, right) = cols.split_at_mut(1);
+            let (focused_ui, other_ui) = if right_focused {
+                (&mut right[0], &mut left[0])
+            } else {
+                (&mut left[0], &mut right[0])
+            };
+            self.pane_ui(focused_ui, None, actions);
+            self.pane_ui(other_ui, Some(other), actions);
+        });
+        // フォーカスの無いペインのエディタをクリックしたら、そちらに移る
+        let other_path = self.tabs[other].path.clone();
+        if self.pane_clicked || ui.ctx().memory(|m| m.has_focus(editor_id(&other_path))) {
+            self.swap_panes();
         }
     }
 
@@ -2383,6 +2563,7 @@ impl App {
             embed_heights,
             find: find_bar,
             vim: vim_state,
+            props_panel,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -2573,6 +2754,27 @@ impl App {
         if std::mem::take(&mut tab.focus) {
             ctx.memory_mut(|m| m.request_focus(id));
         }
+        // ライブ表示ではfrontmatterを畳むので、カーソルが入り込まないよう本文の先頭へ寄せる
+        let fm_end = if live {
+            robsidian_core::props::block(&tab.text).map(|r| r.end)
+        } else {
+            None
+        };
+        if let (Some(end), true) = (fm_end, ctx.memory(|m| m.has_focus(id))) {
+            let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+            let end_char = editor::char_of_byte(&tab.text, end);
+            if state
+                .cursor
+                .char_range()
+                .is_none_or(|r| r.primary.index.0 < end_char)
+            {
+                state
+                    .cursor
+                    .set_char_range(Some(CCursorRange::one(CCursor::new(end_char))));
+                state.store(&ctx, id);
+                tab.cursor = end;
+            }
+        }
         if let Some(byte) = tab.place_cursor.take() {
             let ccursor = CCursor::new(editor::char_of_byte(&tab.text, byte));
             let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
@@ -2690,6 +2892,7 @@ impl App {
                     cursor,
                     image: &image_size,
                     note_embed: &note_embed,
+                    hide_frontmatter: live,
                     marks,
                     current_mark,
                 };
@@ -2702,6 +2905,7 @@ impl App {
 
         let side = side_margin(ui.available_width(), cfg);
         let block_cursor = vim_on && vim_state.mode != vim::Mode::Insert;
+        let mut props_changed: Option<String> = None;
         let (output, background, painter) = ScrollArea::vertical()
             .id_salt(("editor-scroll", id))
             .auto_shrink(false)
@@ -2719,6 +2923,13 @@ impl App {
                             ui.vertical(|ui| {
                                 ui.set_width((ui.available_width() - side).max(80.0));
                                 // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
+                                if live {
+                                    if let Some(new) =
+                                        props_panel.show(ui, &note_path, text, &colors)
+                                    {
+                                        props_changed = Some(new);
+                                    }
+                                }
                                 let background = ui.painter().add(egui::Shape::Noop);
                                 if block_cursor {
                                     // ノーマルモードは下でブロック型のカーソルを描く
@@ -2755,6 +2966,16 @@ impl App {
                 (output, background, ui.painter().clone())
             })
             .inner;
+        if let Some(new) = props_changed {
+            // プロパティ欄での変更。本文側のカーソルは、frontmatterの長さの変化だけずらす
+            let delta = new.len() as isize - tab.text.len() as isize;
+            let cursor = (tab.cursor as isize + delta).clamp(0, new.len() as isize) as usize;
+            let cursor = (0..=cursor)
+                .rev()
+                .find(|&c| new.is_char_boundary(c))
+                .unwrap_or(0);
+            replace_text_undoable(&ctx, tab, new, cursor..cursor);
+        }
         tab.layout_stale = pending.get();
         if tab.layout_stale {
             ctx.request_repaint_after(Duration::from_millis(50));
