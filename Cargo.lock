@@ -2579,6 +2579,7 @@ dependencies = [
  "egui_extras",
  "image",
  "notify",
+ "regex",
  "robsidian-core",
  "serde",
  "serde_json",

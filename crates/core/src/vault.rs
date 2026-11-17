@@ -103,6 +103,8 @@ pub struct Vault {
     file_names: HashMap<String, Vec<String>>,
     backlinks: HashMap<String, Vec<Backlink>>,
     unresolved: BTreeMap<String, Vec<String>>,
+    /// 上書き前の内容をローカル履歴に残す量
+    pub history_limits: history::Limits,
 }
 
 pub fn is_note_path(path: &str) -> bool {
@@ -710,7 +712,7 @@ impl Vault {
         }
         if let Some(old) = self.disk_text(rel).filter(|old| old != text) {
             // 履歴が残せなくても保存自体は止めない
-            let _ = history::snapshot(&self.root, rel, &old);
+            let _ = history::snapshot_with(&self.root, rel, &old, self.history_limits);
         }
         atomic_write(&abs, text.as_bytes()).with_context(|| format!("failed to save {rel}"))?;
         self.register_dirs(rel);

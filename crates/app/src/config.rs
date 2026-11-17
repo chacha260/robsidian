@@ -24,6 +24,8 @@ impl ViewMode {
         }
     }
 
+    pub const ALL: [ViewMode; 4] = [Self::Live, Self::Edit, Self::Split, Self::Preview];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "ライブ",
@@ -46,6 +48,20 @@ pub struct Config {
     pub show_left: bool,
     pub show_right: bool,
     pub font_size: f32,
+    /// 日本語フォントのファイル（空なら自動で探す）
+    pub font_path: String,
+    /// 本文を読みやすい幅に収め、中央に置く
+    pub readable_width: bool,
+    pub max_width: f32,
+    /// Enterでのリスト継続とTabでの字下げ
+    pub smart_lists: bool,
+    /// 括弧・記号の自動補完と、選択範囲を囲む入力
+    pub auto_pair: bool,
+    /// 入力が止まってから自動保存するまでの秒数
+    pub autosave_secs: f32,
+    /// ローカル履歴に残す件数（0で残さない）と日数
+    pub history_versions: usize,
+    pub history_days: u64,
 }
 
 impl Default for Config {
@@ -60,6 +76,14 @@ impl Default for Config {
             show_left: true,
             show_right: true,
             font_size: 15.0,
+            font_path: String::new(),
+            readable_width: true,
+            max_width: 760.0,
+            smart_lists: true,
+            auto_pair: true,
+            autosave_secs: 1.2,
+            history_versions: 50,
+            history_days: 30,
         }
     }
 }
@@ -69,6 +93,13 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl Config {
+    pub fn history_limits(&self) -> robsidian_core::history::Limits {
+        robsidian_core::history::Limits {
+            versions: self.history_versions,
+            days: self.history_days.max(1),
+        }
+    }
+
     pub fn load() -> Self {
         config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())

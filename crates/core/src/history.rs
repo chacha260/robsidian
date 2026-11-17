@@ -15,6 +15,22 @@ pub const KEEP_VERSIONS: usize = 50;
 pub const KEEP_DAYS: u64 = 30;
 const ALWAYS_KEEP: usize = 5;
 
+/// 履歴を残す量。`versions` が0なら履歴を残さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub versions: usize,
+    pub days: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            versions: KEEP_VERSIONS,
+            days: KEEP_DAYS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub file: PathBuf,
@@ -72,7 +88,12 @@ pub fn list(root: &Path, rel: &str) -> Vec<Version> {
 
 /// `text` を1つの版として残す。直近の版と同じ内容、または空なら何もしない。
 pub fn snapshot(root: &Path, rel: &str, text: &str) -> Result<()> {
-    if text.is_empty() {
+    snapshot_with(root, rel, text, Limits::default())
+}
+
+/// 残す量を指定して [`snapshot`] する。
+pub fn snapshot_with(root: &Path, rel: &str, text: &str, limits: Limits) -> Result<()> {
+    if text.is_empty() || limits.versions == 0 {
         return Ok(());
     }
     let versions = list(root, rel);
@@ -87,14 +108,14 @@ pub fn snapshot(root: &Path, rel: &str, text: &str) -> Result<()> {
         millis += 1;
     }
     fs::write(dir.join(format!("{millis}.md")), text)?;
-    prune(&list(root, rel), now_millis());
+    prune(&list(root, rel), now_millis(), limits);
     Ok(())
 }
 
-fn prune(versions: &[Version], now: u64) {
-    let max_age = Duration::from_secs(KEEP_DAYS * 24 * 3600).as_millis() as u64;
+fn prune(versions: &[Version], now: u64, limits: Limits) {
+    let max_age = Duration::from_secs(limits.days * 24 * 3600).as_millis() as u64;
     for (i, v) in versions.iter().enumerate() {
-        let too_many = i >= KEEP_VERSIONS;
+        let too_many = i >= limits.versions;
         let too_old = i >= ALWAYS_KEEP && now.saturating_sub(v.millis) > max_age;
         if too_many || too_old {
             let _ = fs::remove_file(&v.file);
@@ -135,10 +156,22 @@ mod tests {
             snapshot(root, "a/b.md", &format!("n{i}")).unwrap();
         }
         assert_eq!(list(root, "a/b.md").len(), KEEP_VERSIONS);
+        let small = Limits {
+            versions: 3,
+            days: 30,
+        };
+        snapshot_with(root, "a/b.md", "x", small).unwrap();
+        assert_eq!(list(root, "a/b.md").len(), 3);
+        let off = Limits {
+            versions: 0,
+            days: 30,
+        };
+        snapshot_with(root, "a/b.md", "y", off).unwrap();
+        assert_eq!(list(root, "a/b.md")[0].read().unwrap(), "x");
 
         rename(root, "a", "c");
         assert!(list(root, "a/b.md").is_empty());
-        assert_eq!(list(root, "c/b.md").len(), KEEP_VERSIONS);
+        assert_eq!(list(root, "c/b.md").len(), 3);
     }
 
     #[test]
@@ -155,7 +188,7 @@ mod tests {
                 }
             })
             .collect();
-        prune(&versions, 100 * day);
+        prune(&versions, 100 * day, Limits::default());
         // 最新の5件は残し、6件目以降は30日を過ぎたものだけ消える
         let left: Vec<bool> = versions.iter().map(|v| v.file.exists()).collect();
         assert_eq!(left, [true, true, true, true, true, false, false, false]);

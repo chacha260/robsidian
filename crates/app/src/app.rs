@@ -3,10 +3,13 @@
 use crate::config::{Config, ViewMode};
 use crate::edit;
 use crate::editor::{self, Colors};
+use crate::find;
+use crate::fonts;
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
 use crate::hover;
 use crate::preview;
+use crate::settings::SettingsView;
 use crate::workspace::{self, Workspace};
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
@@ -21,7 +24,6 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const AUTOSAVE_DELAY: Duration = Duration::from_millis(1200);
 const RESCAN_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,6 +51,11 @@ enum Command {
     InsertTemplate,
     NewFromTemplate,
     OpenVault,
+    Find,
+    Replace,
+    FindNext,
+    FindPrev,
+    Settings,
     ToggleTheme,
     Rescan,
 }
@@ -83,6 +90,11 @@ impl Command {
             Command::ToggleBookmark => "bookmark star favorite pin",
             Command::InsertTemplate => "insert template",
             Command::NewFromTemplate => "new note from template create",
+            Command::Find => "find in note search",
+            Command::Replace => "replace in note find",
+            Command::FindNext => "find next match",
+            Command::FindPrev => "find previous match",
+            Command::Settings => "settings preferences options config",
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
@@ -158,6 +170,19 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::ToggleBookmark, "ブックマークに追加 / 解除", None),
     (Command::InsertTemplate, "テンプレートを挿入", None),
     (Command::NewFromTemplate, "テンプレートから新規ノート", None),
+    (
+        Command::FindPrev,
+        "前の一致へ",
+        Some((Modifiers::SHIFT, Key::F3)),
+    ),
+    (Command::Find, "ノート内を検索", Some((CTRL, Key::F))),
+    (Command::Replace, "ノート内で置換", Some((CTRL, Key::H))),
+    (
+        Command::FindNext,
+        "次の一致へ",
+        Some((Modifiers::NONE, Key::F3)),
+    ),
+    (Command::Settings, "設定", Some((CTRL, Key::Comma))),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
@@ -204,7 +229,7 @@ enum Dialog {
 }
 
 /// 組版結果を使い回せる条件: (文字サイズ, ダーク, Live Preview, カーソルの文字範囲, 画像の最大幅)
-type LayoutKey = (f32, bool, bool, Option<(usize, usize)>, u32);
+type LayoutKey = (f32, bool, bool, Option<(usize, usize)>, u32, u64);
 
 struct Tab {
     path: String,
@@ -222,6 +247,8 @@ struct Tab {
     focus: bool,
     /// 次の描画でカーソルをこのバイト位置に置く
     place_cursor: Option<usize>,
+    /// 次の描画でこの範囲（バイト位置）を選択し、見える位置までスクロールする（フォーカスは移さない）
+    select: Option<std::ops::Range<usize>>,
     /// 最後に確認したカーソル位置（バイト）
     cursor: usize,
     layout: editor::Layout,
@@ -245,6 +272,7 @@ impl Tab {
             jump: None,
             focus: false,
             place_cursor: None,
+            select: None,
             cursor: 0,
             layout: editor::Layout::default(),
             layout_key: None,
@@ -296,6 +324,22 @@ struct Palette {
     computed_for: Option<String>,
     items: Vec<PaletteItem>,
     selected: usize,
+}
+
+/// ノート内の検索バー。
+struct FindBar {
+    query: find::Query,
+    replace: String,
+    show_replace: bool,
+    /// 次の描画で検索欄にフォーカスする
+    focus: bool,
+    /// 次の描画で置換欄にフォーカスする
+    focus_replace: bool,
+    /// (ノートのパス, 本文の版, 検索条件) が変わったら一致を数え直す
+    key: Option<(String, u64, find::Query)>,
+    matches: Vec<std::ops::Range<usize>>,
+    current: Option<usize>,
+    error: Option<String>,
 }
 
 struct Completion {
@@ -380,6 +424,10 @@ pub struct App {
     completion_dismissed: Option<usize>,
     dialog: Option<Dialog>,
     history: Option<HistoryView>,
+    find: Option<FindBar>,
+    settings: Option<SettingsView>,
+    /// 読み込んだ日本語フォントのパス
+    font_in_use: Option<String>,
     /// 順序を保つために次のフレームへ回した入力イベント
     deferred_events: Vec<egui::Event>,
     /// IMEで変換中か（変換中のEnterやTabは編集補助の対象にしない）
@@ -409,6 +457,10 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, vault_arg: Option<PathBuf>) -> Self {
         let cfg = Config::load();
+        let font = fonts::install(
+            &cc.egui_ctx,
+            (!cfg.font_path.is_empty()).then(|| std::path::Path::new(&cfg.font_path)),
+        );
         let mut app = Self {
             cfg,
             vault: None,
@@ -426,6 +478,9 @@ impl App {
             completion_dismissed: None,
             dialog: None,
             history: None,
+            find: None,
+            settings: None,
+            font_in_use: font.map(|p| p.display().to_string()),
             deferred_events: Vec::new(),
             ime_composing: false,
             workspace: Workspace::default(),
@@ -497,6 +552,8 @@ impl App {
                 self.watcher = None;
                 self.start_watcher(&vault, ctx);
                 self.workspace = Workspace::load(vault.root());
+                let mut vault = vault;
+                vault.history_limits = self.cfg.history_limits();
                 self.nav_back.clear();
                 self.nav_forward.clear();
                 self.vault = Some(vault);
@@ -600,7 +657,12 @@ impl App {
         }
         if tab.conflict.is_some() {
             // 解決前にタブを閉じたり終了したりしても編集が消えないよう、履歴に退避しておく
-            let _ = robsidian_core::history::snapshot(vault.root(), &tab.path, &tab.text);
+            let _ = robsidian_core::history::snapshot_with(
+                vault.root(),
+                &tab.path,
+                &tab.text,
+                vault.history_limits,
+            );
             return;
         }
         // 索引の更新（ファイル監視）を待たず、実ファイルで外部の変更を確かめる
@@ -635,10 +697,11 @@ impl App {
     fn autosave(&mut self, ctx: &egui::Context) {
         for i in 0..self.tabs.len() {
             if let Some(at) = self.tabs[i].edited_at {
-                if at.elapsed() >= AUTOSAVE_DELAY {
+                let delay = Duration::from_secs_f32(self.cfg.autosave_secs.clamp(0.3, 60.0));
+                if at.elapsed() >= delay {
                     self.save_tab(i);
                 } else {
-                    ctx.request_repaint_after(AUTOSAVE_DELAY);
+                    ctx.request_repaint_after(delay);
                 }
             }
         }
@@ -971,6 +1034,43 @@ impl App {
                     self.open_history(&path);
                 }
             }
+            Command::Find | Command::Replace => {
+                if self.cfg.view_mode == ViewMode::Preview {
+                    self.cfg.view_mode = ViewMode::Live;
+                }
+                // 1行だけ選択していれば、それを検索語にする
+                let selected = self.current().and_then(|tab| {
+                    let state = TextEdit::load_state(ctx, editor_id(&tab.path))?;
+                    let r = state.cursor.char_range()?.as_sorted_char_range();
+                    let (a, b) = (
+                        editor::byte_of_char(&tab.text, r.start.0),
+                        editor::byte_of_char(&tab.text, r.end.0),
+                    );
+                    let t = &tab.text[a..b];
+                    (!t.is_empty() && !t.contains('\n')).then(|| t.to_string())
+                });
+                let bar = self.find.get_or_insert_with(|| FindBar {
+                    query: find::Query::default(),
+                    replace: String::new(),
+                    show_replace: false,
+                    focus: true,
+                    focus_replace: false,
+                    key: None,
+                    matches: Vec::new(),
+                    current: None,
+                    error: None,
+                });
+                if let Some(t) = selected {
+                    bar.query.text = t;
+                }
+                // 置換で開いたときは、検索語が入っていれば置換欄から打てるようにする
+                let to_replace = cmd == Command::Replace && !bar.query.text.is_empty();
+                bar.focus = !to_replace;
+                bar.focus_replace = to_replace;
+                bar.show_replace |= cmd == Command::Replace;
+            }
+            Command::FindNext | Command::FindPrev => self.find_step(cmd == Command::FindNext),
+            Command::Settings => self.settings = Some(SettingsView::new(&self.cfg)),
             Command::GoBack => self.navigate(true),
             Command::GoForward => self.navigate(false),
             Command::ToggleBookmark => {
@@ -1094,7 +1194,12 @@ impl App {
         let tab = &mut self.tabs[idx];
         match choice {
             0 => {
-                let _ = robsidian_core::history::snapshot(vault.root(), &tab.path, &tab.text);
+                let _ = robsidian_core::history::snapshot_with(
+                    vault.root(),
+                    &tab.path,
+                    &tab.text,
+                    vault.history_limits,
+                );
                 tab.set_text(disk.clone());
                 tab.base = disk;
                 tab.dirty = false;
@@ -1126,7 +1231,12 @@ impl App {
             _ => {
                 // 外部の内容を履歴に入れておくと、履歴ダイアログで自分の編集と比べられる
                 let path = tab.path.clone();
-                let _ = robsidian_core::history::snapshot(vault.root(), &path, &disk);
+                let _ = robsidian_core::history::snapshot_with(
+                    vault.root(),
+                    &path,
+                    &disk,
+                    vault.history_limits,
+                );
                 self.open_history(&path);
             }
         }
@@ -1220,6 +1330,280 @@ impl App {
         });
     }
 
+    /// 検索の一致を、必要なら数え直す。
+    fn refresh_find(&mut self) {
+        let (Some(bar), Some(tab)) = (self.find.as_mut(), self.tabs.get(self.active)) else {
+            return;
+        };
+        let key = (tab.path.clone(), tab.version, bar.query.clone());
+        if bar.key.as_ref() == Some(&key) {
+            return;
+        }
+        let query_changed = bar
+            .key
+            .as_ref()
+            .is_none_or(|k| k.0 != key.0 || k.2 != key.2);
+        match bar.query.find_all(&tab.text) {
+            Ok(m) => {
+                bar.matches = m;
+                bar.error = None;
+            }
+            Err(e) => {
+                bar.matches.clear();
+                bar.error = Some(e);
+            }
+        }
+        bar.current = if query_changed {
+            find::next_from(
+                &bar.matches,
+                tab.cursor.saturating_sub(bar.query.text.len()),
+            )
+        } else {
+            bar.current
+                .filter(|&i| i < bar.matches.len())
+                .or(find::next_from(&bar.matches, tab.cursor))
+        };
+        bar.key = Some(key);
+    }
+
+    /// 次（または前）の一致を選ぶ。
+    fn find_step(&mut self, forward: bool) {
+        self.refresh_find();
+        let Some(bar) = self.find.as_mut() else {
+            return;
+        };
+        let n = bar.matches.len();
+        if n == 0 {
+            return;
+        }
+        let i = match bar.current {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None => 0,
+        };
+        bar.current = Some(i);
+        let range = bar.matches[i].clone();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.select = Some(range);
+        }
+    }
+
+    fn replace_current(&mut self, ctx: &egui::Context) {
+        self.refresh_find();
+        let (Some(bar), Some(tab)) = (self.find.as_mut(), self.tabs.get_mut(self.active)) else {
+            return;
+        };
+        let Some(range) = bar.current.and_then(|i| bar.matches.get(i).cloned()) else {
+            return;
+        };
+        let with = bar
+            .query
+            .replacement_for(&tab.text, range.clone(), &bar.replace);
+        let mut text = tab.text.clone();
+        text.replace_range(range.clone(), &with);
+        let end = range.start + with.len();
+        replace_text_undoable(ctx, tab, text, range.start..end);
+        // 置き換えた直後から次の一致を探す
+        bar.key = None;
+        tab.cursor = end;
+        let after = end;
+        self.refresh_find();
+        if let Some(bar) = self.find.as_mut() {
+            bar.current = find::next_from(&bar.matches, after);
+            if let (Some(i), Some(tab)) = (bar.current, self.tabs.get_mut(self.active)) {
+                tab.select = Some(bar.matches[i].clone());
+            }
+        }
+    }
+
+    fn replace_all(&mut self, ctx: &egui::Context) {
+        let (Some(bar), Some(tab)) = (self.find.as_mut(), self.tabs.get_mut(self.active)) else {
+            return;
+        };
+        match bar.query.replace_all(&tab.text, &bar.replace) {
+            Ok((_, 0)) => {}
+            Ok((text, n)) => {
+                let cursor = tab.cursor.min(text.len());
+                let cursor = (0..=cursor)
+                    .rev()
+                    .find(|&c| text.is_char_boundary(c))
+                    .unwrap_or(0);
+                replace_text_undoable(ctx, tab, text, cursor..cursor);
+                bar.key = None;
+                self.toast(format!("{n}件置き換えました（Ctrl+Zで戻せます）"));
+            }
+            Err(e) => bar.error = Some(e),
+        }
+    }
+
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        if self.find.is_none() {
+            return;
+        }
+        self.refresh_find();
+        let ctx = ui.ctx().clone();
+        let Some(bar) = self.find.as_mut() else {
+            return;
+        };
+        let mut step = None;
+        let (mut close, mut replace_one, mut replace_all) = (false, false, false);
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let query = ui.add(
+                        TextEdit::singleline(&mut bar.query.text)
+                            .id(egui::Id::unique("find-query"))
+                            .hint_text("ノート内を検索")
+                            .desired_width(240.0),
+                    );
+                    if std::mem::take(&mut bar.focus) {
+                        query.request_focus();
+                        // 入力済みの語は全選択して、そのまま打ち直せるようにする
+                        if let Some(mut state) = TextEdit::load_state(&ctx, query.id) {
+                            state
+                                .cursor
+                                .set_char_range(Some(CCursorRange::select_all_str(
+                                    &bar.query.text,
+                                )));
+                            state.store(&ctx, query.id);
+                        }
+                    }
+                    // Enterで次、Shift+Enterで前。検索欄からフォーカスは外さない
+                    if query.lost_focus() {
+                        let (enter, shift, esc) = ui.input(|i| {
+                            (
+                                i.key_pressed(Key::Enter),
+                                i.modifiers.shift,
+                                i.key_pressed(Key::Escape),
+                            )
+                        });
+                        if enter {
+                            step = Some(!shift);
+                            query.request_focus();
+                        }
+                        if esc {
+                            close = true;
+                        }
+                    }
+                    ui.toggle_value(&mut bar.query.case, "Aa")
+                        .on_hover_text("大文字と小文字を区別");
+                    ui.toggle_value(&mut bar.query.regex, ".*")
+                        .on_hover_text("正規表現（置換で $1 などが使える）");
+                    match (&bar.error, bar.matches.len(), bar.current) {
+                        (Some(_), _, _) => {
+                            ui.colored_label(ui.visuals().error_fg_color, "正規表現の誤り")
+                                .on_hover_text(bar.error.clone().unwrap_or_default());
+                        }
+                        (None, 0, _) if !bar.query.text.is_empty() => {
+                            ui.weak("見つかりません");
+                        }
+                        (None, 0, _) => {}
+                        (None, n, Some(i)) => {
+                            ui.weak(format!("{}/{n}", i + 1));
+                        }
+                        (None, n, None) => {
+                            ui.weak(format!("{n}件"));
+                        }
+                    }
+                    if ui
+                        .small_button("↑")
+                        .on_hover_text("前 (Shift+Enter / Shift+F3)")
+                        .clicked()
+                    {
+                        step = Some(false);
+                    }
+                    if ui
+                        .small_button("↓")
+                        .on_hover_text("次 (Enter / F3)")
+                        .clicked()
+                    {
+                        step = Some(true);
+                    }
+                    ui.toggle_value(&mut bar.show_replace, "置換")
+                        .on_hover_text("Ctrl+H");
+                    if ui.small_button("×").on_hover_text("閉じる (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+                if bar.show_replace {
+                    ui.horizontal(|ui| {
+                        let field = ui.add(
+                            TextEdit::singleline(&mut bar.replace)
+                                .hint_text("置換後の文字列")
+                                .desired_width(240.0),
+                        );
+                        if std::mem::take(&mut bar.focus_replace) {
+                            field.request_focus();
+                        }
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            replace_one = true;
+                            field.request_focus();
+                        }
+                        replace_one |= ui.button("置換").clicked();
+                        replace_all |= ui.button("すべて置換").clicked();
+                    });
+                }
+            });
+        ui.separator();
+        // ボタンを押した後など、どこにもフォーカスが無いときのEscでも閉じる
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && ctx.memory(|m| m.focused().is_none()) {
+            close = true;
+        }
+        if close {
+            self.find = None;
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.focus = true;
+            }
+            return;
+        }
+        if replace_one {
+            self.replace_current(&ctx);
+        }
+        if replace_all {
+            self.replace_all(&ctx);
+        }
+        if let Some(forward) = step {
+            self.find_step(forward);
+        }
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.settings.as_mut() else {
+            return;
+        };
+        let note = self.tabs.get(self.active).map(|t| t.path.as_str());
+        let before = self.cfg.history_limits();
+        let out = view.show(
+            ctx,
+            &mut self.cfg,
+            self.vault.as_ref(),
+            note,
+            self.font_in_use.as_deref(),
+        );
+        if out.font {
+            let path =
+                (!self.cfg.font_path.is_empty()).then(|| std::path::Path::new(&self.cfg.font_path));
+            self.font_in_use = fonts::install(ctx, path).map(|p| p.display().to_string());
+            if !self.cfg.font_path.is_empty()
+                && self.font_in_use.as_deref() != Some(self.cfg.font_path.as_str())
+            {
+                self.toast(
+                    "指定したフォントを読み込めませんでした（自動で探したフォントを使います）",
+                );
+            }
+        }
+        if self.cfg.history_limits() != before {
+            if let Some(vault) = self.vault.as_mut() {
+                vault.history_limits = self.cfg.history_limits();
+            }
+        }
+        if out.close {
+            self.settings = None;
+            self.cfg.save();
+        }
+    }
+
     fn close_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.save_tab(idx);
@@ -1258,7 +1642,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.dialog.is_some() || self.history.is_some() {
+        if self.dialog.is_some() || self.history.is_some() || self.settings.is_some() {
             return;
         }
         ctx.input_mut(|input| {
@@ -1707,6 +2091,9 @@ impl App {
         }
         self.active = self.active.min(self.tabs.len() - 1);
         self.conflict_banner(ui);
+        if self.cfg.view_mode != ViewMode::Preview {
+            self.find_bar(ui);
+        }
         match self.cfg.view_mode {
             ViewMode::Live => self.editor_ui(ui, actions, true),
             ViewMode::Edit => self.editor_ui(ui, actions, false),
@@ -1752,13 +2139,14 @@ impl App {
             deferred_events,
             ime_composing,
             hover_cache,
+            find: find_bar,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
             return;
         };
         let ctx = ui.ctx().clone();
-        let id = egui::Id::unique(("editor", &tab.path));
+        let id = editor_id(&tab.path);
         let size = cfg.font_size;
         let colors = Colors::new(cfg.dark);
 
@@ -1792,8 +2180,12 @@ impl App {
             let sel = editor::byte_of_char(&tab.text, chars.start)
                 ..editor::byte_of_char(&tab.text, chars.end);
             let text = &tab.text;
+            let (smart_lists, auto_pair) = (cfg.smart_lists, cfg.auto_pair);
             let picked = ctx.input_mut(|input| {
                 take_edit_event(&mut input.events, deferred_events, |key| match key {
+                    EditKey::Enter if !smart_lists => None,
+                    EditKey::Tab(_) if !smart_lists => None,
+                    EditKey::Type(_) if !auto_pair => None,
                     EditKey::Enter => edit::on_enter(text, sel.clone()).map(Some),
                     EditKey::Tab(outdent) => edit::on_tab(text, sel.clone(), *outdent).map(Some),
                     EditKey::Checkbox => Some(Some(edit::toggle_checkbox(text, sel.clone()))),
@@ -1847,6 +2239,19 @@ impl App {
             tab.cursor = byte;
         }
         let mut scroll_to = None;
+        if let Some(range) = tab.select.take() {
+            let a = CCursor::new(editor::char_of_byte(&tab.text, range.start));
+            let b = CCursor::new(editor::char_of_byte(&tab.text, range.end));
+            let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+            state.cursor.set_char_range(Some(if a == b {
+                CCursorRange::one(a)
+            } else {
+                CCursorRange::two(a, b)
+            }));
+            state.store(&ctx, id);
+            tab.cursor = range.end;
+            scroll_to = Some(b);
+        }
         if let Some(line) = tab.jump.take() {
             let byte = editor::line_start(&tab.text, line);
             let ccursor = CCursor::new(editor::char_of_byte(&tab.text, byte));
@@ -1876,7 +2281,8 @@ impl App {
         };
 
         // 画像の埋め込みは、読み込み済みならその場に表示する
-        let max_width = (ui.available_width() - 72.0).max(80.0);
+        let max_width =
+            (ui.available_width() - 2.0 * side_margin(ui.available_width(), cfg) - 24.0).max(80.0);
         let pending = std::cell::Cell::new(false);
         let note_path = tab.path.clone();
         let load_image = |target: &str| -> Option<(egui::TextureId, egui::Vec2)> {
@@ -1901,7 +2307,17 @@ impl App {
         };
         let image_size = |target: &str| load_image(target).map(|(_, size)| size);
 
-        let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32);
+        let (marks, current_mark) = find_bar
+            .as_ref()
+            .filter(|f| f.key.as_ref().is_some_and(|k| k.0 == tab.path))
+            .map_or((&[][..], None), |f| (&f.matches[..], f.current));
+        let marks_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (marks, current_mark).hash(&mut h);
+            h.finish()
+        };
+        let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32, marks_key);
         if tab.layout_key != Some(key) || tab.layout_stale {
             tab.layout_key = Some(key);
             tab.layout = editor::Layout::default();
@@ -1915,6 +2331,8 @@ impl App {
                     live,
                     cursor,
                     image: &image_size,
+                    marks,
+                    current_mark,
                 };
                 *layout = editor::layout(buf.as_str(), &options);
             }
@@ -1923,24 +2341,38 @@ impl App {
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
+        let side = side_margin(ui.available_width(), cfg);
         let (output, background, painter) = ScrollArea::vertical()
             .id_salt(("editor-scroll", id))
             .auto_shrink(false)
             .show(ui, |ui| {
                 let (output, background) = egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(24, 12))
+                    .inner_margin(egui::Margin {
+                        left: 0,
+                        right: 0,
+                        top: 12,
+                        bottom: 12,
+                    })
                     .show(ui, |ui| {
-                        // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
-                        let background = ui.painter().add(egui::Shape::Noop);
-                        let output = TextEdit::multiline(text)
-                            .id(id)
-                            .frame(egui::Frame::NONE)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(30)
-                            .lock_focus(true)
-                            .layouter(&mut layouter)
-                            .show(ui);
-                        (output, background)
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(side);
+                            ui.vertical(|ui| {
+                                ui.set_width((ui.available_width() - side).max(80.0));
+                                // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
+                                let background = ui.painter().add(egui::Shape::Noop);
+                                let output = TextEdit::multiline(text)
+                                    .id(id)
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(30)
+                                    .lock_focus(true)
+                                    .layouter(&mut layouter)
+                                    .show(ui);
+                                (output, background)
+                            })
+                            .inner
+                        })
+                        .inner
                     })
                     .inner;
                 if let Some(ccursor) = scroll_to {
@@ -2313,6 +2745,7 @@ impl App {
             md_cache,
             generation,
             active,
+            cfg,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -2333,14 +2766,19 @@ impl App {
             .id_salt(("preview-scroll", &tab.path))
             .auto_shrink(false)
             .show(ui, |ui| {
-                egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(24, 12))
-                    .show(ui, |ui| {
+                let side = side_margin(ui.available_width(), cfg);
+                ui.add_space(12.0);
+                ui.horizontal_top(|ui| {
+                    ui.add_space(side);
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - side).max(80.0));
                         let width = ui.available_width().max(100.0) as usize;
                         CommonMarkViewer::new()
                             .max_image_width(Some(width))
                             .show(ui, md_cache, src);
                     });
+                });
+                ui.add_space(12.0);
             });
         // プレビュー内のwikilinkクリックを横取りしてノートを開く
         ui.ctx().output_mut(|out| {
@@ -2672,6 +3110,41 @@ impl App {
     }
 }
 
+/// ノートごとのエディタのID（TextEditの状態の保存先）。
+/// 本文の左右の余白。「読みやすい行幅」が有効なら、本文が最大幅に収まるよう中央に寄せる。
+fn side_margin(available: f32, cfg: &Config) -> f32 {
+    const MIN: f32 = 24.0;
+    if cfg.readable_width {
+        ((available - cfg.max_width) / 2.0).max(MIN)
+    } else {
+        MIN
+    }
+}
+
+fn editor_id(path: &str) -> egui::Id {
+    egui::Id::unique(("editor", path))
+}
+
+/// エディタの本文を書き換え、変更前の状態を「元に戻す」の履歴に積み、選択範囲を設定する。
+fn replace_text_undoable(
+    ctx: &egui::Context,
+    tab: &mut Tab,
+    text: String,
+    select: std::ops::Range<usize>,
+) {
+    let id = editor_id(&tab.path);
+    let mut state = TextEdit::load_state(ctx, id).unwrap_or_default();
+    let range = state.cursor.char_range().unwrap_or_default();
+    let mut undoer = state.undoer();
+    undoer.add_undo(&(range, tab.text.clone()));
+    state.set_undoer(undoer);
+    state.store(ctx, id);
+    tab.set_text(text);
+    tab.select = Some(select);
+    tab.dirty = true;
+    tab.edited_at = Some(Instant::now());
+}
+
 /// 言及の文脈を、該当部分だけ目立たせて組む。
 fn mention_job(ui: &egui::Ui, m: &Mention) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
@@ -2940,6 +3413,7 @@ impl eframe::App for App {
         self.palette_ui(&ctx, &mut actions);
         self.dialog_ui(&ctx);
         self.history_ui(&ctx);
+        self.settings_ui(&ctx);
         self.file_dialog.update(&ctx);
         if let Some(path) = self.file_dialog.take_picked() {
             actions.push(Action::OpenVault(path));

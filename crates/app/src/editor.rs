@@ -20,6 +20,8 @@ pub struct Colors {
     pub quote: Color32,
     pub mark_bg: Color32,
     pub diff_add: Color32,
+    pub find_bg: Color32,
+    pub find_current: Color32,
     pub diff_del: Color32,
     pub warn_bg: Color32,
 }
@@ -40,6 +42,8 @@ impl Colors {
                 quote: Color32::from_rgb(0xa6, 0xab, 0xb5),
                 mark_bg: Color32::from_rgb(0x5c, 0x4d, 0x12),
                 diff_add: Color32::from_rgb(0x1f, 0x3d, 0x2a),
+                find_bg: Color32::from_rgb(0x4d, 0x43, 0x1a),
+                find_current: Color32::from_rgb(0x9a, 0x6a, 0x10),
                 diff_del: Color32::from_rgb(0x4a, 0x22, 0x26),
                 warn_bg: Color32::from_rgb(0x4a, 0x3a, 0x12),
             }
@@ -57,6 +61,8 @@ impl Colors {
                 quote: Color32::from_rgb(0x5c, 0x61, 0x6b),
                 mark_bg: Color32::from_rgb(0xff, 0xec, 0x99),
                 diff_add: Color32::from_rgb(0xd8, 0xf5, 0xdf),
+                find_bg: Color32::from_rgb(0xff, 0xf0, 0xa8),
+                find_current: Color32::from_rgb(0xff, 0xb8, 0x4d),
                 diff_del: Color32::from_rgb(0xfb, 0xdd, 0xdd),
                 warn_bg: Color32::from_rgb(0xfd, 0xf0, 0xc8),
             }
@@ -116,6 +122,9 @@ pub struct Options<'a> {
     pub cursor: Option<(usize, usize)>,
     /// 画像リンク先 → 表示サイズ。読み込めない・未読み込みなら None
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
+    /// 検索で一致した範囲（バイト位置）と、そのうち選択中のものの番号
+    pub marks: &'a [Range<usize>],
+    pub current_mark: Option<usize>,
 }
 
 #[derive(Default, Clone)]
@@ -642,9 +651,50 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         }
         p.push(eol, p.fmt(p.c.text));
     }
+    let mut job = p.job;
+    paint_marks(&mut job, opt.marks, opt.current_mark, opt.colors);
     Layout {
-        job: p.job,
+        job,
         decos: p.decos,
+    }
+}
+
+/// 検索の一致範囲に背景色を付ける（区間を一致の境界で分割する）。
+fn paint_marks(job: &mut LayoutJob, marks: &[Range<usize>], current: Option<usize>, c: &Colors) {
+    if marks.is_empty() {
+        return;
+    }
+    let sections = std::mem::take(&mut job.sections);
+    for section in sections {
+        let (s, e) = (section.byte_range.start.0, section.byte_range.end.0);
+        let mut cuts = vec![s, e];
+        // 一致は位置順に並んでいるので、区間に重なるものだけを見る
+        let first = marks.partition_point(|m| m.end <= s);
+        for m in marks[first..].iter().take_while(|m| m.start < e) {
+            cuts.push(m.start.clamp(s, e));
+            cuts.push(m.end.clamp(s, e));
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for (i, w) in cuts.windows(2).enumerate() {
+            let mut piece = section.clone();
+            piece.byte_range = w[0].into()..w[1].into();
+            if i > 0 {
+                piece.leading_space = 0.0;
+            }
+            let hit = marks[first..]
+                .iter()
+                .take_while(|m| m.start < e)
+                .position(|m| m.start <= w[0] && w[1] <= m.end);
+            if let Some(k) = hit {
+                piece.format.background = if current == Some(first + k) {
+                    c.find_current
+                } else {
+                    c.find_bg
+                };
+            }
+            job.sections.push(piece);
+        }
     }
 }
 
@@ -744,6 +794,8 @@ mod tests {
         layout(
             text,
             &Options {
+                marks: &[],
+                current_mark: None,
                 size: 14.0,
                 colors: &colors,
                 live,
@@ -847,6 +899,47 @@ mod tests {
         let source = run(SAMPLE, false, None);
         assert_eq!(hidden(&source), "");
         assert!(source.decos.iter().all(|d| d.kind == DecoKind::Code));
+    }
+
+    #[test]
+    fn search_marks_are_painted() {
+        let colors = Colors::new(true);
+        let text = "# Rust\n**rust** and rust";
+        let marks = [2..6, 9..13, 20..24];
+        let image = |_: &str| None;
+        let out = layout(
+            text,
+            &Options {
+                marks: &marks,
+                current_mark: Some(1),
+                size: 14.0,
+                colors: &colors,
+                live: false,
+                cursor: None,
+                image: &image,
+            },
+        );
+        assert_eq!(out.job.text, text);
+        let painted: Vec<(&str, bool)> = out
+            .job
+            .sections
+            .iter()
+            .filter(|s| {
+                s.format.background == colors.find_bg || s.format.background == colors.find_current
+            })
+            .map(|s| {
+                let r = s.byte_range.start.0..s.byte_range.end.0;
+                (&text[r], s.format.background == colors.find_current)
+            })
+            .collect();
+        assert_eq!(painted, [("Rust", false), ("rust", true), ("rust", false)]);
+        // 区間は隙間なく本文全体を覆う
+        let mut at = 0;
+        for s in &out.job.sections {
+            assert_eq!(s.byte_range.start.0, at);
+            at = s.byte_range.end.0;
+        }
+        assert_eq!(at, text.len());
     }
 
     #[test]
