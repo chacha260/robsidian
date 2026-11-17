@@ -62,6 +62,8 @@ pub struct Config {
     /// ローカル履歴に残す件数（0で残さない）と日数
     pub history_versions: usize,
     pub history_days: u64,
+    /// Vimキーバインド（モーダル編集）
+    pub vim: bool,
 }
 
 impl Default for Config {
@@ -84,6 +86,7 @@ impl Default for Config {
             autosave_secs: 1.2,
             history_versions: 50,
             history_days: 30,
+            vim: false,
         }
     }
 }

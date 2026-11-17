@@ -13,6 +13,7 @@ mod history_view;
 mod hover;
 mod preview;
 mod settings;
+mod vim;
 mod workspace;
 
 use eframe::egui;

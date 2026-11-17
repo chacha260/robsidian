@@ -10,6 +10,7 @@ use crate::history_view::{self, HistoryView};
 use crate::hover;
 use crate::preview;
 use crate::settings::SettingsView;
+use crate::vim::{self, Vim};
 use crate::workspace::{self, Workspace};
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
@@ -56,6 +57,7 @@ enum Command {
     FindNext,
     FindPrev,
     Settings,
+    ToggleVim,
     ToggleTheme,
     Rescan,
 }
@@ -95,6 +97,7 @@ impl Command {
             Command::FindNext => "find next match",
             Command::FindPrev => "find previous match",
             Command::Settings => "settings preferences options config",
+            Command::ToggleVim => "vim modal keybindings normal mode",
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
@@ -183,6 +186,7 @@ const COMMANDS: &[CommandEntry] = &[
         Some((Modifiers::NONE, Key::F3)),
     ),
     (Command::Settings, "設定", Some((CTRL, Key::Comma))),
+    (Command::ToggleVim, "Vimキーバインドの切り替え", None),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
@@ -202,6 +206,7 @@ enum Action {
     OpenVault(PathBuf),
     Run(Command),
     History(String),
+    Vim(vim::Cmd),
     PasteImage(std::sync::Arc<egui::ColorImage>),
     /// 未リンクの言及をリンクにする（言及, リンク先のノート）
     LinkMentions(Vec<Mention>, String),
@@ -425,6 +430,9 @@ pub struct App {
     dialog: Option<Dialog>,
     history: Option<HistoryView>,
     find: Option<FindBar>,
+    /// 検索バーを閉じた後も `n` で続きを探せるよう、最後の検索条件を覚えておく
+    last_find: Option<find::Query>,
+    vim: Vim,
     settings: Option<SettingsView>,
     /// 読み込んだ日本語フォントのパス
     font_in_use: Option<String>,
@@ -479,6 +487,8 @@ impl App {
             dialog: None,
             history: None,
             find: None,
+            last_find: None,
+            vim: Vim::default(),
             settings: None,
             font_in_use: font.map(|p| p.display().to_string()),
             deferred_events: Vec::new(),
@@ -1071,6 +1081,16 @@ impl App {
             }
             Command::FindNext | Command::FindPrev => self.find_step(cmd == Command::FindNext),
             Command::Settings => self.settings = Some(SettingsView::new(&self.cfg)),
+            Command::ToggleVim => {
+                self.cfg.vim = !self.cfg.vim;
+                self.vim = Vim::default();
+                self.cfg.save();
+                self.toast(if self.cfg.vim {
+                    "Vimキーバインドを有効にしました（Escでノーマルモード）"
+                } else {
+                    "Vimキーバインドを無効にしました"
+                });
+            }
             Command::GoBack => self.navigate(true),
             Command::GoForward => self.navigate(false),
             Command::ToggleBookmark => {
@@ -1551,7 +1571,11 @@ impl App {
             close = true;
         }
         if close {
-            self.find = None;
+            self.last_find = self
+                .find
+                .take()
+                .map(|f| f.query)
+                .filter(|q| !q.text.is_empty());
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 tab.focus = true;
             }
@@ -1604,6 +1628,56 @@ impl App {
         }
     }
 
+    fn vim_command(&mut self, cmd: vim::Cmd, ctx: &egui::Context) {
+        match cmd {
+            vim::Cmd::Save => self.save_tab(self.active),
+            vim::Cmd::Close => self.close_tab(self.active),
+            vim::Cmd::SaveClose => {
+                self.save_tab(self.active);
+                self.close_tab(self.active);
+            }
+            vim::Cmd::OpenFind(_) => self.run(Command::Find, ctx),
+            vim::Cmd::FindNext | vim::Cmd::FindPrev => {
+                if self.find.is_none() {
+                    let Some(query) = self.last_find.clone() else {
+                        return;
+                    };
+                    self.open_find_with(query, false);
+                }
+                self.find_step(cmd == vim::Cmd::FindNext);
+            }
+            vim::Cmd::SearchWord(word, forward) => {
+                let query = find::Query {
+                    text: word,
+                    case: true,
+                    regex: false,
+                };
+                self.open_find_with(query, false);
+                self.find_step(forward);
+            }
+            vim::Cmd::ClearSearch => {
+                self.last_find = self.find.take().map(|f| f.query);
+            }
+            vim::Cmd::Undo(_) | vim::Cmd::Redo(_) => {}
+            vim::Cmd::Unknown(c) => self.toast(format!("未対応のコマンド: :{c}")),
+        }
+    }
+
+    /// 検索バーを、指定した検索条件で開く（`focus` が false ならエディタにフォーカスを残す）。
+    fn open_find_with(&mut self, query: find::Query, focus: bool) {
+        self.find = Some(FindBar {
+            query,
+            replace: String::new(),
+            show_replace: false,
+            focus,
+            focus_replace: false,
+            key: None,
+            matches: Vec::new(),
+            current: None,
+            error: None,
+        });
+    }
+
     fn close_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.save_tab(idx);
@@ -1635,6 +1709,7 @@ impl App {
             Action::OpenVault(path) => self.open_vault(path, ctx),
             Action::Run(cmd) => self.run(cmd, ctx),
             Action::History(path) => self.open_history(&path),
+            Action::Vim(cmd) => self.vim_command(cmd, ctx),
             Action::PasteImage(image) => self.paste_image(&image),
             Action::LinkMentions(mentions, target) => self.link_mentions(&mentions, &target),
             Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
@@ -1645,8 +1720,17 @@ impl App {
         if self.dialog.is_some() || self.history.is_some() || self.settings.is_some() {
             return;
         }
+        // Vimのノーマルモードで編集中は、Ctrl+D（半画面移動）をエディタに渡す
+        let vim_normal = self.cfg.vim
+            && self.vim.mode != vim::Mode::Insert
+            && self
+                .current()
+                .is_some_and(|t| ctx.memory(|m| m.has_focus(editor_id(&t.path))));
         ctx.input_mut(|input| {
             for &(cmd, _, shortcut) in COMMANDS {
+                if vim_normal && cmd == Command::Daily {
+                    continue;
+                }
                 if let Some((mods, key)) = shortcut {
                     if input.consume_shortcut(&KeyboardShortcut::new(mods, key)) {
                         actions.push(Action::Run(cmd));
@@ -1701,6 +1785,13 @@ impl App {
                     name.unwrap_or_default(),
                     vault.note_count()
                 ));
+            }
+            if self.cfg.vim {
+                let label = match &self.vim.cmdline {
+                    Some(line) => format!(":{line}"),
+                    None => format!("-- {} -- {}", self.vim.mode.label(), self.vim.pending()),
+                };
+                ui.label(RichText::new(label).monospace().strong());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(tab) = self.tabs.get(self.active) {
@@ -2140,6 +2231,7 @@ impl App {
             ime_composing,
             hover_cache,
             find: find_bar,
+            vim: vim_state,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -2168,9 +2260,110 @@ impl App {
             });
         }
 
+        let mut scroll_to_cursor: Option<CCursor> = None;
+        // ---- Vimキーバインド ----
+        let vim_on = cfg.vim;
+        if vim_on && ctx.memory(|m| m.has_focus(id)) {
+            let normal = vim_state.mode != vim::Mode::Insert;
+            let mut keys = Vec::new();
+            ctx.input_mut(|input| {
+                input.events.retain(|e| {
+                    if !normal {
+                        // 挿入モードでは Esc（と Ctrl+[）だけを受け取る
+                        let esc = matches!(e, egui::Event::Key { key: Key::Escape, pressed: true, .. })
+                            || matches!(e, egui::Event::Key { key: Key::OpenBracket, pressed: true, modifiers, .. } if modifiers.command_only());
+                        if esc {
+                            keys.push(vim::Key::Esc);
+                        }
+                        return !esc;
+                    }
+                    match vim_keys(e) {
+                        Some(ks) => {
+                            keys.extend(ks);
+                            false
+                        }
+                        // ノーマルモードでは、本文を直接変える入力をエディタに渡さない
+                        None => !changes_text(e) || is_navigation(e),
+                    }
+                });
+            });
+            if !keys.is_empty() {
+                let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+                let primary = state.cursor.char_range().map_or(0, |r| r.primary.index.0);
+                let mut cursor = editor::byte_of_char(&tab.text, primary);
+                if vim_state.mode == vim::Mode::Normal {
+                    cursor = vim::clamp_normal(&tab.text, cursor);
+                }
+                let mut undoer = state.undoer();
+                let mut changed = false;
+                for key in keys {
+                    let before = (
+                        CCursorRange::one(CCursor::new(editor::char_of_byte(&tab.text, cursor))),
+                        tab.text.clone(),
+                    );
+                    let fx = vim_state.handle(&mut tab.text, &mut cursor, key);
+                    if fx.changed {
+                        // 1キーの変更を1回の「元に戻す」にする
+                        undoer.add_undo(&before);
+                        changed = true;
+                    }
+                    if let Some(y) = fx.yank {
+                        ctx.copy_text(y);
+                    }
+                    match fx.cmd {
+                        Some(vim::Cmd::Undo(n) | vim::Cmd::Redo(n)) => {
+                            let redo = matches!(fx.cmd, Some(vim::Cmd::Redo(_)));
+                            for _ in 0..n {
+                                let current = (
+                                    CCursorRange::one(CCursor::new(editor::char_of_byte(
+                                        &tab.text, cursor,
+                                    ))),
+                                    tab.text.clone(),
+                                );
+                                let restored = if redo {
+                                    undoer.redo(&current).cloned()
+                                } else {
+                                    undoer.undo(&current).cloned()
+                                };
+                                let Some((range, text)) = restored else { break };
+                                tab.text = text;
+                                cursor = vim::clamp_normal(
+                                    &tab.text,
+                                    editor::byte_of_char(&tab.text, range.primary.index.0),
+                                );
+                                changed = true;
+                            }
+                        }
+                        Some(cmd) => actions.push(Action::Vim(cmd)),
+                        None => {}
+                    }
+                }
+                state.set_undoer(undoer);
+                let to_char = |b: usize| CCursor::new(editor::char_of_byte(&tab.text, b));
+                let range = match vim_state.selection(&tab.text, cursor) {
+                    Some((a, b)) if cursor < vim_state.anchor => {
+                        CCursorRange::two(to_char(b), to_char(a))
+                    }
+                    Some((a, b)) => CCursorRange::two(to_char(a), to_char(b)),
+                    None => CCursorRange::one(to_char(cursor)),
+                };
+                state.cursor.set_char_range(Some(range));
+                state.store(&ctx, id);
+                scroll_to_cursor = Some(to_char(cursor));
+                tab.cursor = cursor;
+                if changed {
+                    // 版を上げて、プレビューやアウトラインを作り直させる
+                    tab.version += 1;
+                    tab.dirty = true;
+                    tab.edited_at = Some(Instant::now());
+                }
+            }
+        }
+
         // ---- 編集補助（リストの継続、インデント、チェックボックス、強調、括弧、貼り付け） ----
         let popup_open = completion.as_ref().is_some_and(|c| !c.items.is_empty());
-        if ctx.memory(|m| m.has_focus(id)) && !popup_open && !*ime_composing {
+        let helpers = !vim_on || vim_state.mode == vim::Mode::Insert;
+        if helpers && ctx.memory(|m| m.has_focus(id)) && !popup_open && !*ime_composing {
             let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
             let range = state.cursor.char_range();
             let chars = range.map_or(0..0, |r| {
@@ -2238,7 +2431,7 @@ impl App {
             state.store(&ctx, id);
             tab.cursor = byte;
         }
-        let mut scroll_to = None;
+        let mut scroll_to = scroll_to_cursor.take();
         if let Some(range) = tab.select.take() {
             let a = CCursor::new(editor::char_of_byte(&tab.text, range.start));
             let b = CCursor::new(editor::char_of_byte(&tab.text, range.end));
@@ -2342,6 +2535,7 @@ impl App {
         };
 
         let side = side_margin(ui.available_width(), cfg);
+        let block_cursor = vim_on && vim_state.mode != vim::Mode::Insert;
         let (output, background, painter) = ScrollArea::vertical()
             .id_salt(("editor-scroll", id))
             .auto_shrink(false)
@@ -2360,12 +2554,22 @@ impl App {
                                 ui.set_width((ui.available_width() - side).max(80.0));
                                 // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
                                 let background = ui.painter().add(egui::Shape::Noop);
+                                if block_cursor {
+                                    // ノーマルモードは下でブロック型のカーソルを描く
+                                    ui.visuals_mut().text_cursor.stroke.width = 0.0;
+                                }
                                 let output = TextEdit::multiline(text)
                                     .id(id)
                                     .frame(egui::Frame::NONE)
                                     .desired_width(f32::INFINITY)
                                     .desired_rows(30)
-                                    .lock_focus(true)
+                                    .event_filter(egui::EventFilter {
+                                        tab: true,
+                                        horizontal_arrows: true,
+                                        vertical_arrows: true,
+                                        // Vimでは Esc でノーマルモードに戻るので、フォーカスを手放さない
+                                        escape: vim_on,
+                                    })
                                     .layouter(&mut layouter)
                                     .show(ui);
                                 (output, background)
@@ -2540,6 +2744,53 @@ impl App {
             }
         }
         painter.set(background, egui::Shape::Vec(behind));
+
+        if block_cursor && output.response.response.has_focus() {
+            // ノーマルモードではIMEを止める（日本語入力のままでもキーがコマンドとして届くように）
+            ctx.output_mut(|o| o.ime = None);
+            if let Some(r) = output.cursor_range {
+                let (p, s) = (r.primary.index.0, r.secondary.index.0);
+                let (pb, sb) = (
+                    editor::byte_of_char(&tab.text, p),
+                    editor::byte_of_char(&tab.text, s),
+                );
+                if vim_state.mode == vim::Mode::Normal && p != s {
+                    // マウスで範囲を選んだらビジュアルモードにする
+                    vim_state.mode = vim::Mode::Visual;
+                    vim_state.anchor = sb;
+                    tab.cursor = if pb > sb {
+                        pb - tab.text[..pb].chars().next_back().map_or(0, char::len_utf8)
+                    } else {
+                        pb
+                    };
+                } else if vim_state.mode == vim::Mode::Normal {
+                    let clamped = vim::clamp_normal(&tab.text, pb);
+                    if clamped != pb {
+                        let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+                        state
+                            .cursor
+                            .set_char_range(Some(CCursorRange::one(CCursor::new(
+                                editor::char_of_byte(&tab.text, clamped),
+                            ))));
+                        state.store(&ctx, id);
+                        tab.cursor = clamped;
+                    }
+                }
+            }
+            let c = editor::char_of_byte(&tab.text, tab.cursor.min(tab.text.len()));
+            let here = row(c);
+            let after = row(c + 1);
+            let width = if tab.text[tab.cursor.min(tab.text.len())..].starts_with('\n')
+                || tab.cursor >= tab.text.len()
+                || (after.top() - here.top()).abs() > 1.0
+            {
+                size * 0.55
+            } else {
+                (after.left() - here.left()).max(2.0)
+            };
+            let rect = egui::Rect::from_min_size(here.left_top(), egui::vec2(width, here.height()));
+            painter.rect_filled(rect, 1.0, colors.accent.gamma_multiply(0.45));
+        }
         if let Some((ch, checked)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
             if tab.text.is_char_boundary(byte) && tab.text.is_char_boundary(byte + 1) {
@@ -3162,6 +3413,59 @@ fn mention_job(ui: &egui::Ui, m: &Mention) -> egui::text::LayoutJob {
         _ => job.append(&m.context, 0.0, weak),
     }
     job
+}
+
+/// ノーマルモードで、Vimのキーとして扱う入力。
+fn vim_keys(event: &egui::Event) -> Option<Vec<vim::Key>> {
+    use egui::Event;
+    match event {
+        Event::Text(t) => Some(
+            t.chars()
+                .map(|c| vim::Key::Char(vim::normalize_key(c)))
+                .collect(),
+        ),
+        Event::Ime(egui::ImeEvent::Commit(t)) => Some(
+            t.chars()
+                .map(|c| vim::Key::Char(vim::normalize_key(c)))
+                .collect(),
+        ),
+        Event::Ime(_) => Some(Vec::new()),
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => match (key, *modifiers) {
+            (Key::Escape, _) => Some(vec![vim::Key::Esc]),
+            (Key::Enter, m) if m.is_none() => Some(vec![vim::Key::Enter]),
+            (Key::Backspace, m) if m.is_none() => Some(vec![vim::Key::Backspace]),
+            (Key::Delete, m) if m.is_none() => Some(vec![vim::Key::Char('x')]),
+            (Key::R, m) if m.command_only() => Some(vec![vim::Key::CtrlR]),
+            (Key::D, m) if m.command_only() => Some(vec![vim::Key::CtrlD]),
+            (Key::U, m) if m.command_only() => Some(vec![vim::Key::CtrlU]),
+            (Key::OpenBracket, m) if m.command_only() => Some(vec![vim::Key::Esc]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// カーソルの移動だけで本文を変えない入力（ノーマルモードでもエディタに渡す）。
+fn is_navigation(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::ArrowUp
+                | Key::ArrowDown
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown,
+            ..
+        }
+    ) || matches!(event, egui::Event::Key { modifiers, .. } if modifiers.command && !matches!(event, egui::Event::Key { key: Key::V | Key::X, .. }))
 }
 
 /// 編集補助が受け取る入力。

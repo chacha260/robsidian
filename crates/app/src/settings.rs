@@ -102,7 +102,9 @@ impl SettingsView {
                     }
 
                     section(ui, "エディタ");
-                    ui.checkbox(&mut cfg.smart_lists, "Enterでリストを続け、Tabで字下げする");
+                    ui.checkbox(&mut cfg.vim, "Vimキーバインド（モーダル編集）")
+                    .on_hover_text("Escでノーマルモード、i / a などで挿入モード。ノーマルモード中はIMEを止めます");
+                ui.checkbox(&mut cfg.smart_lists, "Enterでリストを続け、Tabで字下げする");
                     ui.checkbox(&mut cfg.auto_pair, "括弧を自動で閉じ、選択範囲を記号で囲む");
                     ui.horizontal(|ui| {
                         ui.label("自動保存までの時間");
