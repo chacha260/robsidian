@@ -25,6 +25,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// 埋め込んだノートの、まだ測っていないときの高さと、描く高さの上限
+const EMBED_ESTIMATE: f32 = 120.0;
+const EMBED_MAX: f32 = 640.0;
 const RESCAN_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,6 +210,9 @@ enum Action {
     Run(Command),
     History(String),
     Vim(vim::Cmd),
+    /// タスクの完了状態を切り替える（ノートのパス, 行, タスクの本文）
+    ToggleTask(String, usize, String),
+    Toast(String),
     PasteImage(std::sync::Arc<egui::ColorImage>),
     /// 未リンクの言及をリンクにする（言及, リンク先のノート）
     LinkMentions(Vec<Mention>, String),
@@ -303,6 +309,7 @@ enum LeftTab {
     Files,
     Search,
     Tags,
+    Tasks,
     Bookmarks,
 }
 
@@ -433,6 +440,10 @@ pub struct App {
     /// 検索バーを閉じた後も `n` で続きを探せるよう、最後の検索条件を覚えておく
     last_find: Option<find::Query>,
     vim: Vim,
+    task_filter: String,
+    task_show_done: bool,
+    /// タスク一覧: ((索引の世代, 条件, 今日), 結果)
+    task_cache: Option<((u64, String, chrono::NaiveDate), Vec<search::TaskHit>)>,
     settings: Option<SettingsView>,
     /// 読み込んだ日本語フォントのパス
     font_in_use: Option<String>,
@@ -450,6 +461,10 @@ pub struct App {
     md_cache: CommonMarkCache,
     /// ホバープレビュー用（本文のプレビューとはスクロールなどの状態を分ける）
     hover_cache: CommonMarkCache,
+    /// エディタ内に埋め込んだノートの描画用
+    embed_cache: CommonMarkCache,
+    /// 埋め込んだノートを描いた高さ（次の組版で場所を確保するために覚えておく）
+    embed_heights: HashMap<String, f32>,
     /// 未リンクの言及: (索引の世代, ノートのパス, 結果)
     mentions: Option<(u64, String, Vec<Mention>)>,
     graph: Graph,
@@ -489,6 +504,9 @@ impl App {
             find: None,
             last_find: None,
             vim: Vim::default(),
+            task_filter: String::new(),
+            task_show_done: false,
+            task_cache: None,
             settings: None,
             font_in_use: font.map(|p| p.display().to_string()),
             deferred_events: Vec::new(),
@@ -500,6 +518,8 @@ impl App {
             file_dialog: egui_file_dialog::FileDialog::new().title("vaultフォルダを選択"),
             md_cache: CommonMarkCache::default(),
             hover_cache: CommonMarkCache::default(),
+            embed_cache: CommonMarkCache::default(),
+            embed_heights: HashMap::new(),
             mentions: None,
             graph: Graph::new(true),
             show_graph: false,
@@ -1628,6 +1648,55 @@ impl App {
         }
     }
 
+    /// タスクの完了状態を切り替える。開いているタブは未保存の編集ごと書き換え、
+    /// そうでなければファイルを書き換える。行がずれていたら、同じ本文のタスクを探す。
+    fn toggle_task(&mut self, path: &str, line: usize, text: &str, ctx: &egui::Context) {
+        use robsidian_core::task;
+        let find_line = |body: &str| -> Option<usize> {
+            let same = |n: usize| {
+                body.lines()
+                    .nth(n)
+                    .and_then(task::task_in_line)
+                    .is_some_and(|(_, _, b)| task::split_due(b).0 == text)
+            };
+            if same(line) {
+                return Some(line);
+            }
+            (0..body.lines().count()).find(|&n| same(n))
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
+            let toggled = find_line(&tab.text).and_then(|n| task::toggle(&tab.text, n));
+            match toggled {
+                Some(new) => {
+                    let cursor = tab.cursor.min(new.len());
+                    let cursor = (0..=cursor)
+                        .rev()
+                        .find(|&c| new.is_char_boundary(c))
+                        .unwrap_or(0);
+                    replace_text_undoable(ctx, tab, new, cursor..cursor);
+                    self.save_all();
+                }
+                None => {
+                    self.toast("タスクが見つかりませんでした（内容が変わった可能性があります）")
+                }
+            }
+            return;
+        }
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let Some(body) = vault.note(path).map(|n| n.text.clone()) else {
+            return;
+        };
+        match find_line(&body).and_then(|n| task::toggle(&body, n)) {
+            Some(new) => match vault.write_note(path, &new) {
+                Ok(()) => self.generation += 1,
+                Err(e) => self.toast(format!("保存できません: {e:#}")),
+            },
+            None => self.toast("タスクが見つかりませんでした（内容が変わった可能性があります）"),
+        }
+    }
+
     fn vim_command(&mut self, cmd: vim::Cmd, ctx: &egui::Context) {
         match cmd {
             vim::Cmd::Save => self.save_tab(self.active),
@@ -1710,6 +1779,8 @@ impl App {
             Action::Run(cmd) => self.run(cmd, ctx),
             Action::History(path) => self.open_history(&path),
             Action::Vim(cmd) => self.vim_command(cmd, ctx),
+            Action::ToggleTask(path, line, text) => self.toggle_task(&path, line, &text, ctx),
+            Action::Toast(msg) => self.toast(msg),
             Action::PasteImage(image) => self.paste_image(&image),
             Action::LinkMentions(mentions, target) => self.link_mentions(&mentions, &target),
             Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
@@ -1816,6 +1887,7 @@ impl App {
             ui.selectable_value(&mut self.left_tab, LeftTab::Files, "ファイル");
             ui.selectable_value(&mut self.left_tab, LeftTab::Search, "検索");
             ui.selectable_value(&mut self.left_tab, LeftTab::Tags, "タグ");
+            ui.selectable_value(&mut self.left_tab, LeftTab::Tasks, "タスク");
             ui.selectable_value(&mut self.left_tab, LeftTab::Bookmarks, "★");
         });
         ui.separator();
@@ -1907,6 +1979,83 @@ impl App {
                             }
                         }
                         ui.add_space(4.0);
+                    }
+                });
+            }
+            LeftTab::Tasks => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut self.task_filter)
+                            .hint_text("絞り込み 例: tag:work 予算")
+                            .desired_width(ui.available_width() - 60.0),
+                    );
+                    ui.toggle_value(&mut self.task_show_done, "完了");
+                });
+                let today = chrono::Local::now().date_naive();
+                let status = if self.task_show_done {
+                    "task:any"
+                } else {
+                    "task:todo"
+                };
+                let query = format!("{status} sort:due {}", self.task_filter);
+                let key = (self.generation, query.clone(), today);
+                if self.task_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let tasks = match search::run_query(vault, &query, today) {
+                        search::QueryResult::Tasks(t) => t,
+                        search::QueryResult::Notes(_) => Vec::new(),
+                    };
+                    self.task_cache = Some((key, tasks));
+                }
+                let Some((_, tasks)) = &self.task_cache else {
+                    return;
+                };
+                let group = |t: &search::TaskHit| -> usize {
+                    match t.task.due {
+                        _ if t.task.done() => 4,
+                        Some(d) if d < today => 0,
+                        Some(d) if d == today => 1,
+                        Some(_) => 2,
+                        None => 3,
+                    }
+                };
+                const TITLES: [&str; 5] = ["期限切れ", "今日", "今後", "期日なし", "完了"];
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    if tasks.is_empty() {
+                        ui.weak("タスクはありません");
+                        ui.weak("ノートに `- [ ] やること` と書くと、ここに集まります。期日は `📅 2026-01-31` か `due:2026-01-31`");
+                    }
+                    for (g, title) in TITLES.iter().enumerate() {
+                        let items: Vec<&search::TaskHit> = tasks.iter().filter(|t| group(t) == g).collect();
+                        if items.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(4.0);
+                        let heading = RichText::new(format!("{title}（{}）", items.len())).strong();
+                        ui.label(if g == 0 { heading.color(ui.visuals().warn_fg_color) } else { heading });
+                        for t in items {
+                            ui.horizontal(|ui| {
+                                let mut done = t.task.done();
+                                if ui.checkbox(&mut done, "").changed() {
+                                    actions.push(Action::ToggleTask(t.path.clone(), t.task.line, t.task.text.clone()));
+                                }
+                                let text = if t.task.text.is_empty() { "（本文なし）" } else { t.task.text.as_str() };
+                                let label = if t.task.done() { RichText::new(text).weak().strikethrough() } else { RichText::new(text) };
+                                let row = ui.add(egui::Button::new(label).frame(false));
+                                if row.clicked() {
+                                    actions.push(Action::Open(t.path.clone(), Some(t.task.line)));
+                                }
+                                row.on_hover_ui(|ui| hover::note_preview(ui, vault, &mut self.hover_cache, &t.path, None));
+                            });
+                            let note = file_name(&t.path).trim_end_matches(".md");
+                            let meta = match t.task.due {
+                                Some(d) => format!("{note} ・ {d}"),
+                                None => note.to_string(),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.add_space(26.0);
+                                ui.weak(RichText::new(meta).small());
+                            });
+                        }
                     }
                 });
             }
@@ -2230,6 +2379,8 @@ impl App {
             deferred_events,
             ime_composing,
             hover_cache,
+            embed_cache,
+            embed_heights,
             find: find_bar,
             vim: vim_state,
             ..
@@ -2478,6 +2629,20 @@ impl App {
             (ui.available_width() - 2.0 * side_margin(ui.available_width(), cfg) - 24.0).max(80.0);
         let pending = std::cell::Cell::new(false);
         let note_path = tab.path.clone();
+        let embed_key = |path: &str, heading: Option<&str>| {
+            format!("{path}#{}@{}", heading.unwrap_or(""), max_width as u32)
+        };
+        let note_embed = |target: &str| -> Option<f32> {
+            let (note, heading) = hover::split_target(target);
+            let path = vault.resolve(note, &note_path)?;
+            // 自分自身の埋め込みは無限に入れ子になるので描かない
+            (path != note_path).then(|| {
+                embed_heights
+                    .get(&embed_key(path, heading))
+                    .copied()
+                    .unwrap_or(EMBED_ESTIMATE)
+            })
+        };
         let load_image = |target: &str| -> Option<(egui::TextureId, egui::Vec2)> {
             let rel = vault
                 .resolve_file(target, &note_path)
@@ -2524,6 +2689,7 @@ impl App {
                     live,
                     cursor,
                     image: &image_size,
+                    note_embed: &note_embed,
                     marks,
                     current_mark,
                 };
@@ -2732,6 +2898,68 @@ impl App {
                         painter.vline(*x, a.top()..=b.bottom(), line);
                     }
                 }
+                editor::DecoKind::Callout {
+                    color,
+                    first,
+                    label,
+                } => {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(left - 8.0, a.top() - if *first { 3.0 } else { 0.0 }),
+                        egui::pos2(right + 8.0, b.bottom()),
+                    );
+                    behind.push(egui::Shape::rect_filled(
+                        rect,
+                        0.0,
+                        color.gamma_multiply(0.13),
+                    ));
+                    let bar =
+                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height()));
+                    behind.push(egui::Shape::rect_filled(bar, 0.0, *color));
+                    if let Some((text, at)) = label {
+                        painter.text(
+                            row(*at).left_center(),
+                            Align2::LEFT_CENTER,
+                            text,
+                            egui::FontId::new(size, fonts::bold()),
+                            *color,
+                        );
+                    }
+                }
+                editor::DecoKind::NoteEmbed(target) => {
+                    let (note, heading) = hover::split_target(target);
+                    let Some(path) = vault.resolve(note, &tab.path).map(str::to_string) else {
+                        continue;
+                    };
+                    let key = embed_key(&path, heading);
+                    let reserved = embed_heights.get(&key).copied().unwrap_or(EMBED_ESTIMATE);
+                    let top = a.top() + editor::line_height(size) + 4.0;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, top),
+                        egui::vec2((right - left).max(80.0), reserved),
+                    );
+                    behind.push(egui::Shape::rect_filled(rect, 4.0, colors.code_bg));
+                    let bar =
+                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height()));
+                    behind.push(egui::Shape::rect_filled(bar, 0.0, colors.accent));
+                    let inner = rect.shrink2(egui::vec2(14.0, 8.0));
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                inner.min,
+                                egui::vec2(inner.width(), f32::INFINITY),
+                            ))
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    child.set_clip_rect(rect.intersect(clip));
+                    hover::embed_ui(&mut child, vault, embed_cache, &path, heading);
+                    // 実際の高さを覚え、確保した場所と違えば組版をやり直す
+                    let used = (child.min_rect().height() + 16.0).min(EMBED_MAX);
+                    if (used - reserved).abs() > 1.0 {
+                        embed_heights.insert(key, used);
+                        tab.layout_stale = true;
+                        ctx.request_repaint();
+                    }
+                }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;
@@ -2821,6 +3049,21 @@ impl App {
         if let Some(c) = cursor_char {
             tab.cursor = editor::byte_of_char(&tab.text, c);
         }
+        // 埋め込みの中のリンクのクリックを横取りしてノートを開く
+        ctx.output_mut(|out| {
+            out.commands.retain(|cmd| {
+                if let egui::OutputCommand::OpenUrl(open) = cmd {
+                    if let Some(target) = preview::decode_link(&open.url) {
+                        actions.push(Action::FollowLink {
+                            target,
+                            from: tab.path.clone(),
+                        });
+                        return false;
+                    }
+                }
+                true
+            });
+        });
         // Ctrl+ホバーでリンク先を覗く
         if response.hovered() && ctx.input(|i| i.modifiers.command) {
             if let Some(pointer) = ctx.pointer_hover_pos() {
@@ -3013,6 +3256,8 @@ impl App {
         let Some((_, _, src)) = &tab.preview else {
             return;
         };
+        // チェックボックスのクリックを受けるため、描画用の複製を渡す（変化したら元のノートに反映する）
+        let mut rendered = src.clone();
         ScrollArea::vertical()
             .id_salt(("preview-scroll", &tab.path))
             .auto_shrink(false)
@@ -3025,12 +3270,28 @@ impl App {
                         ui.set_width((ui.available_width() - side).max(80.0));
                         let width = ui.available_width().max(100.0) as usize;
                         CommonMarkViewer::new()
+                            .alerts(preview::alerts())
                             .max_image_width(Some(width))
-                            .show(ui, md_cache, src);
+                            .show_mut(ui, md_cache, &mut rendered);
                     });
                 });
                 ui.add_space(12.0);
             });
+        if rendered != *src {
+            match preview::toggle_from_preview(&tab.text, src, &rendered) {
+                Some(text) => {
+                    let cursor = tab.cursor.min(text.len());
+                    let cursor = (0..=cursor)
+                        .rev()
+                        .find(|&c| text.is_char_boundary(c))
+                        .unwrap_or(0);
+                    replace_text_undoable(ui.ctx(), tab, text, cursor..cursor);
+                }
+                None => actions.push(Action::Toast(
+                    "このチェックボックスは元のノートと対応づけられませんでした".into(),
+                )),
+            }
+        }
         // プレビュー内のwikilinkクリックを横取りしてノートを開く
         ui.ctx().output_mut(|out| {
             out.commands.retain(|cmd| {

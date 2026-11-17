@@ -74,8 +74,42 @@ pub fn note_preview(
     }
     let src = preview::to_preview(&src, path, vault);
     CommonMarkViewer::new()
+        .alerts(preview::alerts())
         .max_image_width(Some(WIDTH as usize - 20))
         .show_with_id(egui::Id::unique(("hover-preview", path)), ui, cache, &src);
+}
+
+/// エディタの中に埋め込んだノートを描く（タイトルはリンク）。
+pub fn embed_ui(
+    ui: &mut egui::Ui,
+    vault: &Vault,
+    cache: &mut CommonMarkCache,
+    path: &str,
+    heading: Option<&str>,
+) {
+    let Some(note) = vault.note(path) else {
+        ui.weak(format!("見つかりません: {path}"));
+        return;
+    };
+    let title = match heading {
+        Some(h) => format!("{} › {h}", note.name),
+        None => note.name.clone(),
+    };
+    let target = match heading {
+        Some(h) => format!("{}#{h}", path.trim_end_matches(".md")),
+        None => path.trim_end_matches(".md").to_string(),
+    };
+    let src = excerpt(&note.text, heading);
+    let body = preview::to_preview(&src, path, vault);
+    let md = format!(
+        "**[{title}]({}{})**\n\n{body}",
+        preview::SCHEME,
+        preview::encode_target(&target)
+    );
+    CommonMarkViewer::new()
+        .alerts(preview::alerts())
+        .max_image_width(Some(ui.available_width().max(80.0) as usize))
+        .show_with_id(egui::Id::unique(("embed", path, heading)), ui, cache, &md);
 }
 
 /// `ノート#見出し` を (ノート, 見出し) に分ける。

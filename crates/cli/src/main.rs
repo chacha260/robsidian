@@ -50,6 +50,18 @@ enum Cmd {
         #[arg(long)]
         link: bool,
     },
+    /// タスクの一覧（既定は未完了。条件は search と同じ書き方で、due:overdue なども使える）
+    Tasks {
+        query: Vec<String>,
+        /// 完了したタスクも含める
+        #[arg(short, long)]
+        all: bool,
+        /// 完了したタスクだけ
+        #[arg(long)]
+        done: bool,
+    },
+    /// 条件でノートやタスクを探す（rob-query ブロックと同じ書き方。例: "tag:project sort:mtime limit:10"）
+    Query { query: Vec<String> },
     /// このノートから出ているリンク
     Links { note: String },
     /// タグ一覧。タグを指定するとそのタグを持つノート
@@ -144,6 +156,34 @@ impl Out {
     }
 }
 
+fn print_query(vault: &Vault, query: &str, out: &mut Out) -> Result<()> {
+    for e in search::query_errors(query) {
+        eprintln!("rob: 解釈できない条件を無視しました: {e}");
+    }
+    let today = chrono::Local::now().date_naive();
+    match search::run_query(vault, query, today) {
+        search::QueryResult::Tasks(tasks) if out.json => {
+            out.value(&serde_json::to_value(&tasks)?)?
+        }
+        search::QueryResult::Tasks(tasks) => {
+            for t in tasks {
+                let due = t.task.due.map(|d| format!("  📅 {d}")).unwrap_or_default();
+                writeln!(
+                    out.w,
+                    "{}:{}: [{}] {}{due}",
+                    t.path,
+                    t.task.line + 1,
+                    t.task.status,
+                    t.task.text
+                )?;
+            }
+        }
+        search::QueryResult::Notes(hits) if out.json => out.value(&serde_json::to_value(&hits)?)?,
+        search::QueryResult::Notes(hits) => out.lines(hits.iter().map(|h| &h.path))?,
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -236,6 +276,18 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Tasks { query, all, done } => {
+            let status = if done {
+                "task:done"
+            } else if all {
+                "task:any"
+            } else {
+                "task:todo"
+            };
+            let q = format!("{status} {}", query.join(" "));
+            print_query(&vault, &q, &mut out)?;
+        }
+        Cmd::Query { query } => print_query(&vault, &query.join(" "), &mut out)?,
         Cmd::Links { note } => {
             let rel = note_arg(&vault, &note)?;
             let links = vault.outgoing(&rel);

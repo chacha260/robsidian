@@ -50,6 +50,8 @@ pub struct Parsed {
     pub aliases: Vec<String>,
     /// frontmatterを除いた本文の開始バイト位置
     pub body_start: usize,
+    /// タスク（`- [ ] ...`）。コードブロックの中は含まない
+    pub tasks: Vec<crate::task::Task>,
 }
 
 pub fn parse(text: &str) -> Parsed {
@@ -83,6 +85,16 @@ pub fn parse(text: &str) -> Parsed {
                 }
             }
             scan_inline(line, offset, line_no, &mut out);
+            if let Some((at, status, body)) = crate::task::task_in_line(line) {
+                let (text, due) = crate::task::split_due(body);
+                out.tasks.push(crate::task::Task {
+                    line: line_no,
+                    status,
+                    text,
+                    due,
+                    marker: offset + at..offset + at + status.len_utf8(),
+                });
+            }
         }
 
         offset += raw.len();
@@ -396,6 +408,20 @@ mod tests {
         assert_eq!(p.links[2].heading.as_deref(), Some("sec"));
         assert_eq!(&src[p.links[2].span.clone()], "dir/b%20c.md");
         assert_eq!(p.tags, vec!["project/alpha"]);
+    }
+
+    #[test]
+    fn tasks_are_collected() {
+        let src = "---\na: 1\n---\n- [ ] one 📅 2026-01-02\n```\n- [ ] in code\n```\n  - [x] two";
+        let p = parse(src);
+        let got: Vec<_> = p
+            .tasks
+            .iter()
+            .map(|t| (t.line, t.status, t.text.as_str()))
+            .collect();
+        assert_eq!(got, [(3, ' ', "one"), (7, 'x', "two")]);
+        assert_eq!(&src[p.tasks[1].marker.clone()], "x");
+        assert!(p.tasks[0].due.is_some() && !p.tasks[0].done() && p.tasks[1].done());
     }
 
     #[test]
