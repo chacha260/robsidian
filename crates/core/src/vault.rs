@@ -6,6 +6,7 @@
 
 use crate::history;
 use crate::parse::{self, Link, LinkKind, Parsed};
+use crate::template;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -675,38 +676,80 @@ impl Vault {
 
     // ---- デイリーノート ----
 
+    /// `.obsidian/<file>` の文字列設定を読む（空文字は無いものとして扱う）。
+    fn obsidian_setting(&self, file: &str, key: &str) -> Option<String> {
+        let text = fs::read_to_string(self.root.join(".obsidian").join(file)).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let s = value.get(key)?.as_str()?.trim().trim_matches('/');
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
+    /// テンプレートを置くフォルダ。Obsidianの設定（`.obsidian/templates.json` の folder）、
+    /// 無ければ `templates`。
+    pub fn template_folder(&self) -> String {
+        self.obsidian_setting("templates.json", "folder")
+            .unwrap_or_else(|| "templates".to_string())
+    }
+
+    /// テンプレートフォルダ内のノート（パス順）。
+    pub fn templates(&self) -> Vec<&str> {
+        let prefix = format!("{}/", self.template_folder());
+        self.notes
+            .keys()
+            .filter(|p| p.starts_with(&prefix))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// 名前（テンプレートフォルダからの相対パス、拡張子なしでも可）またはパスでテンプレートを探す。
+    pub fn find_template(&self, name: &str) -> Option<&str> {
+        let name = name.trim().trim_end_matches(".md");
+        let folder = self.template_folder();
+        self.templates().into_iter().find(|p| {
+            let stem = p.trim_end_matches(".md");
+            stem == name
+                || stem
+                    .strip_prefix(&folder)
+                    .map(|s| s.trim_start_matches('/'))
+                    == Some(name)
+                || file_name(stem) == name
+        })
+    }
+
+    /// テンプレートを展開した本文。`title` は作るノートの名前。
+    pub fn render_template(&self, template: &str, title: &str) -> Option<String> {
+        let text = &self.notes.get(template)?.text;
+        Some(template::render(text, title, &chrono::Local::now()))
+    }
+
     /// 指定日のデイリーノートのパス。Obsidianの設定
     /// （`.obsidian/daily-notes.json` の folder / format）があればそれに従う。
     pub fn daily_path(&self, date: chrono::NaiveDate) -> String {
-        let cfg = fs::read_to_string(self.root.join(".obsidian/daily-notes.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let get = |key: &str| {
-            cfg.as_ref()
-                .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        };
-        let format = get("format").unwrap_or("YYYY-MM-DD");
-        let name = format
-            .replace("YYYY", &date.format("%Y").to_string())
-            .replace("MM", &date.format("%m").to_string())
-            .replace("DD", &date.format("%d").to_string());
-        match get("folder").map(|f| f.trim_matches('/')) {
-            Some(folder) if !folder.is_empty() => format!("{folder}/{name}.md"),
-            _ => format!("{name}.md"),
+        let format = self
+            .obsidian_setting("daily-notes.json", "format")
+            .unwrap_or_else(|| "YYYY-MM-DD".to_string());
+        let name = template::format_moment(&date.and_time(chrono::NaiveTime::MIN), &format);
+        match self.obsidian_setting("daily-notes.json", "folder") {
+            Some(folder) => format!("{folder}/{name}.md"),
+            None => format!("{name}.md"),
         }
     }
 
-    /// 今日のデイリーノートを（無ければ作って）返す。
+    /// 今日のデイリーノートを（無ければ作って）返す。作るときは、Obsidianの設定で
+    /// 指定されたテンプレート（`.obsidian/daily-notes.json` の template）を展開する。
     pub fn daily(&mut self) -> Result<String> {
         let rel = self.daily_path(chrono::Local::now().date_naive());
         if !self.notes.contains_key(&rel) {
             if self.abs(&rel).exists() {
                 self.reload(&rel);
             } else {
-                self.write_note(&rel, "")?;
+                let title = strip_note_ext(file_name(&rel)).to_string();
+                let body = self
+                    .obsidian_setting("daily-notes.json", "template")
+                    .and_then(|t| self.find_template(&t).map(str::to_string))
+                    .and_then(|t| self.render_template(&t, &title))
+                    .unwrap_or_default();
+                self.write_note(&rel, &body)?;
             }
         }
         Ok(rel)
@@ -845,5 +888,23 @@ mod tests {
         assert_eq!(v.daily_path(date), "Daily/2026/01-05.md");
         let rel = v.daily().unwrap();
         assert!(v.note(&rel).is_some());
+
+        // テンプレートの指定があれば、新しく作るデイリーノートに展開する
+        fs::write(
+            d.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder":"Daily","format":"YYYY-MM-DD","template":"tpl/日記"}"#,
+        )
+        .unwrap();
+        fs::write(
+            d.path().join(".obsidian/templates.json"),
+            r#"{"folder":"tpl"}"#,
+        )
+        .unwrap();
+        v.write_note("tpl/日記.md", "# {{title}}\n- ").unwrap();
+        assert_eq!(v.templates(), ["tpl/日記.md"]);
+        assert_eq!(v.find_template("日記"), Some("tpl/日記.md"));
+        let rel = v.daily().unwrap();
+        let title = rel.trim_start_matches("Daily/").trim_end_matches(".md");
+        assert_eq!(v.note(&rel).unwrap().text, format!("# {title}\n- "));
     }
 }

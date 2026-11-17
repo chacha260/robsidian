@@ -659,7 +659,7 @@ pub fn line_start(text: &str, line: usize) -> usize {
         .map_or(text.len(), |(i, _)| i + 1)
 }
 
-/// カーソル位置にあるリンクのリンク先（`#見出し` 付きの場合はそれを除いたもの）。
+/// カーソル位置（文字境界のバイト位置）にあるリンクのリンク先。見出しの指定があれば `ノート#見出し`。
 pub fn link_at(text: &str, byte_pos: usize) -> Option<String> {
     let start = text[..byte_pos].rfind('\n').map_or(0, |i| i + 1);
     let end = text[byte_pos..]
@@ -667,7 +667,7 @@ pub fn link_at(text: &str, byte_pos: usize) -> Option<String> {
         .map_or(text.len(), |i| byte_pos + i);
     let line = &text[start..end];
     let pos = byte_pos - start;
-    parse::parse(line).links.into_iter().find_map(|l| {
+    let found = parse::parse(line).links.into_iter().find_map(|l| {
         let range = match l.kind {
             LinkKind::Wiki => l.full.clone(),
             LinkKind::Markdown => {
@@ -675,7 +675,19 @@ pub fn link_at(text: &str, byte_pos: usize) -> Option<String> {
                 open..(l.span.end + 1).min(line.len())
             }
         };
-        (range.start <= pos && pos <= range.end).then_some(l.target)
+        let target = match &l.heading {
+            Some(h) => format!("{}#{h}", l.target),
+            None => l.target,
+        };
+        (range.start <= pos && pos <= range.end).then_some(target)
+    });
+    // `[[#見出し]]`（同じノート内のリンク）は索引の対象外なので、ここで拾う
+    found.or_else(|| {
+        let open = line[..pos.min(line.len())].rfind("[[#")?;
+        let close = open + line[open..].find("]]")?;
+        let inner = &line[open + 2..close];
+        (pos <= close + 2 && !inner.contains('['))
+            .then(|| inner.split('|').next().unwrap_or(inner).trim().to_string())
     })
 }
 
@@ -685,7 +697,8 @@ pub fn completion_start(text: &str, cursor: usize) -> Option<usize> {
     let before = &text[line_start..cursor];
     let open = before.rfind("[[")?;
     let typed = &before[open + 2..];
-    if typed.contains(['|', '#', '[', ']']) || typed.len() > 80 {
+    // `#` は見出しの指定として1つだけ許す（`[[ノート#見出し`）
+    if typed.contains(['|', '[', ']']) || typed.matches('#').count() > 1 || typed.len() > 80 {
         return None;
     }
     Some(line_start + open + 2)
@@ -699,6 +712,13 @@ mod tests {
     fn helpers() {
         let t = "あ[[Note A|x]]\n見出し [m](b.md) [[Par";
         assert_eq!(link_at(t, 6).as_deref(), Some("Note A"));
+        let h = "x [[Note#節|別名]] y [[#自分の節]]";
+        assert_eq!(link_at(h, 5).as_deref(), Some("Note#節"));
+        assert_eq!(link_at(h, h.len() - 2).as_deref(), Some("#自分の節"));
+        assert_eq!(link_at(h, 0), None);
+        let k = "[[Note#";
+        assert_eq!(&k[completion_start(k, k.len()).unwrap()..], "Note#");
+        assert_eq!(completion_start("[[a#b#", 6), None);
         assert_eq!(link_at(t, 0), None);
         let md = t.find("b.md").unwrap();
         assert_eq!(link_at(t, md + 1).as_deref(), Some("b.md"));

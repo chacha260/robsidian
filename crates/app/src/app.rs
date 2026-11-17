@@ -5,6 +5,7 @@ use crate::editor::{self, Colors};
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
 use crate::preview;
+use crate::workspace::{self, Workspace};
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
     self, Align, Align2, Key, KeyboardShortcut, Layout, Modifiers, RichText, ScrollArea, TextEdit,
@@ -40,6 +41,11 @@ enum Command {
     Rename,
     Delete,
     History,
+    GoBack,
+    GoForward,
+    ToggleBookmark,
+    InsertTemplate,
+    NewFromTemplate,
     OpenVault,
     ToggleTheme,
     Rescan,
@@ -70,6 +76,11 @@ impl Command {
             Command::Rename => "rename move",
             Command::Delete => "delete trash remove",
             Command::History => "history restore version undo diff",
+            Command::GoBack => "go back navigate previous",
+            Command::GoForward => "go forward navigate next",
+            Command::ToggleBookmark => "bookmark star favorite pin",
+            Command::InsertTemplate => "insert template",
+            Command::NewFromTemplate => "new note from template create",
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
@@ -132,6 +143,19 @@ const COMMANDS: &[CommandEntry] = &[
     ),
     (Command::Delete, "現在のノートをゴミ箱へ", None),
     (Command::History, "現在のノートの履歴（復元）", None),
+    (
+        Command::GoBack,
+        "戻る",
+        Some((Modifiers::ALT, Key::ArrowLeft)),
+    ),
+    (
+        Command::GoForward,
+        "進む",
+        Some((Modifiers::ALT, Key::ArrowRight)),
+    ),
+    (Command::ToggleBookmark, "ブックマークに追加 / 解除", None),
+    (Command::InsertTemplate, "テンプレートを挿入", None),
+    (Command::NewFromTemplate, "テンプレートから新規ノート", None),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
@@ -148,13 +172,27 @@ enum Action {
     OpenVault(PathBuf),
     Run(Command),
     History(String),
+    ToggleBookmark(String),
 }
 
 enum Dialog {
-    NewNote { dir: String, name: String },
-    NewFolder { dir: String, name: String },
-    Rename { path: String, new: String },
-    Delete { path: String },
+    NewNote {
+        dir: String,
+        name: String,
+        /// 新しいノートに展開するテンプレート
+        template: Option<String>,
+    },
+    NewFolder {
+        dir: String,
+        name: String,
+    },
+    Rename {
+        path: String,
+        new: String,
+    },
+    Delete {
+        path: String,
+    },
 }
 
 /// 組版結果を使い回せる条件: (文字サイズ, ダーク, Live Preview, カーソルの文字範囲, 画像の最大幅)
@@ -174,6 +212,8 @@ struct Tab {
     jump: Option<usize>,
     /// 次の描画でエディタにフォーカスを移す
     focus: bool,
+    /// 次の描画でカーソルをこのバイト位置に置く
+    place_cursor: Option<usize>,
     /// 最後に確認したカーソル位置（バイト）
     cursor: usize,
     layout: editor::Layout,
@@ -196,6 +236,7 @@ impl Tab {
             version: 0,
             jump: None,
             focus: false,
+            place_cursor: None,
             cursor: 0,
             layout: editor::Layout::default(),
             layout_key: None,
@@ -221,16 +262,28 @@ enum LeftTab {
     Files,
     Search,
     Tags,
+    Bookmarks,
 }
 
 enum PaletteItem {
     Note(String),
+    Template(String),
     Create(String),
     Cmd(usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteMode {
+    Notes,
+    Commands,
+    /// 選んだテンプレートを現在のノートのカーソル位置に挿入する
+    InsertTemplate,
+    /// 選んだテンプレートで新規ノートを作る
+    NewFromTemplate,
+}
+
 struct Palette {
-    commands: bool,
+    mode: PaletteMode,
     query: String,
     computed_for: Option<String>,
     items: Vec<PaletteItem>,
@@ -319,6 +372,12 @@ pub struct App {
     completion_dismissed: Option<usize>,
     dialog: Option<Dialog>,
     history: Option<HistoryView>,
+    workspace: Workspace,
+    /// 戻る/進むの履歴: (ノートのパス, カーソルのあった行)
+    nav_back: Vec<(String, usize)>,
+    nav_forward: Vec<(String, usize)>,
+    /// 戻る/進むで移動中（このときは履歴に積まない）
+    navigating: bool,
     file_dialog: egui_file_dialog::FileDialog,
     md_cache: CommonMarkCache,
     graph: Graph,
@@ -351,6 +410,10 @@ impl App {
             completion_dismissed: None,
             dialog: None,
             history: None,
+            workspace: Workspace::default(),
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            navigating: false,
             file_dialog: egui_file_dialog::FileDialog::new().title("vaultフォルダを選択"),
             md_cache: CommonMarkCache::default(),
             graph: Graph::new(true),
@@ -408,6 +471,9 @@ impl App {
                 self.active = 0;
                 self.watcher = None;
                 self.start_watcher(&vault, ctx);
+                self.workspace = Workspace::load(vault.root());
+                self.nav_back.clear();
+                self.nav_forward.clear();
                 self.vault = Some(vault);
                 self.generation += 1;
                 self.cfg.save();
@@ -554,6 +620,11 @@ impl App {
     }
 
     fn open_note(&mut self, path: &str, line: Option<usize>) {
+        if self.vault.as_ref().is_some_and(|v| v.note(path).is_some()) {
+            self.record_navigation(path);
+            self.workspace.touch(path);
+            self.save_workspace();
+        }
         let idx = match self.tabs.iter().position(|t| t.path == path) {
             Some(i) => i,
             None => {
@@ -573,11 +644,104 @@ impl App {
         self.completion = None;
     }
 
+    /// 別のノートへ移る前に、いまの場所を「戻る」の履歴に積む。
+    fn record_navigation(&mut self, to: &str) {
+        if self.navigating || self.show_graph {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.path == to {
+            return;
+        }
+        let line = tab.text[..tab.cursor.min(tab.text.len())]
+            .matches('\n')
+            .count();
+        self.nav_back.push((tab.path.clone(), line));
+        if self.nav_back.len() > 100 {
+            self.nav_back.remove(0);
+        }
+        self.nav_forward.clear();
+    }
+
+    fn navigate(&mut self, back: bool) {
+        let (from, to) = if back {
+            (&mut self.nav_back, &mut self.nav_forward)
+        } else {
+            (&mut self.nav_forward, &mut self.nav_back)
+        };
+        let Some(vault) = &self.vault else {
+            return;
+        };
+        // 消えたノートは飛ばす
+        let target = loop {
+            match from.pop() {
+                Some((path, line)) if vault.note(&path).is_some() => break Some((path, line)),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        let Some((path, line)) = target else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get(self.active) {
+            let here = tab.text[..tab.cursor.min(tab.text.len())]
+                .matches('\n')
+                .count();
+            to.push((tab.path.clone(), here));
+        }
+        self.navigating = true;
+        self.open_note(&path, Some(line));
+        self.navigating = false;
+    }
+
+    fn toggle_bookmark(&mut self, path: &str) {
+        let added = self.workspace.toggle_bookmark(path);
+        self.save_workspace();
+        let name = file_name(path).trim_end_matches(".md");
+        self.toast(if added {
+            format!("ブックマークに追加しました: {name}")
+        } else {
+            format!("ブックマークから外しました: {name}")
+        });
+    }
+
+    fn save_workspace(&self) {
+        if let Some(vault) = &self.vault {
+            self.workspace.save(vault.root());
+        }
+    }
+
+    /// 現在のノートのカーソル位置に文字列を挿入する。
+    fn insert_at_cursor(&mut self, text: &str) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let at = tab.cursor.min(tab.text.len());
+        let mut body = tab.text.clone();
+        body.insert_str(at, text);
+        tab.set_text(body);
+        tab.place_cursor = Some(at + text.len());
+        tab.focus = true;
+        tab.dirty = true;
+        tab.edited_at = Some(Instant::now());
+    }
+
     fn create_and_open(&mut self, name: &str) {
+        self.create_from(name, None);
+    }
+
+    /// ノートを作って開く。`template` があれば、ノート名を `{{title}}` として展開した本文で作る。
+    fn create_from(&mut self, name: &str, template: Option<&str>) {
         let Some(vault) = self.vault.as_mut() else {
             return;
         };
-        match vault.create_note(name, "") {
+        let title = file_name(name.trim().trim_end_matches('/')).trim_end_matches(".md");
+        let body = template
+            .and_then(|t| vault.render_template(t, title))
+            .unwrap_or_default();
+        match vault.create_note(name, &body) {
             Ok(path) => {
                 self.generation += 1;
                 self.open_note(&path, None);
@@ -587,15 +751,45 @@ impl App {
     }
 
     fn follow_link(&mut self, target: &str, from: &str, ctx: &egui::Context) {
-        let target = target.split('#').next().unwrap_or(target).trim();
+        let (target, heading) = match target.split_once('#') {
+            Some((t, h)) => (t.trim(), Some(h)),
+            None => (target.trim(), None),
+        };
         let Some(vault) = &self.vault else { return };
-        if let Some(path) = vault.resolve(target, from).map(str::to_string) {
+        // `[[#見出し]]` は同じノート内のリンク
+        let same_note = target.is_empty().then(|| from.to_string());
+        if let Some(path) = same_note.or_else(|| vault.resolve(target, from).map(str::to_string)) {
             self.open_note(&path, None);
+            if let Some(heading) = heading {
+                self.jump_to_heading(&path, heading);
+            }
         } else if let Some(file) = vault.resolve_file(target, from).map(str::to_string) {
             self.open_external(&file, ctx);
         } else if !target.is_empty() {
             // Obsidianと同じく、存在しないリンクを開くとノートを作る
             self.create_and_open(target);
+        }
+    }
+
+    /// 開いているノートの見出しへ移動する。`a#b` のような入れ子の指定は最後の見出しで探す。
+    fn jump_to_heading(&mut self, path: &str, heading: &str) {
+        let want = heading
+            .rsplit('#')
+            .next()
+            .unwrap_or(heading)
+            .trim()
+            .to_lowercase();
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) else {
+            return;
+        };
+        let line = parse::parse(&tab.text)
+            .headings
+            .into_iter()
+            .find(|h| h.text.trim().to_lowercase() == want)
+            .map(|h| h.line);
+        match line {
+            Some(line) => tab.jump = Some(line),
+            None => self.toast(format!("見出しが見つかりません: {heading}")),
         }
     }
 
@@ -628,6 +822,17 @@ impl App {
                         tab.path = format!("{new}{rest}");
                     }
                 }
+                let new_path = [new.to_string(), format!("{new}.md")]
+                    .into_iter()
+                    .find(|p| vault.note(p).is_some() || vault.abs(p).is_dir())
+                    .unwrap_or_else(|| new.to_string());
+                self.workspace.renamed(old, &new_path);
+                for (path, _) in self.nav_back.iter_mut().chain(self.nav_forward.iter_mut()) {
+                    if let Some(moved) = workspace::moved_path(path, old, &new_path) {
+                        *path = moved;
+                    }
+                }
+                self.save_workspace();
                 self.sync_tabs();
                 if !updated.is_empty() {
                     self.toast(format!("{}件のノートのリンクを更新しました", updated.len()));
@@ -649,6 +854,8 @@ impl App {
                 self.tabs
                     .retain(|t| t.path != path && !t.path.starts_with(&prefix));
                 self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                self.workspace.removed(path);
+                self.save_workspace();
                 self.toast(format!("ゴミ箱へ移動しました: {path}"));
             }
             Err(e) => self.toast(format!("ゴミ箱へ移動できません: {e}")),
@@ -661,8 +868,13 @@ impl App {
         let current = self.current().map(|t| t.path.clone());
         match cmd {
             Command::QuickSwitch | Command::Palette => {
+                let mode = if cmd == Command::Palette {
+                    PaletteMode::Commands
+                } else {
+                    PaletteMode::Notes
+                };
                 self.palette = Some(Palette {
-                    commands: cmd == Command::Palette,
+                    mode,
                     query: String::new(),
                     computed_for: None,
                     items: Vec::new(),
@@ -679,6 +891,7 @@ impl App {
                 self.dialog = Some(Dialog::NewNote {
                     dir,
                     name: String::new(),
+                    template: None,
                 });
             }
             Command::Daily => {
@@ -732,6 +945,39 @@ impl App {
                 if let Some(path) = current {
                     self.open_history(&path);
                 }
+            }
+            Command::GoBack => self.navigate(true),
+            Command::GoForward => self.navigate(false),
+            Command::ToggleBookmark => {
+                if let Some(path) = current {
+                    self.toggle_bookmark(&path);
+                }
+            }
+            Command::InsertTemplate | Command::NewFromTemplate => {
+                let Some(vault) = &self.vault else { return };
+                if vault.templates().is_empty() {
+                    let folder = vault.template_folder();
+                    self.toast(format!(
+                        "テンプレートがありません。「{folder}」フォルダにノートを置いてください"
+                    ));
+                    return;
+                }
+                if cmd == Command::InsertTemplate && current.is_none() {
+                    self.toast("テンプレートを挿入するノートを開いてください");
+                    return;
+                }
+                let mode = if cmd == Command::InsertTemplate {
+                    PaletteMode::InsertTemplate
+                } else {
+                    PaletteMode::NewFromTemplate
+                };
+                self.palette = Some(Palette {
+                    mode,
+                    query: String::new(),
+                    computed_for: None,
+                    items: Vec::new(),
+                    selected: 0,
+                });
             }
             Command::OpenVault => self.file_dialog.pick_directory(),
             Command::ToggleTheme => self.cfg.dark = !self.cfg.dark,
@@ -892,6 +1138,7 @@ impl App {
             Action::OpenVault(path) => self.open_vault(path, ctx),
             Action::Run(cmd) => self.run(cmd, ctx),
             Action::History(path) => self.open_history(&path),
+            Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
         }
     }
 
@@ -979,6 +1226,7 @@ impl App {
             ui.selectable_value(&mut self.left_tab, LeftTab::Files, "ファイル");
             ui.selectable_value(&mut self.left_tab, LeftTab::Search, "検索");
             ui.selectable_value(&mut self.left_tab, LeftTab::Tags, "タグ");
+            ui.selectable_value(&mut self.left_tab, LeftTab::Bookmarks, "★");
         });
         ui.separator();
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
@@ -1061,6 +1309,34 @@ impl App {
                             }
                         }
                         ui.add_space(4.0);
+                    }
+                });
+            }
+            LeftTab::Bookmarks => {
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    if self.workspace.bookmarks.is_empty() {
+                        ui.weak("ブックマークはまだありません。");
+                        ui.weak("ノートの右クリックメニューやコマンドパレットから追加できます。");
+                    }
+                    for path in &self.workspace.bookmarks {
+                        let exists = vault.note(path).is_some();
+                        let title = file_name(path).trim_end_matches(".md");
+                        let text = if exists {
+                            RichText::new(title)
+                        } else {
+                            RichText::new(format!("{title}（見つかりません）")).weak()
+                        };
+                        let row = ui
+                            .selectable_label(active == Some(path.as_str()), text)
+                            .on_hover_text(path);
+                        if row.clicked() && exists {
+                            actions.push(Action::Open(path.clone(), None));
+                        }
+                        row.context_menu(|ui| {
+                            if ui.button("ブックマークから外す").clicked() {
+                                actions.push(Action::ToggleBookmark(path.clone()));
+                            }
+                        });
                     }
                 });
             }
@@ -1181,6 +1457,12 @@ impl App {
                     label.context_menu(|ui| {
                         if ui.button("閉じる").clicked() {
                             actions.push(Action::Close(i));
+                        }
+                        if ui.button("ブックマークに追加 / 解除").clicked() {
+                            actions.push(Action::ToggleBookmark(tab.path.clone()));
+                        }
+                        if ui.button("履歴…").clicked() {
+                            actions.push(Action::History(tab.path.clone()));
                         }
                         if ui.button("改名/移動…").clicked() {
                             let d = Dialog::Rename {
@@ -1312,6 +1594,15 @@ impl App {
 
         if std::mem::take(&mut tab.focus) {
             ctx.memory_mut(|m| m.request_focus(id));
+        }
+        if let Some(byte) = tab.place_cursor.take() {
+            let ccursor = CCursor::new(editor::char_of_byte(&tab.text, byte));
+            let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(ccursor)));
+            state.store(&ctx, id);
+            tab.cursor = byte;
         }
         let mut scroll_to = None;
         if let Some(line) = tab.jump.take() {
@@ -1649,17 +1940,42 @@ impl App {
             .as_ref()
             .is_none_or(|c| c.start != start || c.query != query)
         {
-            let items = search::fuzzy(vault, query, 8)
-                .into_iter()
-                .filter(|p| *p != tab.path)
-                .map(|path| {
-                    let full = path.strip_suffix(".md").unwrap_or(&path);
-                    let name = file_name(full);
-                    // 同名ノートがあって名前だけでは別のノートに解決される場合はパスで書く
-                    let unique = vault.resolve(name, &tab.path) == Some(path.as_str());
-                    (if unique { name } else { full }.to_string(), path.clone())
-                })
-                .collect();
+            let items = match query.split_once('#') {
+                // `[[ノート#見出し` → そのノートの見出しを候補にする（`[[#見出し` は同じノート）
+                Some((note, heading)) => {
+                    let text = if note.trim().is_empty() {
+                        Some(tab.text.as_str())
+                    } else {
+                        vault
+                            .resolve(note, &tab.path)
+                            .and_then(|p| vault.note(p))
+                            .map(|n| n.text.as_str())
+                    };
+                    let want = heading.trim().to_lowercase();
+                    text.map(|t| parse::parse(t).headings)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|h| h.text.to_lowercase().contains(&want))
+                        .take(20)
+                        .map(|h| {
+                            let shown =
+                                format!("{}{}", "  ".repeat(usize::from(h.level) - 1), h.text);
+                            (format!("{note}#{}", h.text), shown)
+                        })
+                        .collect()
+                }
+                None => search::fuzzy(vault, query, 8)
+                    .into_iter()
+                    .filter(|p| *p != tab.path)
+                    .map(|path| {
+                        let full = path.strip_suffix(".md").unwrap_or(&path);
+                        let name = file_name(full);
+                        // 同名ノートがあって名前だけでは別のノートに解決される場合はパスで書く
+                        let unique = vault.resolve(name, &tab.path) == Some(path.as_str());
+                        (if unique { name } else { full }.to_string(), path.clone())
+                    })
+                    .collect(),
+            };
             *completion = Some(Completion {
                 start,
                 query: query.to_string(),
@@ -1781,7 +2097,20 @@ impl App {
         if p.computed_for.as_deref() != Some(p.query.as_str()) {
             p.items.clear();
             let q = p.query.trim();
-            if p.commands {
+            if matches!(
+                p.mode,
+                PaletteMode::InsertTemplate | PaletteMode::NewFromTemplate
+            ) {
+                if let Some(vault) = &self.vault {
+                    let q = q.to_lowercase();
+                    let hits = vault
+                        .templates()
+                        .into_iter()
+                        .filter(|t| t.to_lowercase().contains(&q));
+                    p.items
+                        .extend(hits.map(|t| PaletteItem::Template(t.to_string())));
+                }
+            } else if p.mode == PaletteMode::Commands {
                 let q = q.to_lowercase();
                 let hits = COMMANDS.iter().enumerate().filter(|(_, c)| {
                     // IMEをオフにしたまま英語でも引けるようにする
@@ -1789,7 +2118,20 @@ impl App {
                 });
                 p.items.extend(hits.map(|(i, _)| PaletteItem::Cmd(i)));
             } else if let Some(vault) = &self.vault {
-                let notes = search::fuzzy(vault, q, 30);
+                let mut notes = search::fuzzy(vault, q, 30);
+                if q.is_empty() {
+                    // 入力前は「最近開いた順」を先に並べ、残りを更新日時順で続ける
+                    let recent: Vec<String> = self
+                        .workspace
+                        .recent
+                        .iter()
+                        .filter(|r| vault.note(r).is_some())
+                        .cloned()
+                        .collect();
+                    notes.retain(|n| !recent.contains(n));
+                    notes.splice(0..0, recent);
+                    notes.truncate(30);
+                }
                 let exact = notes.iter().any(|n| {
                     n.strip_suffix(".md")
                         .is_some_and(|s| s.eq_ignore_ascii_case(q))
@@ -1818,7 +2160,8 @@ impl App {
             }
         }
         // Shift+Enter: 候補があっても入力した名前で新規作成する
-        let force_create = shift_enter && !p.commands && !p.query.trim().is_empty();
+        let force_create =
+            shift_enter && p.mode == PaletteMode::Notes && !p.query.trim().is_empty();
 
         let area = egui::Area::new(egui::Id::unique("palette"))
             .order(egui::Order::Foreground)
@@ -1826,10 +2169,11 @@ impl App {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(560.0);
-                    let hint = if p.commands {
-                        "コマンドを検索…"
-                    } else {
-                        "ノート名を入力…（無ければEnterで新規作成）"
+                    let hint = match p.mode {
+                        PaletteMode::Commands => "コマンドを検索…（英語でも可）",
+                        PaletteMode::Notes => "ノート名を入力…（無ければEnterで新規作成）",
+                        PaletteMode::InsertTemplate => "挿入するテンプレートを選ぶ…",
+                        PaletteMode::NewFromTemplate => "新規ノートに使うテンプレートを選ぶ…",
                     };
                     let edit = TextEdit::singleline(&mut p.query)
                         .hint_text(hint)
@@ -1849,6 +2193,10 @@ impl App {
                                         r
                                     })
                                     .inner
+                                }
+                                PaletteItem::Template(path) => {
+                                    let name = path.trim_end_matches(".md");
+                                    ui.selectable_label(selected, file_name(name))
                                 }
                                 PaletteItem::Create(name) => ui
                                     .selectable_label(selected, format!("＋ 「{name}」を新規作成")),
@@ -1891,6 +2239,30 @@ impl App {
             let Some(p) = self.palette.take() else { return };
             match &p.items[i] {
                 PaletteItem::Note(path) => actions.push(Action::Open(path.clone(), None)),
+                PaletteItem::Template(path) if p.mode == PaletteMode::InsertTemplate => {
+                    let title = self
+                        .current()
+                        .map(|t| t.title().to_string())
+                        .unwrap_or_default();
+                    let text = self
+                        .vault
+                        .as_ref()
+                        .and_then(|v| v.render_template(path, &title));
+                    if let Some(text) = text {
+                        self.insert_at_cursor(&text);
+                    }
+                }
+                PaletteItem::Template(path) => {
+                    let dir = self
+                        .current()
+                        .map(|t| parent_dir(&t.path).to_string())
+                        .unwrap_or_default();
+                    self.dialog = Some(Dialog::NewNote {
+                        dir,
+                        name: String::new(),
+                        template: Some(path.clone()),
+                    });
+                }
                 PaletteItem::Create(name) => self.create_and_open(name),
                 PaletteItem::Cmd(ci) => actions.push(Action::Run(COMMANDS[*ci].0)),
             }
@@ -1916,12 +2288,20 @@ impl App {
                 response.request_focus();
             };
             match dialog {
-                Dialog::NewNote { dir, name } => {
-                    let title = if dir.is_empty() {
+                Dialog::NewNote {
+                    dir,
+                    name,
+                    template,
+                } => {
+                    let mut title = if dir.is_empty() {
                         "新規ノート".to_string()
                     } else {
                         format!("新規ノート（{dir}/）")
                     };
+                    if let Some(t) = template {
+                        let t = file_name(t);
+                        title.push_str(&format!(" ・テンプレート: {}", t.trim_end_matches(".md")));
+                    }
                     input(ui, &title, "ノート名（フォルダ/名前 も可）", name);
                 }
                 Dialog::NewFolder { dir, name } => {
@@ -1968,8 +2348,12 @@ impl App {
             }
         };
         match self.dialog.take() {
-            Some(Dialog::NewNote { dir, name }) if !name.trim().is_empty() => {
-                self.create_and_open(&join(&dir, &name));
+            Some(Dialog::NewNote {
+                dir,
+                name,
+                template,
+            }) if !name.trim().is_empty() => {
+                self.create_from(&join(&dir, &name), template.as_deref());
             }
             Some(Dialog::NewFolder { dir, name }) if !name.trim().is_empty() => {
                 if let Some(vault) = self.vault.as_mut() {
@@ -2029,6 +2413,7 @@ fn tree_ui(
                 actions.push(Action::Dialog(Dialog::NewNote {
                     dir: path.clone(),
                     name: String::new(),
+                    template: None,
                 }));
             }
             if ui.button("ここに新規フォルダ").clicked() {
@@ -2063,6 +2448,9 @@ fn tree_ui(
             });
         }
         row.context_menu(|ui| {
+            if *note && ui.button("ブックマークに追加 / 解除").clicked() {
+                actions.push(Action::ToggleBookmark(path.clone()));
+            }
             if *note && ui.button("履歴…").clicked() {
                 actions.push(Action::History(path.clone()));
             }
@@ -2097,6 +2485,19 @@ impl eframe::App for App {
         let mut actions = Vec::new();
         if self.palette.is_none() {
             self.shortcuts(&ctx, &mut actions);
+            // マウスの「戻る/進む」ボタン
+            let (back, forward) = ctx.input(|i| {
+                (
+                    i.pointer.button_pressed(egui::PointerButton::Extra1),
+                    i.pointer.button_pressed(egui::PointerButton::Extra2),
+                )
+            });
+            if back {
+                actions.push(Action::Run(Command::GoBack));
+            }
+            if forward {
+                actions.push(Action::Run(Command::GoForward));
+            }
         }
 
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));

@@ -56,7 +56,12 @@ enum Cmd {
         name: String,
         #[arg(short, long, allow_hyphen_values = true)]
         content: Option<String>,
+        /// テンプレート名（テンプレートフォルダ内のノート）。本文の前に展開する
+        #[arg(short, long)]
+        template: Option<String>,
     },
+    /// テンプレートの一覧
+    Templates,
     /// 今日のデイリーノートを（無ければ作って）パスを表示する
     Daily {
         /// 追記するテキスト
@@ -235,7 +240,11 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::New { name, content } => {
+        Cmd::New {
+            name,
+            content,
+            template,
+        } => {
             let content = match content.as_deref() {
                 Some("-") => {
                     let mut s = String::new();
@@ -245,9 +254,26 @@ fn run(cli: Cli) -> Result<()> {
                 Some(c) => c.to_string(),
                 None => String::new(),
             };
+            let content = match template {
+                Some(t) => {
+                    let tpl = vault
+                        .find_template(&t)
+                        .with_context(|| format!("template not found: {t}"))?
+                        .to_string();
+                    let title = name
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&name)
+                        .trim_end_matches(".md");
+                    let body = vault.render_template(&tpl, title).unwrap_or_default();
+                    body + &content
+                }
+                None => content,
+            };
             let rel = vault.create_note(&name, &content)?;
             out.lines([vault.abs(&rel).display().to_string()])?;
         }
+        Cmd::Templates => out.lines(vault.templates())?,
         Cmd::Daily { append } => {
             let rel = vault.daily()?;
             if let Some(text) = append {

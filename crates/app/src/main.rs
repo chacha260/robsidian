@@ -8,6 +8,7 @@ mod graph;
 mod highlight;
 mod history_view;
 mod preview;
+mod workspace;
 
 use eframe::egui;
 use std::path::{Path, PathBuf};

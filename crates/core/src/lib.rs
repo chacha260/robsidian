@@ -5,6 +5,7 @@
 pub mod history;
 pub mod parse;
 pub mod search;
+pub mod template;
 pub mod vault;
 
 pub use parse::{Heading, Link, LinkKind, Parsed};
