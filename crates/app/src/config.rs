@@ -67,6 +67,9 @@ pub struct Config {
     /// 分割したもう一方のペインのノート
     pub split: Option<String>,
     pub split_focus_right: bool,
+    /// 実行を許可したユーザーコマンドの設定ファイル（vaultのパス → 許可したときの内容）。
+    /// vaultの外に置くことで、vaultを受け取っただけでは許可されない
+    pub trusted_commands: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -92,6 +95,7 @@ impl Default for Config {
             vim: false,
             split: None,
             split_focus_right: false,
+            trusted_commands: Default::default(),
         }
     }
 }

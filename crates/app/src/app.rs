@@ -3,6 +3,7 @@
 use crate::config::{Config, ViewMode};
 use crate::edit;
 use crate::editor::{self, Colors};
+use crate::external::{self, GitEvent, TrustOutcome};
 use crate::find;
 use crate::fonts;
 use crate::graph::Graph;
@@ -19,6 +20,7 @@ use eframe::egui::{
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::Watcher as _;
+use robsidian_core::usercmd::{self, Input, Output, UserCommand};
 use robsidian_core::vault::{file_name, is_note_path, parent_dir};
 use robsidian_core::{parse, search, Heading, Mention, NoteHit, Vault};
 use std::collections::HashMap;
@@ -67,6 +69,7 @@ enum Command {
     AddProperty,
     ToggleTheme,
     Rescan,
+    GitCommit,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -111,6 +114,7 @@ impl Command {
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
+            Command::GitCommit => "git commit snapshot save version",
         }
     }
 }
@@ -207,6 +211,7 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
+    (Command::GitCommit, "gitにスナップショットをコミット", None),
 ];
 
 enum Action {
@@ -231,6 +236,8 @@ enum Action {
     /// 未リンクの言及をリンクにする（言及, リンク先のノート）
     LinkMentions(Vec<Mention>, String),
     ToggleBookmark(String),
+    /// ユーザーコマンドを実行する（`UserCommands::list` の番号）
+    RunUser(usize),
 }
 
 enum Dialog {
@@ -332,6 +339,8 @@ enum PaletteItem {
     Template(String),
     Create(String),
     Cmd(usize),
+    /// ユーザーコマンド（`.robsidian/commands.toml`）
+    User(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -496,6 +505,14 @@ pub struct App {
     focus_right: bool,
     /// このフレームでクリックされた、フォーカスの無いペイン
     pane_clicked: bool,
+    user_cmds: external::UserCommands,
+    jobs: Vec<external::Job>,
+    /// 実行の許可を待っているユーザーコマンド
+    /// (実行を頼まれたコマンド, 許可を求めている設定ファイルの本文)
+    trust_prompt: Option<(external::Request, String)>,
+    git: external::GitState,
+    /// コミットメッセージの入力中
+    commit_message: Option<String>,
 }
 
 impl App {
@@ -553,6 +570,11 @@ impl App {
             other: None,
             focus_right: false,
             pane_clicked: false,
+            user_cmds: Default::default(),
+            jobs: Vec::new(),
+            trust_prompt: None,
+            git: Default::default(),
+            commit_message: None,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -618,6 +640,11 @@ impl App {
                 vault.history_limits = self.cfg.history_limits();
                 self.nav_back.clear();
                 self.nav_forward.clear();
+                self.user_cmds = Default::default();
+                self.jobs.clear();
+                self.trust_prompt = None;
+                self.git = external::GitState::detect(vault.root());
+                self.commit_message = None;
                 self.vault = Some(vault);
                 self.generation += 1;
                 self.cfg.save();
@@ -661,6 +688,7 @@ impl App {
             for paths in rx.try_iter() {
                 for abs in paths {
                     let Some(rel) = vault.rel(&abs) else { continue };
+                    self.git.mark_stale();
                     if is_note_path(&rel) {
                         changed |= vault.reload(&rel);
                     } else {
@@ -741,6 +769,7 @@ impl App {
                 tab.edited_at = None;
                 tab.base.clone_from(&tab.text);
                 self.generation += 1;
+                self.git.mark_stale();
             }
             Err(e) => {
                 // 失敗し続けて毎フレーム再試行しないよう、次の編集まで自動保存を止める
@@ -1211,13 +1240,249 @@ impl App {
                     self.generation += 1;
                     self.sync_tabs();
                 }
+                self.user_cmds.recheck();
+                self.git.mark_stale();
+            }
+            Command::GitCommit => {
+                if !self.git.repo {
+                    self.toast("このvaultはgitのリポジトリの中にありません");
+                } else if self.git.committing() {
+                    self.toast("コミット中です");
+                } else {
+                    self.save_all();
+                    self.commit_message = Some(external::snapshot_message());
+                }
             }
         }
     }
 
     fn open_history(&mut self, path: &str) {
         if let Some(vault) = &self.vault {
-            self.history = Some(HistoryView::new(vault.root(), path));
+            self.history = Some(HistoryView::new(vault.root(), path, self.git.repo));
+        }
+    }
+
+    // ---- ユーザーコマンドとgit ----
+
+    /// 設定ファイルの更新の確認と、実行中のコマンド・gitの結果の受け取り。
+    fn poll_external(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.vault.as_ref().map(|v| v.root().to_path_buf()) else {
+            return;
+        };
+        if let Some(err) = self.user_cmds.refresh(&root) {
+            self.toast(err);
+        }
+        let mut i = 0;
+        while i < self.jobs.len() {
+            match self.jobs[i].poll() {
+                Some(result) => {
+                    let job = self.jobs.remove(i);
+                    self.finish_job(job, result, ctx);
+                }
+                None => i += 1,
+            }
+        }
+        match self.git.poll(&root, ctx) {
+            Some(GitEvent::Committed(hash)) => self.toast(format!("コミットしました: {hash}")),
+            Some(GitEvent::NothingToCommit) => self.toast("コミットする変更はありません"),
+            Some(GitEvent::Failed(e)) => self.toast(format!("コミットできません: {e}")),
+            None => {}
+        }
+    }
+
+    /// ユーザーコマンドを実行する。設定ファイルが未許可なら、先に許可を求める。
+    fn run_user(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(root) = self.vault.as_ref().map(|v| v.root().to_path_buf()) else {
+            return;
+        };
+        // 許可した内容と比べるので、最新の内容を読んでおく
+        self.user_cmds.recheck();
+        if let Some(err) = self.user_cmds.refresh(&root) {
+            self.toast(err);
+            return;
+        }
+        let Some(cmd) = self.user_cmds.list.get(i).cloned() else {
+            return;
+        };
+        let Some(req) = self.prepare_user(cmd, ctx) else {
+            return;
+        };
+        let trusted = self.cfg.trusted_commands.get(&root.display().to_string());
+        if trusted != Some(&self.user_cmds.text) {
+            self.trust_prompt = Some((req, self.user_cmds.text.clone()));
+            return;
+        }
+        self.jobs.push(external::Job::spawn(req, root, ctx));
+    }
+
+    /// 実行に使う入力（選択範囲・本文）と環境を、いまのエディタの状態から決める。
+    fn prepare_user(&mut self, cmd: UserCommand, ctx: &egui::Context) -> Option<external::Request> {
+        let uses_note =
+            cmd.input != Input::None || matches!(cmd.output, Output::Replace | Output::Insert);
+        if uses_note && self.tabs.get(self.active).is_none() {
+            self.toast("ノートを開いてから実行してください");
+            return None;
+        }
+        // $ROB_FILE を読むコマンドが編集中の内容を見られるよう、先に保存する
+        self.save_tab(self.active);
+        let Some(tab) = self.tabs.get(self.active) else {
+            return Some(external::Request {
+                cmd,
+                env: usercmd::Env::default(),
+                path: None,
+                version: 0,
+                range: 0..0,
+                input: String::new(),
+            });
+        };
+        let sel = selection_bytes(ctx, tab);
+        let (range, input) = match cmd.input {
+            Input::Note => (0..tab.text.len(), tab.text.clone()),
+            Input::Selection => (sel.clone(), tab.text[sel].to_string()),
+            Input::None => (sel, String::new()),
+        };
+        let line = tab.text[..range.start].matches('\n').count() + 1;
+        Some(external::Request {
+            cmd,
+            env: usercmd::Env {
+                note: Some(tab.path.clone()),
+                line: Some(line),
+            },
+            path: Some(tab.path.clone()),
+            version: tab.version,
+            range,
+            input,
+        })
+    }
+
+    /// 終わったユーザーコマンドの出力を反映する。
+    fn finish_job(
+        &mut self,
+        job: external::Job,
+        result: anyhow::Result<usercmd::Finished>,
+        ctx: &egui::Context,
+    ) {
+        let name = &job.name;
+        let done = match result {
+            Ok(done) => done,
+            Err(e) => return self.toast(format!("「{name}」を実行できません: {e:#}")),
+        };
+        if !done.success {
+            return self.toast(format!("「{name}」が失敗しました: {}", done.error_line()));
+        }
+        match job.output {
+            Output::None => self.toast(format!("「{name}」を実行しました")),
+            Output::Notice => {
+                let msg = done.stdout.trim();
+                let msg = if msg.is_empty() {
+                    format!("「{name}」を実行しました")
+                } else {
+                    let mut short: String = msg.chars().take(500).collect();
+                    if short.len() < msg.len() {
+                        short.push('…');
+                    }
+                    short
+                };
+                self.toast(msg);
+            }
+            Output::Replace | Output::Insert => {
+                let Some(path) = job.path.as_deref() else {
+                    return;
+                };
+                let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) else {
+                    return self.toast(format!(
+                        "ノートが閉じられたので「{name}」の結果を反映しませんでした"
+                    ));
+                };
+                if tab.version != job.version {
+                    return self.toast(format!(
+                        "実行中にノートが変わったので「{name}」の結果を反映しませんでした"
+                    ));
+                }
+                let (range, out) = if job.output == Output::Replace {
+                    (
+                        job.range.clone(),
+                        usercmd::fit_output(&job.input, &done.stdout),
+                    )
+                } else {
+                    let end = job.range.end;
+                    (end..end, usercmd::fit_output("", &done.stdout))
+                };
+                let mut text = tab.text.clone();
+                text.replace_range(range.clone(), &out);
+                let end = range.start + out.len();
+                replace_text_undoable(ctx, tab, text, range.start..end);
+                // すぐ Ctrl+Z で戻せるよう、エディタにフォーカスを戻す
+                tab.focus = true;
+            }
+        }
+    }
+
+    /// ユーザーコマンドの許可と、gitのコミットメッセージの入力。
+    fn external_ui(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.vault.as_ref().map(|v| v.root().to_path_buf()) else {
+            return;
+        };
+        if let Some((_, text)) = &self.trust_prompt {
+            match external::trust_ui(ctx, &root, text) {
+                Some(TrustOutcome::Allow) => {
+                    // 見せた内容を許可し、その内容から読んだコマンドを実行する
+                    if let Some((req, text)) = self.trust_prompt.take() {
+                        let key = root.display().to_string();
+                        self.cfg.trusted_commands.insert(key, text);
+                        self.cfg.save();
+                        self.jobs.push(external::Job::spawn(req, root.clone(), ctx));
+                    }
+                }
+                Some(TrustOutcome::Cancel) => self.trust_prompt = None,
+                None => {}
+            }
+        }
+        let Some(message) = self.commit_message.as_mut() else {
+            return;
+        };
+        let changes = self.git.changes;
+        let mut commit = None;
+        let modal = egui::Modal::new(egui::Id::unique("git-commit")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("gitにスナップショットをコミット");
+            ui.label(match changes {
+                Some(n) => format!("vault以下の{n}件の変更をコミットします。"),
+                None => "vault以下の変更をすべてコミットします。".to_string(),
+            });
+            ui.add_space(4.0);
+            let edit = TextEdit::singleline(message)
+                .hint_text("コミットメッセージ")
+                .desired_width(f32::INFINITY);
+            let r = ui.add(edit);
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                commit = Some(true);
+            } else {
+                r.request_focus();
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("コミット").clicked() {
+                    commit = Some(true);
+                }
+                if ui.button("キャンセル").clicked() {
+                    commit = Some(false);
+                }
+            });
+        });
+        if commit.is_none() && modal.should_close() {
+            commit = Some(false);
+        }
+        match commit {
+            Some(true) => {
+                let mut message = self.commit_message.take().unwrap_or_default();
+                if message.trim().is_empty() {
+                    message = external::snapshot_message();
+                }
+                self.git.commit(&root, message.trim().to_string(), ctx);
+            }
+            Some(false) => self.commit_message = None,
+            None => {}
         }
     }
 
@@ -1942,11 +2207,17 @@ impl App {
             Action::PasteImage(image) => self.paste_image(&image),
             Action::LinkMentions(mentions, target) => self.link_mentions(&mentions, &target),
             Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
+            Action::RunUser(i) => self.run_user(i, ctx),
         }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.dialog.is_some() || self.history.is_some() || self.settings.is_some() {
+        if self.dialog.is_some()
+            || self.history.is_some()
+            || self.settings.is_some()
+            || self.trust_prompt.is_some()
+            || self.commit_message.is_some()
+        {
             return;
         }
         // Vimのノーマルモードで編集中は、Ctrl+D（半画面移動）をエディタに渡す
@@ -1956,6 +2227,12 @@ impl App {
                 .current()
                 .is_some_and(|t| ctx.memory(|m| m.has_focus(editor_id(&t.path))));
         ctx.input_mut(|input| {
+            // ユーザーコマンドを先に見る（修飾キーまで完全一致。組み込みより具体的な指定なので優先する）
+            for (i, key) in self.user_cmds.keys.iter().enumerate() {
+                if key.is_some_and(|k| external::consume_exact(input, k)) {
+                    actions.push(Action::RunUser(i));
+                }
+            }
             for &(cmd, _, shortcut) in COMMANDS {
                 if vim_normal && cmd == Command::Daily {
                     continue;
@@ -2003,6 +2280,7 @@ impl App {
     // ---- 画面 ----
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut commit = false;
         ui.horizontal(|ui| {
             if let Some(vault) = &self.vault {
                 let name = vault
@@ -2022,6 +2300,25 @@ impl App {
                 };
                 ui.label(RichText::new(label).monospace().strong());
             }
+            if self.git.repo {
+                let label = match self.git.changes {
+                    _ if self.git.committing() => "git: コミット中…".to_string(),
+                    Some(0) => "git: 変更なし".to_string(),
+                    Some(n) => format!("git: {n}件の変更"),
+                    None => "git".to_string(),
+                };
+                let button = egui::Button::new(RichText::new(label).weak()).frame(false);
+                if ui
+                    .add(button)
+                    .on_hover_text("クリックでスナップショットをコミット")
+                    .clicked()
+                {
+                    commit = true;
+                }
+            }
+            for job in &self.jobs {
+                ui.weak(format!("「{}」を実行中…", job.name));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(tab) = self.tabs.get(self.active) {
                     ui.weak(if tab.dirty {
@@ -2037,6 +2334,10 @@ impl App {
                 }
             });
         });
+        if commit {
+            let ctx = ui.ctx().clone();
+            self.run(Command::GitCommit, &ctx);
+        }
     }
 
     fn left_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -3569,6 +3870,9 @@ impl App {
                     c.1.to_lowercase().contains(&q) || c.0.keywords().contains(q.as_str())
                 });
                 p.items.extend(hits.map(|(i, _)| PaletteItem::Cmd(i)));
+                let user = self.user_cmds.list.iter().enumerate();
+                let user = user.filter(|(_, c)| c.name.to_lowercase().contains(&q));
+                p.items.extend(user.map(|(i, _)| PaletteItem::User(i)));
             } else if let Some(vault) = &self.vault {
                 let mut notes = search::fuzzy(vault, q, 30);
                 if q.is_empty() {
@@ -3665,6 +3969,19 @@ impl App {
                                     })
                                     .inner
                                 }
+                                PaletteItem::User(ui_idx) => {
+                                    let cmd = &self.user_cmds.list[*ui_idx];
+                                    let key = self.user_cmds.keys[*ui_idx];
+                                    ui.horizontal(|ui| {
+                                        let r = ui.selectable_label(selected, &cmd.name);
+                                        if let Some(k) = key {
+                                            ui.weak(ui.ctx().format_shortcut(&k));
+                                        }
+                                        ui.weak("ユーザーコマンド");
+                                        r
+                                    })
+                                    .inner
+                                }
                             };
                             if selected && (up || down) {
                                 row.scroll_to_me(None);
@@ -3717,6 +4034,7 @@ impl App {
                 }
                 PaletteItem::Create(name) => self.create_and_open(name),
                 PaletteItem::Cmd(ci) => actions.push(Action::Run(COMMANDS[*ci].0)),
+                PaletteItem::User(i) => actions.push(Action::RunUser(*i)),
             }
         } else if close {
             self.palette = None;
@@ -3851,6 +4169,22 @@ fn side_margin(available: f32, cfg: &Config) -> f32 {
         ((available - cfg.max_width) / 2.0).max(MIN)
     } else {
         MIN
+    }
+}
+
+/// エディタの選択範囲（バイト位置）。選択が無ければカーソル位置の空の範囲。
+fn selection_bytes(ctx: &egui::Context, tab: &Tab) -> std::ops::Range<usize> {
+    let state = TextEdit::load_state(ctx, editor_id(&tab.path));
+    match state.and_then(|s| s.cursor.char_range()) {
+        Some(r) => {
+            let a = editor::byte_of_char(&tab.text, r.primary.index.0);
+            let b = editor::byte_of_char(&tab.text, r.secondary.index.0);
+            a.min(b)..a.max(b)
+        }
+        None => {
+            let c = tab.cursor.min(tab.text.len());
+            c..c
+        }
     }
 }
 
@@ -4137,6 +4471,7 @@ impl eframe::App for App {
         self.apply_style(&ctx);
         self.poll_watcher(&ctx);
         self.autosave(&ctx);
+        self.poll_external(&ctx);
         // ウィンドウからフォーカスが外れたら即保存する
         if ctx.input(|i| {
             i.events
@@ -4199,6 +4534,7 @@ impl eframe::App for App {
         self.palette_ui(&ctx, &mut actions);
         self.dialog_ui(&ctx);
         self.history_ui(&ctx);
+        self.external_ui(&ctx);
         self.settings_ui(&ctx);
         self.file_dialog.update(&ctx);
         if let Some(path) = self.file_dialog.take_picked() {
