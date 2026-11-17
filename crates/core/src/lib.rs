@@ -4,6 +4,7 @@
 
 pub mod git;
 pub mod history;
+pub mod math;
 pub mod parse;
 pub mod props;
 pub mod related;

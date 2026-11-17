@@ -11,6 +11,7 @@ use std::process::{Command, Output};
 const EXCLUDES: &[&str] = &[
     ":(exclude).robsidian/history",
     ":(exclude).robsidian/workspace.json",
+    ":(exclude).robsidian/cache",
 ];
 
 fn git(root: &Path) -> Command {

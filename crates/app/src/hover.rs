@@ -75,6 +75,7 @@ pub fn note_preview(
     let src = preview::to_preview(&src, path, vault);
     CommonMarkViewer::new()
         .alerts(preview::alerts())
+        .render_math_fn(Some(&crate::math_view::show))
         .max_image_width(Some(WIDTH as usize - 20))
         .show_with_id(egui::Id::unique(("hover-preview", path)), ui, cache, &src);
 }
@@ -108,6 +109,7 @@ pub fn embed_ui(
     );
     CommonMarkViewer::new()
         .alerts(preview::alerts())
+        .render_math_fn(Some(&crate::math_view::show))
         .max_image_width(Some(ui.available_width().max(80.0) as usize))
         .show_with_id(egui::Id::unique(("embed", path, heading)), ui, cache, &md);
 }

@@ -47,6 +47,21 @@ const LATIN_BOLD_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 ];
 
+/// 数式の変数に使う斜体（セリフ体）の候補。
+const MATH_ITALIC_FONTS: &[&str] = &[
+    "C:/Windows/Fonts/cambriai.ttf",
+    "C:/Windows/Fonts/timesi.ttf",
+    "/System/Library/Fonts/Supplemental/Times New Roman Italic.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSerif-Italic.ttf",
+];
+
+/// 数式の変数に使うフォントファミリー。斜体のフォントが無ければ通常のフォントで描かれる。
+pub fn math_italic() -> egui::FontFamily {
+    egui::FontFamily::Name("math-italic".into())
+}
+
 /// エディタの太字・見出しに使うフォントファミリー。太字のフォントが無ければ通常のフォントで描かれる。
 pub fn bold() -> egui::FontFamily {
     egui::FontFamily::Name("bold".into())
@@ -97,11 +112,23 @@ pub fn install(ctx: &egui::Context, configured: Option<&Path>) -> Option<PathBuf
             bold_fonts.push(name.to_owned());
         }
     }
+    // 数式の斜体: 斜体のセリフ体 → 通常のフォント
+    let mut italic_fonts: Vec<String> = Vec::new();
+    if let Some(bytes) = first_readable(MATH_ITALIC_FONTS) {
+        fonts.font_data.insert(
+            "math-italic".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        italic_fonts.push("math-italic".to_owned());
+    }
+    italic_fonts.extend(regular.iter().cloned());
     bold_fonts.extend(regular);
     if found.is_some() {
         bold_fonts.push("cjk".to_owned());
+        italic_fonts.push("cjk".to_owned());
     }
     fonts.families.insert(bold(), bold_fonts);
+    fonts.families.insert(math_italic(), italic_fonts);
     ctx.set_fonts(fonts);
     found.map(|(p, _)| p)
 }

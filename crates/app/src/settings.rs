@@ -111,6 +111,14 @@ impl SettingsView {
                         ui.add(Slider::new(&mut cfg.autosave_secs, 0.3..=10.0).suffix(" 秒"));
                     });
 
+                    section(ui, "プレビュー");
+                    ui.horizontal(|ui| {
+                        ui.label("Mermaid図のコマンド");
+                        ui.add(egui::TextEdit::singleline(&mut cfg.mermaid_command).desired_width(240.0))
+                            .on_hover_text("後ろに -i 入力 -o 出力 -b transparent -t テーマ を付けて実行します。空にすると使いません");
+                    });
+                    ui.weak("mermaid-cli（mmdc）が入っていれば、```mermaid の図を画像にして表示します");
+
                     section(ui, "ローカル履歴");
                     ui.weak("保存で上書きされる直前の内容を .robsidian/history に残します");
                     egui::Grid::new("history")

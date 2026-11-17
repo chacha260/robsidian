@@ -9,6 +9,7 @@ use crate::fonts;
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
 use crate::hover;
+use crate::math_view;
 use crate::preview;
 use crate::props_ui::PropsPanel;
 use crate::settings::SettingsView;
@@ -517,6 +518,7 @@ pub struct App {
     /// コミットメッセージの入力中
     commit_message: Option<String>,
     theme: crate::theme::ThemeFile,
+    mermaid: crate::mermaid::Mermaid,
     /// 関連ノート: (索引の世代, ノートのパス, 計算した時刻, 結果)
     related: Option<(u64, String, Instant, Vec<robsidian_core::related::Related>)>,
 }
@@ -583,6 +585,7 @@ impl App {
             commit_message: None,
             theme: Default::default(),
             related: None,
+            mermaid: Default::default(),
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -1259,6 +1262,10 @@ impl App {
                 }
                 self.user_cmds.recheck();
                 self.git.mark_stale();
+                self.mermaid.forget_failures();
+                for tab in &mut self.tabs {
+                    tab.preview = None;
+                }
             }
             Command::GitCommit => {
                 if !self.git.repo {
@@ -1291,6 +1298,12 @@ impl App {
         }
         if let Some(err) = self.theme.refresh(&root) {
             self.toast(err);
+        }
+        // Mermaid図ができたら、プレビューを作り直す
+        if self.mermaid.poll() {
+            for tab in &mut self.tabs {
+                tab.preview = None;
+            }
         }
         let mut i = 0;
         while i < self.jobs.len() {
@@ -3269,6 +3282,16 @@ impl App {
         let Tab { text, layout, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
+                let math_size = |tex: &str, display: bool| {
+                    let b = math_view::layout(
+                        &ctx,
+                        tex,
+                        math_font(size, display),
+                        display,
+                        colors.text,
+                    );
+                    Some(b.size())
+                };
                 let options = editor::Options {
                     size,
                     colors: &colors,
@@ -3276,6 +3299,7 @@ impl App {
                     cursor,
                     image: &image_size,
                     note_embed: &note_embed,
+                    math: &math_size,
                     hide_frontmatter: live,
                     marks,
                     current_mark,
@@ -3565,6 +3589,27 @@ impl App {
                         ctx.request_repaint();
                     }
                 }
+                editor::DecoKind::Math { tex, display } => {
+                    let m = math_view::layout(
+                        &ctx,
+                        tex,
+                        math_font(size, *display),
+                        *display,
+                        colors.text,
+                    );
+                    let (x, center) = if *display {
+                        (
+                            (left + right) / 2.0 - m.w / 2.0,
+                            (a.top() + b.bottom()) / 2.0,
+                        )
+                    } else {
+                        // 確保した字間の右端から数式の幅だけ戻る（字間が文字の前後どちらに付いても合う）
+                        (b.left() - m.w, a.center().y)
+                    };
+                    // 上下の中心を、確保した場所の中心にそろえる
+                    let baseline = center + (m.asc - m.desc) / 2.0;
+                    m.paint(&painter, egui::pos2(x, baseline), colors.text);
+                }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;
@@ -3845,6 +3890,7 @@ impl App {
             generation,
             active,
             cfg,
+            mermaid,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -3856,6 +3902,7 @@ impl App {
             .is_none_or(|(v, g, _)| (*v, *g) != (tab.version, *generation))
         {
             let src = preview::to_preview(&tab.text, &tab.path, vault);
+            let src = mermaid_images(&src, vault.root(), mermaid, cfg, ui.ctx());
             tab.preview = Some((tab.version, *generation, src));
         }
         let Some((_, _, src)) = &tab.preview else {
@@ -3876,6 +3923,7 @@ impl App {
                         let width = ui.available_width().max(100.0) as usize;
                         CommonMarkViewer::new()
                             .alerts(preview::alerts())
+                            .render_math_fn(Some(&crate::math_view::show))
                             .max_image_width(Some(width))
                             .show_mut(ui, md_cache, &mut rendered);
                     });
@@ -4252,6 +4300,63 @@ fn side_margin(available: f32, cfg: &Config) -> f32 {
         ((available - cfg.max_width) / 2.0).max(MIN)
     } else {
         MIN
+    }
+}
+
+/// プレビューの ```mermaid ブロックを、画像ができていれば画像に置き換える。
+/// 作成中・失敗のときは、コードのまま見せて一言添える。
+fn mermaid_images(
+    src: &str,
+    root: &std::path::Path,
+    mermaid: &mut crate::mermaid::Mermaid,
+    cfg: &Config,
+    ctx: &egui::Context,
+) -> String {
+    use crate::mermaid::State;
+    let blocks = crate::mermaid::blocks(src);
+    if blocks.is_empty() {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut at = 0;
+    for (range, body) in blocks {
+        out.push_str(&src[at..range.start]);
+        let block = &src[range.clone()];
+        match mermaid.image(root, &body, cfg.dark, &cfg.mermaid_command, ctx) {
+            Some(State::Ready(png)) => {
+                let uri = png.display().to_string().replace('\\', "/");
+                let uri = if uri.starts_with('/') {
+                    format!("file://{uri}")
+                } else {
+                    format!("file:///{uri}")
+                };
+                // 空白を含むパスでも切れないよう <…> で囲む（エンコードはしない。読み込み側が解かないため）
+                out.push_str(&format!("![Mermaid](<{uri}>)\n"));
+            }
+            Some(State::Pending) => {
+                out.push_str("*Mermaid図を作成中…*\n\n");
+                out.push_str(block);
+            }
+            Some(State::Failed(e)) => {
+                out.push_str(&format!(
+                    "*Mermaid図を作れませんでした: {e}（コマンドは設定で変えられます）*\n\n"
+                ));
+                out.push_str(block);
+            }
+            None => out.push_str(block),
+        }
+        at = range.end;
+    }
+    out.push_str(&src[at..]);
+    out
+}
+
+/// 数式の文字の大きさ（表示数式は少し大きくする）
+fn math_font(size: f32, display: bool) -> f32 {
+    if display {
+        size * 1.1
+    } else {
+        size
     }
 }
 
