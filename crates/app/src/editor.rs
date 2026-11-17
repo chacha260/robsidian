@@ -133,6 +133,8 @@ pub struct Options<'a> {
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
     /// 埋め込んだノート（`ノート#見出し`）を描く高さ。ノートでなければ None
     pub note_embed: &'a dyn Fn(&str) -> Option<f32>,
+    /// frontmatterを畳む（プロパティ欄を出しているとき）
+    pub hide_frontmatter: bool,
     /// 検索で一致した範囲（バイト位置）と、そのうち選択中のものの番号
     pub marks: &'a [Range<usize>],
     pub current_mark: Option<usize>,
@@ -560,7 +562,13 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         let hide = p.hidden(p.ahead(line));
 
         if in_frontmatter {
-            p.push(raw, p.mono(p.c.dim));
+            // ライブ表示では、frontmatterはプロパティ欄で見せるので本文からは畳む
+            let format = if opt.hide_frontmatter {
+                p.mark(true)
+            } else {
+                p.mono(p.c.dim)
+            };
+            p.push(raw, format);
             if n > 0 && matches!(line.trim_end(), "---" | "...") {
                 in_frontmatter = false;
             }
@@ -922,6 +930,7 @@ mod tests {
                 cursor,
                 image: &image,
                 note_embed: &|_: &str| None,
+                hide_frontmatter: false,
             },
         )
     }
@@ -1039,6 +1048,7 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &|_: &str| None,
+                hide_frontmatter: false,
             },
         );
         assert_eq!(out.job.text, text);
@@ -1065,6 +1075,35 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_can_be_folded() {
+        let colors = Colors::new(true);
+        let text = "---\na: 1\n---\nbody";
+        let image = |_: &str| None;
+        let out = layout(
+            text,
+            &Options {
+                marks: &[],
+                current_mark: None,
+                size: 14.0,
+                colors: &colors,
+                live: true,
+                cursor: None,
+                image: &image,
+                note_embed: &|_: &str| None,
+                hide_frontmatter: true,
+            },
+        );
+        let hidden: String = out
+            .job
+            .sections
+            .iter()
+            .filter(|s| s.format.font_id.size == HIDDEN_SIZE)
+            .map(|s| &text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
+        assert_eq!(hidden, "---\na: 1\n---\n");
+    }
+
+    #[test]
     fn callouts_and_note_embeds() {
         let colors = Colors::new(true);
         let text = "> [!tip]- Title\n> body\nafter\n> [!note]\n> b\n![[Other#h]]\nend";
@@ -1081,6 +1120,7 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &embed,
+                hide_frontmatter: false,
             },
         );
         let kinds: Vec<String> = out

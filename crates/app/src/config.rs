@@ -64,6 +64,9 @@ pub struct Config {
     pub history_days: u64,
     /// Vimキーバインド（モーダル編集）
     pub vim: bool,
+    /// 分割したもう一方のペインのノート
+    pub split: Option<String>,
+    pub split_focus_right: bool,
 }
 
 impl Default for Config {
@@ -87,6 +90,8 @@ impl Default for Config {
             history_versions: 50,
             history_days: 30,
             vim: false,
+            split: None,
+            split_focus_right: false,
         }
     }
 }

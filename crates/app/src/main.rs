@@ -12,6 +12,7 @@ mod highlight;
 mod history_view;
 mod hover;
 mod preview;
+mod props_ui;
 mod settings;
 mod vim;
 mod workspace;

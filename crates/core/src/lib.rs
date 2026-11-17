@@ -4,6 +4,7 @@
 
 pub mod history;
 pub mod parse;
+pub mod props;
 pub mod search;
 pub mod task;
 pub mod template;
