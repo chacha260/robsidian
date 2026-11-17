@@ -3,6 +3,10 @@
 //! 出力は1行1件のプレーンテキスト（`--json` でJSON）なので、
 //! fzf / xargs / jq / nushell などにそのままパイプできる。
 
+mod export;
+mod lint;
+mod serve;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use robsidian_core::{search, Vault};
@@ -96,6 +100,27 @@ enum Cmd {
     },
     /// vaultの統計
     Stats,
+    /// リンク切れ・埋め込み先なし・曖昧なリンクなどを報告する（エラーがあれば終了コード1）
+    Lint {
+        /// 孤立ノートも警告する
+        #[arg(long)]
+        orphans: bool,
+        /// 警告もエラーとして扱う（終了コード1にする）
+        #[arg(long)]
+        strict: bool,
+    },
+    /// vaultを静的なHTMLサイトとして書き出す
+    Export {
+        /// 書き出し先のフォルダ
+        out: PathBuf,
+        /// 空でないフォルダにも書き出す
+        #[arg(long)]
+        force: bool,
+    },
+    /// タグを改名する（本文の #タグ と子タグ、frontmatterの tags）
+    TagRename { old: String, new: String },
+    /// 標準入出力で、1行1リクエストのJSONに答え続ける（エディタ連携用）
+    Serve,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -411,6 +436,47 @@ fn run(cli: Cli) -> Result<()> {
                     writeln!(out.w, "}}")?;
                 }
             }
+        }
+        Cmd::Lint { orphans, strict } => {
+            let issues = lint::run(&vault, orphans);
+            let errors = issues
+                .iter()
+                .filter(|i| i.level == lint::Level::Error)
+                .count();
+            let warnings = issues.len() - errors;
+            if out.json {
+                out.value(&serde_json::to_value(&issues)?)?;
+            } else {
+                for i in &issues {
+                    let level = match i.level {
+                        lint::Level::Error => "error",
+                        lint::Level::Warning => "warning",
+                    };
+                    writeln!(
+                        out.w,
+                        "{}:{}: {level}[{}]: {}",
+                        i.path, i.line, i.code, i.message
+                    )?;
+                }
+            }
+            out.w.flush()?;
+            eprintln!("{errors}件のエラー、{warnings}件の警告");
+            if errors > 0 || (strict && warnings > 0) {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Export { out: dest, force } => {
+            let n = export::run(&vault, &dest, force)?;
+            eprintln!("{n}ページを {} に書き出しました", dest.display());
+        }
+        Cmd::TagRename { old, new } => {
+            let changed = vault.rename_tag(&old, &new)?;
+            eprintln!("{}件のノートを書き換えました", changed.len());
+            out.lines(changed)?;
+        }
+        Cmd::Serve => {
+            out.w.flush()?;
+            return serve::run(vault);
         }
         Cmd::Stats => {
             let links: usize = vault.notes().map(|n| n.parsed.links.len()).sum();

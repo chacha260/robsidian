@@ -985,6 +985,131 @@ impl Vault {
         Ok(updated)
     }
 
+    /// タグを改名する。本文の `#古い` と `#古い/子`、frontmatterの tags を書き換える。
+    /// 書き換えたノートのパスを返す。
+    pub fn rename_tag(&mut self, old: &str, new: &str) -> Result<Vec<String>> {
+        let old = old.trim().trim_start_matches('#');
+        let new = new.trim().trim_start_matches('#');
+        if old.is_empty() || new.is_empty() {
+            bail!("tag name is empty");
+        }
+        if new.contains(|c: char| c.is_whitespace() || c == '#') {
+            bail!("invalid tag name: {new}");
+        }
+        let lower = old.to_lowercase();
+        // 大文字小文字は区別しない（Obsidianと同じ）。子タグは残りの部分をそのまま保つ
+        let rename = |tag: &str| -> Option<String> {
+            let t = tag.to_lowercase();
+            if t == lower {
+                Some(new.to_string())
+            } else if t.starts_with(&format!("{lower}/")) {
+                Some(format!("{new}{}", &tag[old.len()..]))
+            } else {
+                None
+            }
+        };
+        let mut changes: Vec<(String, String)> = Vec::new();
+        for note in self.notes.values() {
+            let mut text = note.text.clone();
+            for span in note.parsed.tag_spans.iter().rev() {
+                if let Some(rep) = rename(&note.text[span.clone()]) {
+                    text.replace_range(span.clone(), &rep);
+                }
+            }
+            if let Some(props) = crate::props::read(&text) {
+                for p in props
+                    .iter()
+                    .filter(|p| matches!(p.key.as_str(), "tags" | "tag"))
+                {
+                    let value = match &p.value {
+                        crate::props::Value::List(items) => {
+                            let renamed: Vec<String> = items
+                                .iter()
+                                .map(|t| {
+                                    rename(t.trim_start_matches('#')).unwrap_or_else(|| t.clone())
+                                })
+                                .collect();
+                            (renamed != *items).then_some(crate::props::Value::List(renamed))
+                        }
+                        // `tags: a b` や `tags: a, b` のような1行の書き方
+                        crate::props::Value::Text(t) => {
+                            let parts: Vec<&str> =
+                                t.split([' ', ',']).filter(|s| !s.is_empty()).collect();
+                            let renamed: Vec<String> = parts
+                                .iter()
+                                .map(|s| {
+                                    rename(s.trim_start_matches('#'))
+                                        .unwrap_or_else(|| s.to_string())
+                                })
+                                .collect();
+                            let changed = renamed.iter().zip(&parts).any(|(a, b)| a != b);
+                            changed.then(|| crate::props::Value::Text(renamed.join(", ")))
+                        }
+                        crate::props::Value::Raw(_) => None,
+                    };
+                    if let Some(v) = value {
+                        text = crate::props::set(&text, &p.key, &v);
+                    }
+                }
+            }
+            if text != note.text {
+                changes.push((note.path.clone(), text));
+            }
+        }
+        let mut changed = Vec::new();
+        for (path, text) in changes {
+            self.write_note(&path, &text)?;
+            changed.push(path);
+        }
+        Ok(changed)
+    }
+
+    /// ディスクの状態に合わせて、変わったノートだけを読み直す（更新日時で判定）。
+    /// 添付ファイルやフォルダが増減していれば全体を読み直す。読み直したノートの数を返す。
+    pub fn refresh(&mut self) -> usize {
+        let mut seen: HashMap<String, u64> = HashMap::new();
+        let mut files = BTreeSet::new();
+        let walker = WalkDir::new(&self.root)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
+        for entry in walker.filter_map(|e| e.ok()) {
+            if entry.depth() == 0 || entry.file_type().is_dir() {
+                continue;
+            }
+            let Some(rel) = self.rel(entry.path()) else {
+                continue;
+            };
+            if is_note_path(&rel) {
+                seen.insert(rel, mtime_secs(entry.path()));
+            } else {
+                files.insert(rel);
+            }
+        }
+        if files != self.files {
+            self.rescan();
+            return self.notes.len();
+        }
+        let mut stale: Vec<String> = seen
+            .iter()
+            .filter(|(rel, mtime)| self.notes.get(*rel).is_none_or(|n| n.mtime != **mtime))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        stale.extend(
+            self.notes
+                .keys()
+                .filter(|rel| !seen.contains_key(*rel))
+                .cloned(),
+        );
+        stale.sort();
+        let mut count = 0;
+        for rel in stale {
+            if self.reload(&rel) {
+                count += 1;
+            }
+        }
+        count
+    }
+
     // ---- デイリーノート ----
 
     /// `.obsidian/<file>` の文字列設定を読む（空文字は無いものとして扱う）。
@@ -1294,6 +1419,42 @@ mod tests {
             .text
             .contains("[[Rust Notes|ラスト]]の話"));
         assert_eq!(v.unlinked_mentions("Rust Notes.md").len(), 1);
+    }
+
+    #[test]
+    fn tags_can_be_renamed() {
+        let (_d, mut v) = vault(&[
+            (
+                "a.md",
+                "---\ntags: [proj, other]\n---\n#proj と #Proj/sub と #project と `#proj`",
+            ),
+            ("b.md", "---\ntags: proj/x keep\n---\nbody"),
+            ("c.md", "#other"),
+        ]);
+        let changed = v.rename_tag("#proj", "work").unwrap();
+        assert_eq!(changed, ["a.md", "b.md"]);
+        assert_eq!(
+            v.note("a.md").unwrap().text,
+            "---\ntags:\n  - work\n  - other\n---\n#work と #work/sub と #project と `#proj`"
+        );
+        assert!(v
+            .note("b.md")
+            .unwrap()
+            .text
+            .starts_with("---\ntags: work/x, keep\n"));
+        assert!(v.tags().contains_key("work/sub"));
+        assert!(v.rename_tag("x", "a b").is_err());
+    }
+
+    #[test]
+    fn refresh_reloads_changed_notes() {
+        let (d, mut v) = vault(&[("a.md", "x"), ("b.md", "[[a]]")]);
+        assert_eq!(v.refresh(), 0);
+        fs::write(d.path().join("c.md"), "[[a]]").unwrap();
+        fs::remove_file(d.path().join("b.md")).unwrap();
+        assert_eq!(v.refresh(), 2);
+        assert!(v.note("c.md").is_some() && v.note("b.md").is_none());
+        assert_eq!(v.backlinks("a.md").len(), 1);
     }
 
     #[test]

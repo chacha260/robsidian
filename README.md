@@ -210,6 +210,21 @@ rob daily --append "- 14:00 打ち合わせ"
 | `rob mv <from> <to>` | 改名 / 移動（リンク追従） |
 | `rob graph [-f dot\|json]` | リンクグラフを出力 |
 | `rob stats` | 統計 |
+| `rob lint [--orphans] [--strict]` | リンク切れ・埋め込み先なし（エラー）、曖昧なリンク・孤立ノート（警告）を `path:行: level[code]: 内容` で報告。エラーがあれば終了コード1（`--strict` で警告も） |
+| `rob export <出力先> [--force]` | vaultを静的HTMLサイトに書き出す（リンクは相対パス、見出しへのアンカー、被リンク一覧付き） |
+| `rob tag-rename <旧> <新>` | タグの一括改名（本文の `#タグ`・子タグ・frontmatterの `tags`） |
+| `rob serve` | 標準入出力で1行1リクエストのJSONに答える常駐モード（下記） |
+
+`rob lint` はノートのリポジトリのCIにそのまま組み込めます。
+
+```bash
+rob lint --orphans --strict
+```
+
+`rob serve` は `{"id":1,"method":"search","params":{"query":"rust"}}` のような1行を受け取り、
+`{"id":1,"result":...}`（失敗時は `{"id":1,"error":"..."}`）を1行で返します。
+索引を持ち続け、リクエストのたびに変更のあったファイルだけ読み直します。
+メソッドは `stats` `list` `find` `search` `query` `tasks` `cat` `backlinks` `links` `resolve` `mentions` `write` `daily` です。
 
 ## 性能の目安
 
@@ -217,7 +232,8 @@ rob daily --append "- 14:00 打ち合わせ"
 
 | 項目 | 値 |
 |---|---|
-| CLIの起動〜索引化〜結果出力 | 約0.5秒 |
+| CLIの起動〜索引化〜結果出力 | 約0.4秒 |
+| 保存時の索引の更新（1ノート） | 1〜2ミリ秒（別名が変わったときだけ全体を作り直す） |
 | GUIのウィンドウ表示まで | 0.1秒台 |
 | GUIの常駐メモリ（上記vault / 5ノートのvault） | 約340MB / 約125MB（ソフトウェアGL環境での値） |
 | バイナリサイズ | GUI 約14MB、CLI 約3.5MB |
@@ -228,9 +244,9 @@ rob daily --append "- 14:00 打ち合わせ"
 
 正直なところ、まだ次のものはありません。
 
-- **モーダル編集（Helix / Vim キーバインド）** — エディタはeguiの標準テキスト編集です
+- **Helix風のモーダル編集** — Vimキーバインドのみです
 - **プラグイン / テーマ機構** — 旧Tauri版にあったJSプラグインAPIは廃止しました（ダーク/ライト切替のみ）
-- Mermaid・数式・コールアウトの描画、ペイン分割、内蔵ターミナル
+- Mermaid・数式の描画、内蔵ターミナル
 - 動作確認はLinux（X11）のみです。Windows / macOS はCIでビルドとテストを回す設定を入れてありますが、
   実機での確認（特に日本語IME入力）はこれからです
 
