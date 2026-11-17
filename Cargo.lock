@@ -378,6 +378,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -2568,7 +2569,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "robsidian"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2579,6 +2580,7 @@ dependencies = [
  "egui_extras",
  "image",
  "notify",
+ "pulldown-cmark",
  "regex",
  "robsidian-core",
  "serde",
@@ -2591,9 +2593,10 @@ dependencies = [
 
 [[package]]
 name = "robsidian-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "robsidian-core",
  "serde",
@@ -2602,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "robsidian-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "chrono",
