@@ -5,6 +5,7 @@ use crate::edit;
 use crate::editor::{self, Colors};
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
+use crate::hover;
 use crate::preview;
 use crate::workspace::{self, Workspace};
 use eframe::egui::text::{CCursor, CCursorRange};
@@ -14,7 +15,7 @@ use eframe::egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::Watcher as _;
 use robsidian_core::vault::{file_name, is_note_path, parent_dir};
-use robsidian_core::{parse, search, Heading, NoteHit, Vault};
+use robsidian_core::{parse, search, Heading, Mention, NoteHit, Vault};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -165,7 +166,10 @@ const COMMANDS: &[CommandEntry] = &[
 enum Action {
     Open(String, Option<usize>),
     OpenExternal(String),
-    FollowLink { target: String, from: String },
+    FollowLink {
+        target: String,
+        from: String,
+    },
     Activate(usize),
     Close(usize),
     Search(String),
@@ -174,6 +178,8 @@ enum Action {
     Run(Command),
     History(String),
     PasteImage(std::sync::Arc<egui::ColorImage>),
+    /// 未リンクの言及をリンクにする（言及, リンク先のノート）
+    LinkMentions(Vec<Mention>, String),
     ToggleBookmark(String),
 }
 
@@ -386,6 +392,10 @@ pub struct App {
     navigating: bool,
     file_dialog: egui_file_dialog::FileDialog,
     md_cache: CommonMarkCache,
+    /// ホバープレビュー用（本文のプレビューとはスクロールなどの状態を分ける）
+    hover_cache: CommonMarkCache,
+    /// 未リンクの言及: (索引の世代, ノートのパス, 結果)
+    mentions: Option<(u64, String, Vec<Mention>)>,
     graph: Graph,
     show_graph: bool,
     watcher: Option<(notify::RecommendedWatcher, mpsc::Receiver<Vec<PathBuf>>)>,
@@ -424,6 +434,8 @@ impl App {
             navigating: false,
             file_dialog: egui_file_dialog::FileDialog::new().title("vaultフォルダを選択"),
             md_cache: CommonMarkCache::default(),
+            hover_cache: CommonMarkCache::default(),
+            mentions: None,
             graph: Graph::new(true),
             show_graph: false,
             watcher: None,
@@ -432,7 +444,12 @@ impl App {
             applied_style: None,
             saved_session: (Vec::new(), 0),
         };
-        let restore = vault_arg.is_none();
+        // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
+        let same = |p: &PathBuf| {
+            let last = app.cfg.vault.as_ref().and_then(|v| v.canonicalize().ok());
+            last.is_some() && p.canonicalize().ok() == last
+        };
+        let restore = vault_arg.as_ref().is_none_or(same);
         if let Some(path) = vault_arg.or_else(|| app.cfg.vault.clone()) {
             let (tabs, active) = (std::mem::take(&mut app.cfg.open_tabs), app.cfg.active_tab);
             app.open_vault(path, &cc.egui_ctx);
@@ -1155,6 +1172,54 @@ impl App {
         self.insert_at_cursor(&format!("![[{shown}]]"));
     }
 
+    /// 未リンクの言及を `[[リンク]]` に書き換える。開いているタブはタブの本文を、
+    /// そうでなければファイルを書き換える。後ろの言及から順に処理するので範囲はずれない。
+    fn link_mentions(&mut self, mentions: &[Mention], target: &str) {
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let mut sorted: Vec<&Mention> = mentions.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then(b.range.start.cmp(&a.range.start))
+        });
+        let (mut done, mut skipped) = (0, 0);
+        for m in sorted {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == m.source) {
+                match vault.link_mention_text(&tab.text, m, target) {
+                    Some(new) => {
+                        tab.set_text(new);
+                        tab.dirty = true;
+                        tab.edited_at = Some(Instant::now());
+                        done += 1;
+                    }
+                    None => skipped += 1,
+                }
+                continue;
+            }
+            let Some(text) = vault.note(&m.source).map(|n| n.text.clone()) else {
+                skipped += 1;
+                continue;
+            };
+            match vault.link_mention_text(&text, m, target) {
+                Some(new) => match vault.write_note(&m.source, &new) {
+                    Ok(()) => done += 1,
+                    Err(_) => skipped += 1,
+                },
+                None => skipped += 1,
+            }
+        }
+        // 開いているタブの変更もすぐ保存して、索引（バックリンク）に反映する
+        self.save_all();
+        self.generation += 1;
+        self.toast(if skipped == 0 {
+            format!("{done}件をリンクにしました")
+        } else {
+            format!("{done}件をリンクにしました（本文が変わっていた{skipped}件は飛ばしました）")
+        });
+    }
+
     fn close_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.save_tab(idx);
@@ -1187,6 +1252,7 @@ impl App {
             Action::Run(cmd) => self.run(cmd, ctx),
             Action::History(path) => self.open_history(&path),
             Action::PasteImage(image) => self.paste_image(&image),
+            Action::LinkMentions(mentions, target) => self.link_mentions(&mentions, &target),
             Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
         }
     }
@@ -1317,7 +1383,7 @@ impl App {
                 }
                 let Some((_, tree)) = &self.tree else { return };
                 ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    tree_ui(ui, tree, 0, active, actions);
+                    tree_ui(ui, tree, 0, active, actions, vault, &mut self.hover_cache);
                 });
             }
             LeftTab::Search => {
@@ -1345,7 +1411,15 @@ impl App {
                                 active == Some(hit.path.as_str()),
                                 RichText::new(title).strong(),
                             )
-                            .on_hover_text(&hit.path);
+                            .on_hover_ui(|ui| {
+                                hover::note_preview(
+                                    ui,
+                                    vault,
+                                    &mut self.hover_cache,
+                                    &hit.path,
+                                    None,
+                                )
+                            });
                         if label.clicked() {
                             let line = hit.lines.first().map(|l| l.line);
                             actions.push(Action::Open(hit.path.clone(), line));
@@ -1377,7 +1451,9 @@ impl App {
                         };
                         let row = ui
                             .selectable_label(active == Some(path.as_str()), text)
-                            .on_hover_text(path);
+                            .on_hover_ui(|ui| {
+                                hover::note_preview(ui, vault, &mut self.hover_cache, path, None)
+                            });
                         if row.clicked() && exists {
                             actions.push(Action::Open(path.clone(), None));
                         }
@@ -1412,6 +1488,9 @@ impl App {
         let (Some(vault), Some(tab)) = (&self.vault, self.tabs.get_mut(self.active)) else {
             return;
         };
+        let cache = &mut self.hover_cache;
+        let mentions_cache = &mut self.mentions;
+        let generation = self.generation;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.add_space(4.0);
@@ -1429,7 +1508,7 @@ impl App {
                     let title = name.strip_suffix(".md").unwrap_or(name);
                     if ui
                         .selectable_label(false, title)
-                        .on_hover_text(&link.source)
+                        .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &link.source, None))
                         .clicked()
                     {
                         actions.push(Action::Open(link.source.clone(), Some(link.line)));
@@ -1441,6 +1520,63 @@ impl App {
                 if ui.add(egui::Button::new(text).frame(false)).clicked() {
                     actions.push(Action::Open(link.source.clone(), Some(link.line)));
                 }
+            }
+
+            ui.add_space(6.0);
+            let header = egui::CollapsingHeader::new(RichText::new("未リンクの言及").strong())
+                .id_salt("unlinked-mentions")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if mentions_cache
+                        .as_ref()
+                        .is_none_or(|(g, p, _)| *g != generation || *p != tab.path)
+                    {
+                        let found = vault.unlinked_mentions(&tab.path);
+                        *mentions_cache = Some((generation, tab.path.clone(), found));
+                    }
+                    let Some((_, _, mentions)) = mentions_cache.as_ref() else {
+                        return;
+                    };
+                    if mentions.is_empty() {
+                        ui.weak("このノートの名前は、リンクにならずに書かれていません");
+                        return;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("{}件", mentions.len()));
+                        if ui
+                            .small_button("すべてリンクにする")
+                            .on_hover_text("言及をすべて [[リンク]] に書き換えます（各ノートの履歴から戻せます）")
+                            .clicked()
+                        {
+                            actions.push(Action::LinkMentions(mentions.clone(), tab.path.clone()));
+                        }
+                    });
+                    let mut last_source = "";
+                    for m in mentions {
+                        if m.source != last_source {
+                            last_source = &m.source;
+                            let title = file_name(&m.source).trim_end_matches(".md");
+                            let row = ui
+                                .selectable_label(false, title)
+                                .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &m.source, None));
+                            if row.clicked() {
+                                actions.push(Action::Open(m.source.clone(), Some(m.line)));
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("リンク").clicked() {
+                                actions.push(Action::LinkMentions(vec![m.clone()], tab.path.clone()));
+                            }
+                            let job = mention_job(ui, m);
+                            if ui.add(egui::Button::new(job).frame(false)).clicked() {
+                                actions.push(Action::Open(m.source.clone(), Some(m.line)));
+                            }
+                        });
+                    }
+                });
+            // 閉じている間は結果を捨てる（大きなvaultで無駄に走査しないよう、開いているときだけ計算する）
+            if header.body_returned.is_none() {
+                *mentions_cache = None;
             }
 
             ui.add_space(10.0);
@@ -1615,6 +1751,7 @@ impl App {
             active,
             deferred_events,
             ime_composing,
+            hover_cache,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -2000,6 +2137,36 @@ impl App {
         let cursor_char = output.cursor_range.map(|r| r.primary.index.0);
         if let Some(c) = cursor_char {
             tab.cursor = editor::byte_of_char(&tab.text, c);
+        }
+        // Ctrl+ホバーでリンク先を覗く
+        if response.hovered() && ctx.input(|i| i.modifiers.command) {
+            if let Some(pointer) = ctx.pointer_hover_pos() {
+                let at = output.galley.cursor_from_pos(pointer - output.galley_pos);
+                let byte = editor::byte_of_char(&tab.text, at.index.0);
+                let target = editor::link_at(&tab.text, byte);
+                let resolved = target.as_deref().and_then(|t| {
+                    let (note, heading) = hover::split_target(t);
+                    let path = if note.is_empty() {
+                        Some(tab.path.as_str())
+                    } else {
+                        vault.resolve(note, &tab.path)
+                    };
+                    path.map(|p| (p.to_string(), heading.map(str::to_string)))
+                });
+                if let Some((path, heading)) = resolved {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    egui::Tooltip::always_open(
+                        ctx.clone(),
+                        ui.layer_id(),
+                        id.with("hover"),
+                        pointer,
+                    )
+                    .width(hover::WIDTH)
+                    .show(|ui| {
+                        hover::note_preview(ui, vault, hover_cache, &path, heading.as_deref())
+                    });
+                }
+            }
         }
         // Ctrl+クリックでリンクを辿る
         if response.clicked() && ctx.input(|i| i.modifiers.command) {
@@ -2505,6 +2672,25 @@ impl App {
     }
 }
 
+/// 言及の文脈を、該当部分だけ目立たせて組む。
+fn mention_job(ui: &egui::Ui, m: &Mention) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let weak = TextFormat::simple(font.clone(), ui.visuals().weak_text_color());
+    let strong = TextFormat::simple(font, ui.visuals().strong_text_color());
+    let mut job = LayoutJob::default();
+    let (a, b) = (m.column, m.column + m.text.len());
+    match (m.context.get(..a), m.context.get(a..b), m.context.get(b..)) {
+        (Some(before), Some(hit), Some(after)) => {
+            job.append(before, 0.0, weak.clone());
+            job.append(hit, 0.0, strong);
+            job.append(after, 0.0, weak);
+        }
+        _ => job.append(&m.context, 0.0, weak),
+    }
+    job
+}
+
 /// 編集補助が受け取る入力。
 enum EditKey {
     Enter,
@@ -2614,12 +2800,14 @@ fn tree_ui(
     idx: usize,
     active: Option<&str>,
     actions: &mut Vec<Action>,
+    vault: &Vault,
+    cache: &mut CommonMarkCache,
 ) {
     for &d in &tree[idx].dirs {
         let dir = &tree[d];
         let header = egui::CollapsingHeader::new(&dir.name)
             .id_salt(("dir", &dir.path))
-            .show(ui, |ui| tree_ui(ui, tree, d, active, actions));
+            .show(ui, |ui| tree_ui(ui, tree, d, active, actions, vault, cache));
         header.header_response.context_menu(|ui| {
             let path = dir.path.clone();
             if ui.button("ここに新規ノート").clicked() {
@@ -2652,7 +2840,11 @@ fn tree_ui(
         } else {
             RichText::new(name).weak()
         };
-        let row = ui.selectable_label(active == Some(path.as_str()), text);
+        let mut row = ui.selectable_label(active == Some(path.as_str()), text);
+        // ファイル一覧では、Ctrlを押しているときだけプレビューを出す（一覧を眺めるときに邪魔にならないように）
+        if *note && ui.input(|i| i.modifiers.command) {
+            row = row.on_hover_ui(|ui| hover::note_preview(ui, vault, cache, path, None));
+        }
         if row.clicked() {
             actions.push(if *note {
                 Action::Open(path.clone(), None)

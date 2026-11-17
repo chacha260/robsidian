@@ -10,4 +10,4 @@ pub mod vault;
 
 pub use parse::{Heading, Link, LinkKind, Parsed};
 pub use search::{LineHit, NoteHit};
-pub use vault::{Backlink, Note, Vault};
+pub use vault::{Backlink, Mention, Note, Vault};

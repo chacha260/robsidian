@@ -36,6 +36,61 @@ pub struct Backlink {
     pub line: usize,
 }
 
+/// リンクになっていない言及（[`Vault::unlinked_mentions`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mention {
+    pub source: String,
+    /// 0始まりの行番号
+    pub line: usize,
+    /// 本文中のバイト範囲
+    pub range: std::ops::Range<usize>,
+    /// 本文中に書かれていた文字列（大文字小文字は本文のまま）
+    pub text: String,
+    /// 前後の空白を除いた行
+    pub context: String,
+    /// `context` の中で言及が始まるバイト位置
+    pub column: usize,
+}
+
+/// 言及として数えない範囲（既存のリンク全体）。Markdownリンクは `[文字](先)` 全体にする。
+fn mention_guard(text: &str, link: &Link) -> std::ops::Range<usize> {
+    match link.kind {
+        LinkKind::Wiki => link.full.clone(),
+        LinkKind::Markdown => {
+            let line_start = text[..link.span.start].rfind('\n').map_or(0, |i| i + 1);
+            let open = text[line_start..link.span.start]
+                .rfind('[')
+                .map_or(link.span.start, |i| line_start + i);
+            let close = text[link.span.end..]
+                .find(')')
+                .map_or(link.span.end, |i| link.span.end + i + 1);
+            open..close
+        }
+    }
+}
+
+/// 行内のインラインコード（`...`）の範囲。
+fn inline_code_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'`' {
+            let n = b[i..].iter().take_while(|&&c| c == b'`').count();
+            let ticks = &line[i..i + n];
+            if let Some(close) = line[i + n..].find(ticks) {
+                out.push(i..i + n + close + n);
+                i += n + close + n;
+                continue;
+            }
+            i += n;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 #[derive(Debug, Default)]
 pub struct Vault {
     root: PathBuf,
@@ -446,6 +501,136 @@ impl Vault {
     /// リンク先が存在しないリンク（リンク先文字列 → リンク元ノート）
     pub fn unresolved(&self) -> &BTreeMap<String, Vec<String>> {
         &self.unresolved
+    }
+
+    /// このノートの名前（またはaliases）が、リンクにならずに本文中に書かれている箇所。
+    /// コードブロック・インラインコード・frontmatter・既存のリンクの中は数えない。
+    /// 短すぎる名前（英数字は3文字未満、それ以外は2文字未満）は誤検出が多いので対象外。
+    pub fn unlinked_mentions(&self, rel: &str) -> Vec<Mention> {
+        const MAX: usize = 300;
+        let Some(target) = self.notes.get(rel) else {
+            return Vec::new();
+        };
+        let long_enough = |t: &str| {
+            let n = t.chars().count();
+            if t.is_ascii() {
+                n >= 3
+            } else {
+                n >= 2
+            }
+        };
+        let mut terms: Vec<String> = std::iter::once(target.name.clone())
+            .chain(target.parsed.aliases.iter().cloned())
+            .filter(|t| long_enough(t.trim()))
+            .map(|t| t.trim().to_string())
+            .collect();
+        // 長い語を先に試し、「Rust」と「Rust Notes」の両方に当たる場合は長い方を採る
+        terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        terms.dedup();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let pattern = terms
+            .iter()
+            .map(|t| regex::escape(t))
+            .collect::<Vec<_>>()
+            .join("|");
+        let Ok(re) = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+        else {
+            return Vec::new();
+        };
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        let notes: Vec<&Note> = self.notes.values().filter(|n| n.path != rel).collect();
+        let mut out: Vec<Mention> = notes
+            .par_iter()
+            .flat_map_iter(|note| {
+                let text = &note.text;
+                let links: Vec<std::ops::Range<usize>> = note
+                    .parsed
+                    .links
+                    .iter()
+                    .map(|l| mention_guard(text, l))
+                    .collect();
+                let mut found = Vec::new();
+                let mut offset = 0;
+                let mut fence = false;
+                for (line_no, raw) in text.split_inclusive('\n').enumerate() {
+                    let start = offset;
+                    offset += raw.len();
+                    if start < note.parsed.body_start {
+                        continue;
+                    }
+                    let t = raw.trim_start();
+                    if t.starts_with("```") || t.starts_with("~~~") {
+                        fence = !fence;
+                        continue;
+                    }
+                    if fence {
+                        continue;
+                    }
+                    let line = raw.trim_end_matches(['\n', '\r']);
+                    let code = inline_code_ranges(line);
+                    for m in re.find_iter(line) {
+                        let (a, b) = (start + m.start(), start + m.end());
+                        let inside = |r: &std::ops::Range<usize>| r.start < b && a < r.end;
+                        if links.iter().any(inside)
+                            || code.iter().any(|r| r.start < m.end() && m.start() < r.end)
+                        {
+                            continue;
+                        }
+                        // 英数字の語は、単語の途中に当たったものを除く
+                        let ascii = m.as_str().is_ascii();
+                        if ascii
+                            && (word(line[..m.start()].chars().next_back())
+                                || word(line[m.end()..].chars().next()))
+                        {
+                            continue;
+                        }
+                        found.push(Mention {
+                            source: note.path.clone(),
+                            line: line_no,
+                            range: a..b,
+                            text: m.as_str().to_string(),
+                            context: line.trim().to_string(),
+                            column: m.start() - (line.len() - line.trim_start().len()),
+                        });
+                    }
+                }
+                found
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then(a.range.start.cmp(&b.range.start))
+        });
+        out.truncate(MAX);
+        out
+    }
+
+    /// 未リンクの言及を `[[リンク]]` に書き換えた本文を返す（書き込みはしない）。
+    /// 本文がその後変わっていて、範囲の文字列が一致しなければ None。
+    pub fn link_mention_text(&self, text: &str, mention: &Mention, target: &str) -> Option<String> {
+        if text.get(mention.range.clone()) != Some(mention.text.as_str()) {
+            return None;
+        }
+        let note = self.notes.get(target)?;
+        let name = if self.resolve(&note.name, &mention.source) == Some(target) {
+            note.name.clone()
+        } else {
+            strip_note_ext(target).to_string()
+        };
+        let link = if mention.text == name {
+            format!("[[{name}]]")
+        } else {
+            format!("[[{name}|{}]]", mention.text)
+        };
+        let mut out = text.to_string();
+        out.replace_range(mention.range.clone(), &link);
+        Some(out)
     }
 
     /// どこからもリンクされておらず、どこにもリンクしていないノート
@@ -899,6 +1084,45 @@ mod tests {
         v.rename("a.md", "b").unwrap();
         assert_eq!(history::list(d.path(), "b.md").len(), 1);
         assert_eq!(v.disk_text("b.md").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn unlinked_mentions() {
+        let (_d, mut v) = vault(&[
+            ("Rust Notes.md", "---\naliases: [ラスト]\n---\nbody"),
+            (
+                "a.md",
+                "I like rust notes a lot.\nAlready [[Rust Notes]] linked.\n`Rust Notes` in code\nラストの話 and TrustNotes rust notesy",
+            ),
+            ("b.md", "```\nRust Notes\n```\n[Rust Notes](Rust%20Notes.md)"),
+            ("Go.md", "go go"),
+        ]);
+        let m = v.unlinked_mentions("Rust Notes.md");
+        let found: Vec<(&str, usize, &str)> = m
+            .iter()
+            .map(|m| (m.source.as_str(), m.line, m.text.as_str()))
+            .collect();
+        assert_eq!(found, [("a.md", 0, "rust notes"), ("a.md", 3, "ラスト")]);
+        assert_eq!(&m[0].context[m[0].column..][..10], "rust notes");
+        // 短い名前は対象外
+        assert!(v.unlinked_mentions("Go.md").is_empty());
+
+        let text = v.note("a.md").unwrap().text.clone();
+        let linked = v.link_mention_text(&text, &m[0], "Rust Notes.md").unwrap();
+        assert!(linked.starts_with("I like [[Rust Notes|rust notes]] a lot."));
+        let linked = v.link_mention_text(&linked, &m[1], "Rust Notes.md");
+        assert!(linked.is_none(), "範囲がずれたら書き換えない");
+        v.write_note(
+            "a.md",
+            &v.link_mention_text(&text, &m[1], "Rust Notes.md").unwrap(),
+        )
+        .unwrap();
+        assert!(v
+            .note("a.md")
+            .unwrap()
+            .text
+            .contains("[[Rust Notes|ラスト]]の話"));
+        assert_eq!(v.unlinked_mentions("Rust Notes.md").len(), 1);
     }
 
     #[test]

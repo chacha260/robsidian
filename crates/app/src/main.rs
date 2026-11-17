@@ -8,6 +8,7 @@ mod editor;
 mod graph;
 mod highlight;
 mod history_view;
+mod hover;
 mod preview;
 mod workspace;
 
