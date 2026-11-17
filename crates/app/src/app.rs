@@ -2284,7 +2284,7 @@ impl App {
             }
             let mut last_source = "";
             for link in backlinks {
-                if link.source != last_source {
+                if *link.source != *last_source {
                     last_source = &link.source;
                     let name = file_name(&link.source);
                     let title = name.strip_suffix(".md").unwrap_or(name);
@@ -2293,14 +2293,14 @@ impl App {
                         .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &link.source, None))
                         .clicked()
                     {
-                        actions.push(Action::Open(link.source.clone(), Some(link.line)));
+                        actions.push(Action::Open(link.source.to_string(), Some(link.line)));
                     }
                 }
                 let text = RichText::new(vault.line(&link.source, link.line))
                     .small()
                     .weak();
                 if ui.add(egui::Button::new(text).frame(false)).clicked() {
-                    actions.push(Action::Open(link.source.clone(), Some(link.line)));
+                    actions.push(Action::Open(link.source.to_string(), Some(link.line)));
                 }
             }
 

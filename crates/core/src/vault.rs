@@ -10,7 +10,7 @@ use crate::template;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -31,7 +31,8 @@ pub struct Note {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Backlink {
-    pub source: String,
+    /// リンク元のパス（同じノートからのバックリンクで共有する）
+    pub source: std::sync::Arc<str>,
     /// リンクが書かれている行（0始まり）。行の内容は [`Vault::line`] で取れる
     pub line: usize,
 }
@@ -91,6 +92,9 @@ fn inline_code_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
     out
 }
 
+/// 差し替える前のノートの状態: (別名, (解決できたリンク先, 解決できなかったリンク先))
+type OldNote = (Vec<String>, (Vec<String>, Vec<String>));
+
 #[derive(Debug, Default)]
 pub struct Vault {
     root: PathBuf,
@@ -103,6 +107,8 @@ pub struct Vault {
     file_names: HashMap<String, Vec<String>>,
     backlinks: HashMap<String, Vec<Backlink>>,
     unresolved: BTreeMap<String, Vec<String>>,
+    /// 解決できるリンクを1本以上持つノート（自己リンクも含む。孤立ノートの判定用）
+    linking: HashSet<String>,
     /// 上書き前の内容をローカル履歴に残す量
     pub history_limits: history::Limits,
 }
@@ -297,6 +303,10 @@ impl Vault {
         if !is_note_path(rel) {
             return false;
         }
+        let old = self
+            .notes
+            .get(rel)
+            .map(|n| (n.parsed.aliases.clone(), self.old_targets(rel)));
         let changed = match read_note(&self.root, rel) {
             Some(note) => {
                 let same = self.notes.get(rel).is_some_and(|old| old.text == note.text);
@@ -306,12 +316,53 @@ impl Vault {
             None => self.notes.remove(rel).is_some(),
         };
         if changed {
-            self.rebuild_links();
+            self.reindex_note(rel, old);
         }
         changed
     }
 
+    /// 名前の索引（パス・ファイル名・別名）と、リンクの索引を作り直す。
     fn rebuild_links(&mut self) {
+        self.rebuild_names();
+        let notes: Vec<&Note> = self.notes.values().collect();
+        // リンク解決はノートごとに独立なので並列に行い、最後にパス順で集約する
+        #[allow(clippy::type_complexity)]
+        let per_note: Vec<(&str, Vec<(&str, Backlink)>, Vec<&str>, bool)> = notes
+            .par_iter()
+            .filter(|note| !note.parsed.links.is_empty())
+            .map(|note| {
+                let (found, missing, any) = self.note_links(note);
+                (note.path.as_str(), found, missing, any)
+            })
+            .collect();
+        let mut backlinks: HashMap<String, Vec<Backlink>> = HashMap::new();
+        let mut unresolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut linking = HashSet::new();
+        for (source, found, missing, any) in per_note {
+            for (dst, b) in found {
+                match backlinks.get_mut(dst) {
+                    Some(list) => list.push(b),
+                    None => {
+                        backlinks.insert(dst.to_string(), vec![b]);
+                    }
+                }
+            }
+            for target in &missing {
+                unresolved
+                    .entry(target.to_string())
+                    .or_default()
+                    .push(source.to_string());
+            }
+            if any {
+                linking.insert(source.to_string());
+            }
+        }
+        self.backlinks = backlinks;
+        self.unresolved = unresolved;
+        self.linking = linking;
+    }
+
+    fn rebuild_names(&mut self) {
         self.lower_paths.clear();
         self.by_name.clear();
         self.by_alias.clear();
@@ -336,56 +387,111 @@ impl Vault {
                 .or_default()
                 .push(f.clone());
         }
+    }
 
-        // リンク解決はノートごとに独立なので並列に行い、最後に順序を保って集約する
-        let notes: Vec<&Note> = self.notes.values().collect();
-        // (リンク元, 解決できたリンク[(リンク先, Backlink)], 解決できなかったリンク先)
-        type PerNote<'a> = (&'a str, Vec<(&'a str, Backlink)>, Vec<&'a str>);
-        let per_note: Vec<PerNote> = notes
-            .par_iter()
-            .filter(|note| !note.parsed.links.is_empty())
-            .map(|note| {
-                let mut found: Vec<(&str, Backlink)> = Vec::new();
-                let mut missing: Vec<&str> = Vec::new();
-                for link in &note.parsed.links {
-                    if let Some(dst) = self.resolve(&link.target, &note.path) {
-                        // 自己リンクと、同じ行からの重複リンクは数えない
-                        if dst == note.path
-                            || found.iter().any(|(d, b)| *d == dst && b.line == link.line)
-                        {
-                            continue;
-                        }
-                        found.push((
-                            dst,
-                            Backlink {
-                                source: note.path.clone(),
-                                line: link.line,
-                            },
-                        ));
-                    } else if self.resolve_file(&link.target, &note.path).is_none()
-                        && !missing.contains(&link.target.as_str())
-                    {
-                        missing.push(&link.target);
-                    }
+    /// ノートのリンクを解決する: (解決できたリンク先とバックリンク, 解決できなかったリンク先,
+    /// 解決できるリンクを1本でも持つか（自己リンクも含む。孤立ノートの判定用）)。
+    #[allow(clippy::type_complexity)]
+    fn note_links<'a>(&'a self, note: &'a Note) -> (Vec<(&'a str, Backlink)>, Vec<&'a str>, bool) {
+        let source: std::sync::Arc<str> = note.path.as_str().into();
+        let mut found: Vec<(&str, Backlink)> = Vec::new();
+        let mut missing: Vec<&str> = Vec::new();
+        let mut any = false;
+        for link in &note.parsed.links {
+            if let Some(dst) = self.resolve(&link.target, &note.path) {
+                any = true;
+                // 自己リンクと、同じ行からの重複リンクは数えない
+                if dst == note.path || found.iter().any(|(d, b)| *d == dst && b.line == link.line) {
+                    continue;
                 }
-                (note.path.as_str(), found, missing)
-            })
-            .collect();
-        let mut backlinks: HashMap<String, Vec<Backlink>> = HashMap::new();
-        let mut unresolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (source, found, missing) in per_note {
-            for (dst, b) in found {
-                backlinks.entry(dst.to_string()).or_default().push(b);
-            }
-            for target in missing {
-                unresolved
-                    .entry(target.to_string())
-                    .or_default()
-                    .push(source.to_string());
+                found.push((
+                    dst,
+                    Backlink {
+                        source: source.clone(),
+                        line: link.line,
+                    },
+                ));
+            } else if self.resolve_file(&link.target, &note.path).is_none()
+                && !missing.contains(&link.target.as_str())
+            {
+                missing.push(&link.target);
             }
         }
-        self.backlinks = backlinks;
-        self.unresolved = unresolved;
+        (found, missing, any)
+    }
+
+    /// 1つのノートのリンクだけを索引に反映し直す（名前の索引は変わっていない前提）。
+    /// `old` は差し替える前のノートのリンク先（解決できたもの, できなかったもの）。
+    fn relink(&mut self, rel: &str, old: (Vec<String>, Vec<String>)) {
+        let (dsts, missing) = old;
+        for d in dsts {
+            if let Some(list) = self.backlinks.get_mut(&d) {
+                list.retain(|b| &*b.source != rel);
+                if list.is_empty() {
+                    self.backlinks.remove(&d);
+                }
+            }
+        }
+        for m in missing {
+            if let Some(list) = self.unresolved.get_mut(&m) {
+                list.retain(|s| s != rel);
+                if list.is_empty() {
+                    self.unresolved.remove(&m);
+                }
+            }
+        }
+        self.linking.remove(rel);
+        let Some(note) = self.notes.get(rel) else {
+            return;
+        };
+        if note.parsed.links.is_empty() {
+            return;
+        }
+        let (found, missing, any) = self.note_links(note);
+        let found: Vec<(String, Backlink)> =
+            found.into_iter().map(|(d, b)| (d.to_string(), b)).collect();
+        let missing: Vec<String> = missing.into_iter().map(str::to_string).collect();
+        // 全体を作り直したときと同じ順（リンク元のパス順、同じリンク元の中はリンクの順）に入れる
+        for (dst, b) in found {
+            let list = self.backlinks.entry(dst).or_default();
+            let at = list.partition_point(|x| &*x.source <= rel);
+            list.insert(at, b);
+        }
+        for m in missing {
+            let list = self.unresolved.entry(m).or_default();
+            let at = list.partition_point(|s| s.as_str() < rel);
+            list.insert(at, rel.to_string());
+        }
+        if any {
+            self.linking.insert(rel.to_string());
+        }
+    }
+
+    /// 差し替える前のノートのリンク先（[`Vault::relink`] で古い分を消すのに使う）。
+    fn old_targets(&self, rel: &str) -> (Vec<String>, Vec<String>) {
+        let Some(note) = self.notes.get(rel) else {
+            return Default::default();
+        };
+        let (found, missing, _) = self.note_links(note);
+        let mut dsts: Vec<String> = found.into_iter().map(|(d, _)| d.to_string()).collect();
+        dsts.sort();
+        dsts.dedup();
+        (dsts, missing.into_iter().map(str::to_string).collect())
+    }
+
+    /// ノートを差し替えたあとの索引の更新。名前や別名が変わらなければ、そのノートの分だけ直す。
+    /// `old` は差し替える前に [`Vault::old_targets`] で求めたもの。
+    fn reindex_note(&mut self, rel: &str, old: Option<OldNote>) {
+        let same_names = match (&old, self.notes.get(rel)) {
+            (Some((aliases, _)), Some(note)) => *aliases == note.parsed.aliases,
+            _ => false,
+        };
+        if let (true, Some((_, targets))) = (same_names, old) {
+            self.relink(rel, targets);
+        } else {
+            // ノートの追加・削除や別名の変更は、他のノートのリンクの解決結果も変える
+            self.rebuild_links();
+        }
     }
 
     // ---- 参照系 ----
@@ -424,12 +530,30 @@ impl Vault {
     /// 1. リンク元からの相対パス 2. vaultルートからのパス 3. パス末尾一致
     /// 4. ファイル名一致（同じフォルダ優先）5. frontmatterのaliases
     pub fn resolve(&self, target: &str, from: &str) -> Option<&str> {
-        let t = target.trim().replace('\\', "/");
-        let t = strip_note_ext(&t);
+        let t = target.trim();
+        let owned;
+        let t = if t.contains('\\') {
+            owned = t.replace('\\', "/");
+            owned.as_str()
+        } else {
+            t
+        };
+        let t = strip_note_ext(t);
         if t.is_empty() {
             return None;
         }
         let lower = t.to_lowercase();
+        if !lower.contains('/') && !lower.starts_with('.') {
+            // 名前だけのリンク（ほとんどがこれ）。同じフォルダを優先する pick は、相対パス・ルートからの
+            // 解決と同じ結果になるので、それらを飛ばして名前の索引だけで引く
+            if let Some(list) = self.by_name.get(&lower) {
+                return Self::pick(list, from);
+            }
+            return self
+                .by_alias
+                .get(&lower)
+                .and_then(|list| Self::pick(list, from));
+        }
         if let Some(joined) = join_normalized(parent_dir(from), &lower) {
             if let Some(p) = self.lower_paths.get(&joined.to_lowercase()) {
                 return Some(p);
@@ -440,12 +564,15 @@ impl Vault {
             return Some(p);
         }
         if from_root.contains('/') {
+            // パスの末尾一致。ファイル名の索引で候補を絞ってから比べる（全ノートを走査しない）
             let suffix = format!("/{from_root}");
             let matches: Vec<String> = self
-                .lower_paths
-                .iter()
-                .filter(|(k, _)| k.ends_with(&suffix))
-                .map(|(_, v)| v.clone())
+                .by_name
+                .get(file_name(from_root))
+                .into_iter()
+                .flatten()
+                .filter(|p| strip_note_ext(p).to_lowercase().ends_with(&suffix))
+                .cloned()
                 .collect();
             if let Some(best) = Self::pick(&matches, from) {
                 return self.notes.get(best).map(|n| n.path.as_str());
@@ -639,14 +766,7 @@ impl Vault {
     pub fn orphans(&self) -> Vec<&str> {
         self.notes
             .values()
-            .filter(|n| {
-                self.backlinks(&n.path).is_empty()
-                    && !n
-                        .parsed
-                        .links
-                        .iter()
-                        .any(|l| self.resolve(&l.target, &n.path).is_some())
-            })
+            .filter(|n| self.backlinks(&n.path).is_empty() && !self.linking.contains(&n.path))
             .map(|n| n.path.as_str())
             .collect()
     }
@@ -716,11 +836,15 @@ impl Vault {
         }
         atomic_write(&abs, text.as_bytes()).with_context(|| format!("failed to save {rel}"))?;
         self.register_dirs(rel);
+        let old = self
+            .notes
+            .get(rel)
+            .map(|n| (n.parsed.aliases.clone(), self.old_targets(rel)));
         self.notes.insert(
             rel.to_string(),
             make_note(rel, text.to_string(), mtime_secs(&abs)),
         );
-        self.rebuild_links();
+        self.reindex_note(rel, old);
         Ok(())
     }
 
@@ -1020,10 +1144,55 @@ mod tests {
         assert_eq!(v.resolve("b", "sub/c.md"), Some("sub/b.md"));
         assert_eq!(v.resolve("Bee", "sub/c.md"), Some("B.md"));
         assert_eq!(v.resolve_file("pic.png", "a.md"), Some("img/pic.png"));
-        let sources: Vec<_> = v.backlinks("a.md").iter().map(|b| &b.source).collect();
+        let sources: Vec<&str> = v.backlinks("a.md").iter().map(|b| &*b.source).collect();
         assert_eq!(sources, ["B.md", "sub/c.md"]);
         assert_eq!(v.unresolved().keys().collect::<Vec<_>>(), ["missing"]);
         assert!(v.orphans().is_empty());
+    }
+
+    /// 差分更新した索引が、全体を作り直した索引と一致することを確かめる。
+    fn assert_index_matches_fresh(v: &Vault) {
+        let fresh = Vault::open(v.root()).unwrap();
+        let mut keys: Vec<&String> = fresh.backlinks.keys().chain(v.backlinks.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for k in keys {
+            assert_eq!(v.backlinks(k), fresh.backlinks(k), "backlinks of {k}");
+        }
+        assert_eq!(v.unresolved, fresh.unresolved);
+        assert_eq!(v.orphans(), fresh.orphans());
+        assert_eq!(v.linking, fresh.linking);
+    }
+
+    #[test]
+    fn incremental_index_matches_full_rebuild() {
+        let (d, mut v) = vault(&[
+            ("a.md", "[[b]] [[c]] [[missing]]"),
+            ("b.md", "[[a]]\n[[a]] [[c]]"),
+            ("c.md", "nothing"),
+            ("sub/d.md", "[[a]] [[sub/e]]"),
+            ("sub/e.md", "---\naliases: [Echo]\n---\n[[d]]"),
+        ]);
+        assert_index_matches_fresh(&v);
+        // 既存ノートの書き換え（差分更新）
+        v.write_note("c.md", "[[a]] [[b]] [[gone]]").unwrap();
+        assert_index_matches_fresh(&v);
+        v.write_note("a.md", "no links now").unwrap();
+        assert_index_matches_fresh(&v);
+        v.write_note("b.md", "[[Echo]] [[c]]\n[[missing]]").unwrap();
+        assert_index_matches_fresh(&v);
+        // 別名の変更・新しいノート・削除は全体の作り直し
+        v.write_note("sub/e.md", "---\naliases: [Other]\n---\n")
+            .unwrap();
+        assert_index_matches_fresh(&v);
+        v.write_note("missing.md", "[[a]]").unwrap();
+        assert_index_matches_fresh(&v);
+        fs::remove_file(d.path().join("c.md")).unwrap();
+        v.reload("c.md");
+        assert_index_matches_fresh(&v);
+        fs::write(d.path().join("b.md"), "[[a]] [[sub/d]]").unwrap();
+        v.reload("b.md");
+        assert_index_matches_fresh(&v);
     }
 
     #[test]
