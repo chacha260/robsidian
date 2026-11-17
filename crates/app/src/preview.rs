@@ -9,7 +9,7 @@ pub const SCHEME: &str = "rob:";
 
 const IMAGE_EXTS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
 
-fn is_image(path: &str) -> bool {
+pub fn is_image(path: &str) -> bool {
     path.rsplit_once('.')
         .is_some_and(|(_, ext)| IMAGE_EXTS.contains(&ext.to_lowercase().as_str()))
 }
@@ -32,7 +32,7 @@ pub fn decode_link(url: &str) -> Option<String> {
     url.strip_prefix(SCHEME).map(parse::percent_decode)
 }
 
-fn file_uri(vault: &Vault, rel: &str) -> String {
+pub fn file_uri(vault: &Vault, rel: &str) -> String {
     let abs = vault.abs(rel).display().to_string().replace('\\', "/");
     if abs.starts_with('/') {
         format!("file://{abs}")

@@ -4,7 +4,7 @@ use crate::config::{Config, ViewMode};
 use crate::editor::{self, Colors};
 use crate::graph::Graph;
 use crate::preview;
-use eframe::egui::text::{CCursor, CCursorRange, LayoutJob};
+use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
     self, Align, Align2, Key, KeyboardShortcut, Layout, Modifiers, RichText, ScrollArea, TextEdit,
 };
@@ -89,6 +89,9 @@ enum Dialog {
     Delete { path: String },
 }
 
+/// 組版結果を使い回せる条件: (文字サイズ, ダーク, Live Preview, カーソルの文字範囲, 画像の最大幅)
+type LayoutKey = (f32, bool, bool, Option<(usize, usize)>, u32);
+
 struct Tab {
     path: String,
     text: String,
@@ -99,8 +102,10 @@ struct Tab {
     jump: Option<usize>,
     /// 最後に確認したカーソル位置（バイト）
     cursor: usize,
-    job: LayoutJob,
-    job_key: (f32, bool),
+    layout: editor::Layout,
+    layout_key: Option<LayoutKey>,
+    /// 画像の読み込み待ちなどで、次の描画で組版をやり直す必要がある
+    layout_stale: bool,
     preview: Option<(u64, u64, String)>,
     outline: Option<(u64, Vec<Heading>)>,
 }
@@ -115,8 +120,9 @@ impl Tab {
             version: 0,
             jump: None,
             cursor: 0,
-            job: LayoutJob::default(),
-            job_key: (0.0, false),
+            layout: editor::Layout::default(),
+            layout_key: None,
+            layout_stale: false,
             preview: None,
             outline: None,
         }
@@ -913,11 +919,12 @@ impl App {
         }
         self.active = self.active.min(self.tabs.len() - 1);
         match self.cfg.view_mode {
-            ViewMode::Edit => self.editor_ui(ui, actions),
+            ViewMode::Live => self.editor_ui(ui, actions, true),
+            ViewMode::Edit => self.editor_ui(ui, actions, false),
             ViewMode::Preview => self.preview_ui(ui, actions),
             ViewMode::Split => {
                 ui.columns(2, |cols| {
-                    self.editor_ui(&mut cols[0], actions);
+                    self.editor_ui(&mut cols[0], actions, false);
                     self.preview_ui(&mut cols[1], actions);
                 });
             }
@@ -945,7 +952,7 @@ impl App {
         });
     }
 
-    fn editor_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    fn editor_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, live: bool) {
         let Self { tabs, vault, completion, completion_dismissed, cfg, active, .. } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else { return };
         let ctx = ui.ctx().clone();
@@ -982,35 +989,78 @@ impl App {
             scroll_to = Some(ccursor);
         }
 
-        if tab.job_key != (size, cfg.dark) {
-            tab.job_key = (size, cfg.dark);
-            tab.job = LayoutJob::default();
-        }
-        let Tab { text, job, .. } = tab;
-        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-            if job.text != buf.as_str() || job.sections.is_empty() {
-                *job = editor::highlight(buf.as_str(), size, &colors);
+        // Live Preview: カーソル（選択範囲）が触れている要素だけ記法を見せる。
+        // 組版はTextEditが入力を処理する前の状態で決めるので、カーソルが動いた直後は1フレーム遅れる
+        // （下で再描画を要求して追従させる）。
+        let span = |range: Option<CCursorRange>| {
+            range.map(|r| {
+                let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                (a.min(b), a.max(b))
+            })
+        };
+        let focused = ctx.memory(|m| m.has_focus(id));
+        let cursor = if live && focused {
+            span(TextEdit::load_state(&ctx, id).and_then(|s| s.cursor.char_range()))
+        } else {
+            None
+        };
+
+        // 画像の埋め込みは、読み込み済みならその場に表示する
+        let max_width = (ui.available_width() - 72.0).max(80.0);
+        let pending = std::cell::Cell::new(false);
+        let note_path = tab.path.clone();
+        let load_image = |target: &str| -> Option<(egui::TextureId, egui::Vec2)> {
+            let rel = vault.resolve_file(target, &note_path).filter(|p| preview::is_image(p))?;
+            let uri = preview::file_uri(vault, rel);
+            let options = egui::TextureOptions::LINEAR;
+            match ctx.try_load_texture(&uri, options, egui::load::SizeHint::default()) {
+                Ok(egui::load::TexturePoll::Ready { texture }) => {
+                    let scale = (max_width / texture.size.x).min(420.0 / texture.size.y).min(1.0);
+                    Some((texture.id, texture.size * scale))
+                }
+                Ok(egui::load::TexturePoll::Pending { .. }) => {
+                    pending.set(true);
+                    None
+                }
+                Err(_) => None,
             }
-            let mut job = job.clone();
+        };
+        let image_size = |target: &str| load_image(target).map(|(_, size)| size);
+
+        let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32);
+        if tab.layout_key != Some(key) || tab.layout_stale {
+            tab.layout_key = Some(key);
+            tab.layout = editor::Layout::default();
+        }
+        let Tab { text, layout, .. } = tab;
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+            if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
+                let options = editor::Options { size, colors: &colors, live, cursor, image: &image_size };
+                *layout = editor::layout(buf.as_str(), &options);
+            }
+            let mut job = layout.job.clone();
             job.wrap.max_width = wrap_width;
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
-        let output = ScrollArea::vertical()
+        let (output, background, painter) = ScrollArea::vertical()
             .id_salt(("editor-scroll", id))
             .auto_shrink(false)
             .show(ui, |ui| {
-                let output = egui::Frame::NONE
+                let (output, background) = egui::Frame::NONE
                     .inner_margin(egui::Margin::symmetric(24, 12))
                     .show(ui, |ui| {
-                        TextEdit::multiline(text)
+                        // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
+                        let background = ui.painter().add(egui::Shape::Noop);
+                        let output = TextEdit::multiline(text)
                             .id(id)
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY)
                             .desired_rows(30)
                             .lock_focus(true)
                             .layouter(&mut layouter)
-                            .show(ui)
+                            .show(ui);
+                        (output, background)
                     })
                     .inner;
                 if let Some(ccursor) = scroll_to {
@@ -1018,9 +1068,156 @@ impl App {
                     let rect = rect.translate(output.galley_pos.to_vec2()).expand2(egui::vec2(0.0, 60.0));
                     ui.scroll_to_rect(rect, Some(Align::Center));
                 }
-                output
+                (output, background, ui.painter().clone())
             })
             .inner;
+        tab.layout_stale = pending.get();
+        if tab.layout_stale {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if live && response_focus(&output) && span(output.cursor_range) != cursor {
+            ctx.request_repaint();
+        }
+
+        // ---- 装飾の上描き ----
+        let clip = painter.clip_rect();
+        let origin = output.galley_pos.to_vec2();
+        let left = output.galley_pos.x;
+        // 右端はエディタ自身の幅で決める（分割表示で隣の列にはみ出さないように）
+        let right = output.response.response.rect.right().max(left + 40.0);
+        let row = |ch: usize| output.galley.pos_from_cursor(CCursor::new(ch)).translate(origin);
+        let mut behind = Vec::new();
+        let mut toggle = None;
+        for deco in &tab.layout.decos {
+            let (a, b) = (row(deco.chars.start), row(deco.chars.end));
+            if b.bottom() < clip.top() || a.top() > clip.bottom() {
+                continue;
+            }
+            let span = egui::Rect::from_min_max(a.left_top(), egui::pos2(b.right().max(a.left()), a.bottom()));
+            match &deco.kind {
+                editor::DecoKind::Code => {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(left - 10.0, a.top() - 3.0),
+                        egui::pos2(right + 10.0, b.bottom() + 3.0),
+                    );
+                    behind.push(egui::Shape::rect_filled(rect, 0.0, colors.code_bg));
+                }
+                editor::DecoKind::Bullet => {
+                    painter.circle_filled(span.center(), size * 0.17, colors.dim);
+                }
+                editor::DecoKind::Quote => {
+                    let x = left + 2.0;
+                    let stroke = egui::Stroke::new(3.0, colors.dim.gamma_multiply(0.7));
+                    painter.line_segment([egui::pos2(x, a.top()), egui::pos2(x, b.bottom())], stroke);
+                }
+                editor::DecoKind::Rule => {
+                    let y = a.center().y;
+                    let stroke = egui::Stroke::new(1.0, colors.dim.gamma_multiply(0.7));
+                    painter.line_segment([egui::pos2(left, y), egui::pos2(right, y)], stroke);
+                }
+                editor::DecoKind::Checkbox(checked) => {
+                    let side = size * 0.95;
+                    let rect = egui::Rect::from_center_size(span.center(), egui::vec2(side, side));
+                    if *checked {
+                        painter.rect_filled(rect, 3.0, colors.accent);
+                        let (c, u) = (rect.center(), side * 0.5);
+                        let points = vec![
+                            c + egui::vec2(-0.5 * u, 0.0),
+                            c + egui::vec2(-0.12 * u, 0.4 * u),
+                            c + egui::vec2(0.55 * u, -0.4 * u),
+                        ];
+                        let stroke = egui::Stroke::new(1.8, colors.code_bg);
+                        painter.add(egui::Shape::line(points, stroke));
+                    } else {
+                        let stroke = egui::Stroke::new(1.3, colors.dim);
+                        painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                    }
+                    // クリックで切り替える（カーソルは動かさない）
+                    if clip.contains_rect(rect) {
+                        let hit = ui.interact(
+                            rect.expand(2.0),
+                            id.with(("checkbox", deco.chars.start)),
+                            egui::Sense::click(),
+                        );
+                        if hit.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if hit.clicked() {
+                            toggle = Some((deco.chars.start + 1, !*checked));
+                        }
+                    }
+                }
+                editor::DecoKind::Table(rows) => {
+                    let pad = egui::vec2(10.0, 0.0);
+                    let cells: Vec<Vec<_>> = rows
+                        .iter()
+                        .enumerate()
+                        .map(|(r, table_row)| {
+                            let color = if r == 0 { colors.heading } else { colors.text };
+                            table_row
+                                .cells
+                                .iter()
+                                .map(|c| {
+                                    let job = editor::inline_job(c, size, &colors, color);
+                                    ctx.fonts_mut(|f| f.layout_job(job))
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
+                    let mut xs = vec![left];
+                    for col in 0..columns {
+                        let widest = cells
+                            .iter()
+                            .filter_map(|r| r.get(col))
+                            .map(|g| g.size().x)
+                            .fold(24.0, f32::max);
+                        xs.push(xs[col] + widest + pad.x * 2.0);
+                    }
+                    let table_right = xs[columns];
+                    let line = egui::Stroke::new(1.0, colors.dim.gamma_multiply(0.5));
+                    for (r, (table_row, galleys)) in rows.iter().zip(&cells).enumerate() {
+                        let top = row(table_row.chars.start).top();
+                        // 見出し行は、畳んだ区切り行の高さも含めて次の行の上端までとする
+                        let bottom = match rows.get(r + 1).filter(|_| r == 0) {
+                            Some(next) => row(next.chars.start).top(),
+                            None => row(table_row.chars.end).bottom(),
+                        };
+                        if r == 0 {
+                            let header = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(table_right, bottom));
+                            painter.rect_filled(header, 0.0, colors.code_bg);
+                            painter.hline(left..=table_right, top, line);
+                        }
+                        for (col, galley) in galleys.iter().enumerate() {
+                            let y = (top + bottom - galley.size().y) * 0.5;
+                            painter.galley(egui::pos2(xs[col] + pad.x, y), galley.clone(), colors.text);
+                        }
+                        painter.hline(left..=table_right, bottom, line);
+                    }
+                    for x in &xs {
+                        painter.vline(*x, a.top()..=b.bottom(), line);
+                    }
+                }
+                editor::DecoKind::Image(target) => {
+                    if let Some((texture, image_size)) = load_image(target) {
+                        let top = a.top() + editor::line_height(size) + 4.0;
+                        let rect = egui::Rect::from_min_size(egui::pos2(left, top), image_size);
+                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        painter.image(texture, rect, uv, egui::Color32::WHITE);
+                    }
+                }
+            }
+        }
+        painter.set(background, egui::Shape::Vec(behind));
+        if let Some((ch, checked)) = toggle {
+            let byte = editor::byte_of_char(&tab.text, ch);
+            if tab.text.is_char_boundary(byte) && tab.text.is_char_boundary(byte + 1) {
+                tab.text.replace_range(byte..byte + 1, if checked { "x" } else { " " });
+                tab.dirty = true;
+                tab.edited_at = Some(Instant::now());
+                tab.version += 1;
+            }
+        }
 
         let response = &output.response.response;
         if response.changed() {
@@ -1378,6 +1575,10 @@ impl App {
             });
         ctx.request_repaint_after(remaining);
     }
+}
+
+fn response_focus(output: &egui::text_edit::TextEditOutput) -> bool {
+    output.response.response.has_focus()
 }
 
 fn tree_ui(

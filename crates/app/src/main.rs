@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod editor;
 mod graph;
+mod highlight;
 mod preview;
 
 use eframe::egui;
