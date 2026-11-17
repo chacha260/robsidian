@@ -283,7 +283,8 @@ fn run(cli: Cli) -> Result<()> {
                     out.value(&json!({ "nodes": nodes, "edges": edges }))?;
                 }
                 GraphFormat::Dot => {
-                    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+                    let q =
+                        |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
                     writeln!(out.w, "digraph vault {{")?;
                     for n in vault.notes() {
                         writeln!(out.w, "  {} [label={}];", q(&n.path), q(&n.name))?;
@@ -297,7 +298,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Stats => {
             let links: usize = vault.notes().map(|n| n.parsed.links.len()).sum();
-            let words: usize = vault.notes().map(|n| n.text.split_whitespace().count()).sum();
+            let words: usize = vault
+                .notes()
+                .map(|n| n.text.split_whitespace().count())
+                .sum();
             let stats = json!({
                 "vault": vault.root().display().to_string(),
                 "notes": vault.note_count(),

@@ -15,8 +15,12 @@ use syntect::parsing::SyntaxSet;
 /// 行ごとの (色, バイト数) の並び。各行のバイト数の合計は、改行を含むその行の長さ以上になる。
 pub type Lines = Rc<Vec<Vec<(Color32, usize)>>>;
 
-static ASSETS: LazyLock<(SyntaxSet, ThemeSet)> =
-    LazyLock::new(|| (SyntaxSet::load_defaults_newlines(), ThemeSet::load_defaults()));
+static ASSETS: LazyLock<(SyntaxSet, ThemeSet)> = LazyLock::new(|| {
+    (
+        SyntaxSet::load_defaults_newlines(),
+        ThemeSet::load_defaults(),
+    )
+});
 
 const MAX_CACHED_BLOCKS: usize = 200;
 
@@ -40,9 +44,11 @@ pub fn code(lang: &str, lines: &[&str], dark: bool) -> Option<Lines> {
         return Some(hit);
     }
 
-    let theme = themes
-        .themes
-        .get(if dark { "base16-ocean.dark" } else { "InspiredGitHub" })?;
+    let theme = themes.themes.get(if dark {
+        "base16-ocean.dark"
+    } else {
+        "InspiredGitHub"
+    })?;
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {

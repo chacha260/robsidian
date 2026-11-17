@@ -49,21 +49,57 @@ const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 /// (コマンド, 表示名, ショートカット)。Shift付きを先に並べること（先に一致した方が勝つ）。
 type CommandEntry = (Command, &'static str, Option<(Modifiers, Key)>);
 const COMMANDS: &[CommandEntry] = &[
-    (Command::Palette, "コマンドパレット", Some((CTRL_SHIFT, Key::P))),
-    (Command::SearchAll, "vault全体を検索", Some((CTRL_SHIFT, Key::F))),
+    (
+        Command::Palette,
+        "コマンドパレット",
+        Some((CTRL_SHIFT, Key::P)),
+    ),
+    (
+        Command::SearchAll,
+        "vault全体を検索",
+        Some((CTRL_SHIFT, Key::F)),
+    ),
     (Command::PrevTab, "前のタブ", Some((CTRL_SHIFT, Key::Tab))),
-    (Command::QuickSwitch, "ノートを開く（クイックスイッチャー）", Some((CTRL, Key::P))),
+    (
+        Command::QuickSwitch,
+        "ノートを開く（クイックスイッチャー）",
+        Some((CTRL, Key::P)),
+    ),
     (Command::NewNote, "新規ノート", Some((CTRL, Key::N))),
-    (Command::Daily, "今日のデイリーノートを開く", Some((CTRL, Key::D))),
+    (
+        Command::Daily,
+        "今日のデイリーノートを開く",
+        Some((CTRL, Key::D)),
+    ),
     (Command::Save, "保存", Some((CTRL, Key::S))),
     (Command::CloseTab, "タブを閉じる", Some((CTRL, Key::W))),
     (Command::NextTab, "次のタブ", Some((CTRL, Key::Tab))),
-    (Command::ToggleView, "表示切替（編集 → 分割 → プレビュー）", Some((CTRL, Key::E))),
+    (
+        Command::ToggleView,
+        "表示切替（編集 → 分割 → プレビュー）",
+        Some((CTRL, Key::E)),
+    ),
     (Command::ToggleGraph, "グラフビュー", Some((CTRL, Key::G))),
-    (Command::ToggleLeft, "左サイドバーの表示切替", Some((CTRL, Key::B))),
-    (Command::ToggleRight, "右サイドバーの表示切替", Some((CTRL, Key::J))),
-    (Command::FollowLink, "カーソル位置のリンクを開く", Some((CTRL, Key::Enter))),
-    (Command::Rename, "現在のノートを改名/移動", Some((Modifiers::NONE, Key::F2))),
+    (
+        Command::ToggleLeft,
+        "左サイドバーの表示切替",
+        Some((CTRL, Key::B)),
+    ),
+    (
+        Command::ToggleRight,
+        "右サイドバーの表示切替",
+        Some((CTRL, Key::J)),
+    ),
+    (
+        Command::FollowLink,
+        "カーソル位置のリンクを開く",
+        Some((CTRL, Key::Enter)),
+    ),
+    (
+        Command::Rename,
+        "現在のノートを改名/移動",
+        Some((Modifiers::NONE, Key::F2)),
+    ),
     (Command::Delete, "現在のノートをゴミ箱へ", None),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
@@ -209,8 +245,14 @@ fn build_tree(vault: &Vault) -> Vec<TreeDir> {
     for (path, note) in notes.chain(files) {
         let i = dir_index(&mut tree, &mut map, parent_dir(path));
         let name = file_name(path);
-        let name = if note { name.strip_suffix(".md").unwrap_or(name) } else { name };
-        tree[i].files.push((name.to_string(), path.to_string(), note));
+        let name = if note {
+            name.strip_suffix(".md").unwrap_or(name)
+        } else {
+            name
+        };
+        tree[i]
+            .files
+            .push((name.to_string(), path.to_string(), note));
     }
     for dir in &mut tree {
         dir.files.sort_by_cached_key(|f| f.0.to_lowercase());
@@ -292,7 +334,10 @@ impl App {
 
     /// 開いているタブを設定ファイルに記録する（異常終了しても次回復元できるように）。
     fn persist_session(&mut self) {
-        let session = (self.tabs.iter().map(|t| t.path.clone()).collect(), self.active);
+        let session = (
+            self.tabs.iter().map(|t| t.path.clone()).collect(),
+            self.active,
+        );
         if session != self.saved_session {
             self.cfg.open_tabs.clone_from(&session.0);
             self.cfg.active_tab = session.1;
@@ -336,7 +381,8 @@ impl App {
         let ctx = ctx.clone();
         let handler = move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
-                if !matches!(event.kind, notify::EventKind::Access(_)) && tx.send(event.paths).is_ok()
+                if !matches!(event.kind, notify::EventKind::Access(_))
+                    && tx.send(event.paths).is_ok()
                 {
                     ctx.request_repaint();
                 }
@@ -354,7 +400,9 @@ impl App {
 
     /// 外部での変更（別エディタ、git pull、Obsidian本体など）を索引に取り込む。
     fn poll_watcher(&mut self, ctx: &egui::Context) {
-        let Some(vault) = self.vault.as_mut() else { return };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
         let mut changed = false;
         if let Some((_, rx)) = &self.watcher {
             for paths in rx.try_iter() {
@@ -448,7 +496,8 @@ impl App {
                     self.toast(format!("ノートが見つかりません: {path}"));
                     return;
                 };
-                self.tabs.push(Tab::new(path.to_string(), note.text.clone()));
+                self.tabs
+                    .push(Tab::new(path.to_string(), note.text.clone()));
                 self.tabs.len() - 1
             }
         };
@@ -459,7 +508,9 @@ impl App {
     }
 
     fn create_and_open(&mut self, name: &str) {
-        let Some(vault) = self.vault.as_mut() else { return };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
         match vault.create_note(name, "") {
             Ok(path) => {
                 self.generation += 1;
@@ -492,7 +543,9 @@ impl App {
 
     fn rename(&mut self, old: &str, new: &str) {
         self.save_all();
-        let Some(vault) = self.vault.as_mut() else { return };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
         match vault.rename(old, new) {
             Ok(updated) => {
                 self.generation += 1;
@@ -519,13 +572,16 @@ impl App {
     }
 
     fn delete(&mut self, path: &str) {
-        let Some(vault) = self.vault.as_mut() else { return };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
         match trash::delete(vault.abs(path)) {
             Ok(()) => {
                 vault.rescan();
                 self.generation += 1;
                 let prefix = format!("{path}/");
-                self.tabs.retain(|t| t.path != path && !t.path.starts_with(&prefix));
+                self.tabs
+                    .retain(|t| t.path != path && !t.path.starts_with(&prefix));
                 self.active = self.active.min(self.tabs.len().saturating_sub(1));
                 self.toast(format!("ゴミ箱へ移動しました: {path}"));
             }
@@ -554,7 +610,10 @@ impl App {
             }
             Command::NewNote => {
                 let dir = current.as_deref().map(parent_dir).unwrap_or("").to_string();
-                self.dialog = Some(Dialog::NewNote { dir, name: String::new() });
+                self.dialog = Some(Dialog::NewNote {
+                    dir,
+                    name: String::new(),
+                });
             }
             Command::Daily => {
                 if let Some(vault) = self.vault.as_mut() {
@@ -583,7 +642,8 @@ impl App {
             Command::ToggleRight => self.cfg.show_right = !self.cfg.show_right,
             Command::FollowLink => {
                 if let Some(tab) = self.current() {
-                    if let Some(target) = editor::link_at(&tab.text, tab.cursor.min(tab.text.len())) {
+                    if let Some(target) = editor::link_at(&tab.text, tab.cursor.min(tab.text.len()))
+                    {
                         let from = tab.path.clone();
                         self.follow_link(&target, &from, ctx);
                     }
@@ -591,7 +651,10 @@ impl App {
             }
             Command::Rename => {
                 if let Some(path) = current {
-                    self.dialog = Some(Dialog::Rename { new: path.clone(), path });
+                    self.dialog = Some(Dialog::Rename {
+                        new: path.clone(),
+                        path,
+                    });
                 }
             }
             Command::Delete => {
@@ -665,14 +728,26 @@ impl App {
             return;
         }
         self.applied_style = Some(key);
-        ctx.set_theme(if self.cfg.dark { egui::Theme::Dark } else { egui::Theme::Light });
+        ctx.set_theme(if self.cfg.dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
         let size = self.cfg.font_size;
         ctx.all_styles_mut(|style| {
             use egui::{FontFamily::Proportional, FontId, TextStyle};
-            style.text_styles.insert(TextStyle::Body, FontId::new(size - 1.0, Proportional));
-            style.text_styles.insert(TextStyle::Button, FontId::new(size - 1.0, Proportional));
-            style.text_styles.insert(TextStyle::Small, FontId::new(size - 3.5, Proportional));
-            style.text_styles.insert(TextStyle::Heading, FontId::new(size + 6.0, Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Body, FontId::new(size - 1.0, Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Button, FontId::new(size - 1.0, Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Small, FontId::new(size - 3.5, Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Heading, FontId::new(size + 6.0, Proportional));
             style.spacing.item_spacing = egui::vec2(6.0, 4.0);
             style.spacing.button_padding = egui::vec2(6.0, 3.0);
         });
@@ -683,12 +758,23 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(vault) = &self.vault {
-                let name = vault.root().file_name().map(|n| n.to_string_lossy().into_owned());
-                ui.weak(format!("{} ・ {}ノート", name.unwrap_or_default(), vault.note_count()));
+                let name = vault
+                    .root()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned());
+                ui.weak(format!(
+                    "{} ・ {}ノート",
+                    name.unwrap_or_default(),
+                    vault.note_count()
+                ));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(tab) = self.tabs.get(self.active) {
-                    ui.weak(if tab.dirty { "● 未保存" } else { "保存済み" });
+                    ui.weak(if tab.dirty {
+                        "● 未保存"
+                    } else {
+                        "保存済み"
+                    });
                     ui.weak(format!("{}文字", tab.text.chars().count()));
                     if let Some(vault) = &self.vault {
                         ui.weak(format!("被リンク {}", vault.backlinks(&tab.path).len()));
@@ -714,19 +800,34 @@ impl App {
         match self.left_tab {
             LeftTab::Files => {
                 ui.horizontal(|ui| {
-                    if ui.button("＋ノート").on_hover_text("新規ノート (Ctrl+N)").clicked() {
+                    if ui
+                        .button("＋ノート")
+                        .on_hover_text("新規ノート (Ctrl+N)")
+                        .clicked()
+                    {
                         actions.push(Action::Run(Command::NewNote));
                     }
                     if ui.button("＋フォルダ").clicked() {
-                        let d = Dialog::NewFolder { dir: String::new(), name: String::new() };
+                        let d = Dialog::NewFolder {
+                            dir: String::new(),
+                            name: String::new(),
+                        };
                         actions.push(Action::Dialog(d));
                     }
-                    if ui.button("今日").on_hover_text("デイリーノート (Ctrl+D)").clicked() {
+                    if ui
+                        .button("今日")
+                        .on_hover_text("デイリーノート (Ctrl+D)")
+                        .clicked()
+                    {
                         actions.push(Action::Run(Command::Daily));
                     }
                 });
                 ui.add_space(2.0);
-                if self.tree.as_ref().is_none_or(|(g, _)| *g != self.generation) {
+                if self
+                    .tree
+                    .as_ref()
+                    .is_none_or(|(g, _)| *g != self.generation)
+                {
                     self.tree = Some((self.generation, build_tree(vault)));
                 }
                 let Some((_, tree)) = &self.tree else { return };
@@ -755,7 +856,10 @@ impl App {
                         let name = file_name(&hit.path);
                         let title = name.strip_suffix(".md").unwrap_or(name);
                         let label = ui
-                            .selectable_label(active == Some(hit.path.as_str()), RichText::new(title).strong())
+                            .selectable_label(
+                                active == Some(hit.path.as_str()),
+                                RichText::new(title).strong(),
+                            )
                             .on_hover_text(&hit.path);
                         if label.clicked() {
                             let line = hit.lines.first().map(|l| l.line);
@@ -779,7 +883,10 @@ impl App {
                         ui.weak("タグはまだありません");
                     }
                     for (tag, notes) in tags {
-                        if ui.selectable_label(false, format!("#{tag}  ({})", notes.len())).clicked() {
+                        if ui
+                            .selectable_label(false, format!("#{tag}  ({})", notes.len()))
+                            .clicked()
+                        {
                             actions.push(Action::Search(format!("tag:{tag}")));
                         }
                     }
@@ -807,11 +914,17 @@ impl App {
                     last_source = &link.source;
                     let name = file_name(&link.source);
                     let title = name.strip_suffix(".md").unwrap_or(name);
-                    if ui.selectable_label(false, title).on_hover_text(&link.source).clicked() {
+                    if ui
+                        .selectable_label(false, title)
+                        .on_hover_text(&link.source)
+                        .clicked()
+                    {
                         actions.push(Action::Open(link.source.clone(), Some(link.line)));
                     }
                 }
-                let text = RichText::new(vault.line(&link.source, link.line)).small().weak();
+                let text = RichText::new(vault.line(&link.source, link.line))
+                    .small()
+                    .weak();
                 if ui.add(egui::Button::new(text).frame(false)).clicked() {
                     actions.push(Action::Open(link.source.clone(), Some(link.line)));
                 }
@@ -841,14 +954,26 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            if ui.selectable_label(self.cfg.show_left, "一覧").on_hover_text("サイドバー (Ctrl+B)").clicked() {
+            if ui
+                .selectable_label(self.cfg.show_left, "一覧")
+                .on_hover_text("サイドバー (Ctrl+B)")
+                .clicked()
+            {
                 self.cfg.show_left = !self.cfg.show_left;
             }
             let mode = self.cfg.view_mode;
-            if ui.button(mode.label()).on_hover_text("表示切替 (Ctrl+E)").clicked() {
+            if ui
+                .button(mode.label())
+                .on_hover_text("表示切替 (Ctrl+E)")
+                .clicked()
+            {
                 self.cfg.view_mode = mode.next();
             }
-            if ui.selectable_label(self.show_graph, "グラフ").on_hover_text("Ctrl+G").clicked() {
+            if ui
+                .selectable_label(self.show_graph, "グラフ")
+                .on_hover_text("Ctrl+G")
+                .clicked()
+            {
                 self.show_graph = !self.show_graph;
             }
             ui.separator();
@@ -870,11 +995,19 @@ impl App {
                             actions.push(Action::Close(i));
                         }
                         if ui.button("改名/移動…").clicked() {
-                            let d = Dialog::Rename { path: tab.path.clone(), new: tab.path.clone() };
+                            let d = Dialog::Rename {
+                                path: tab.path.clone(),
+                                new: tab.path.clone(),
+                            };
                             actions.push(Action::Dialog(d));
                         }
                     });
-                    if selected && ui.small_button("×").on_hover_text("閉じる (Ctrl+W)").clicked() {
+                    if selected
+                        && ui
+                            .small_button("×")
+                            .on_hover_text("閉じる (Ctrl+W)")
+                            .clicked()
+                    {
                         actions.push(Action::Close(i));
                     }
                 }
@@ -953,8 +1086,18 @@ impl App {
     }
 
     fn editor_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, live: bool) {
-        let Self { tabs, vault, completion, completion_dismissed, cfg, active, .. } = self;
-        let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else { return };
+        let Self {
+            tabs,
+            vault,
+            completion,
+            completion_dismissed,
+            cfg,
+            active,
+            ..
+        } = self;
+        let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
+            return;
+        };
         let ctx = ui.ctx().clone();
         let id = egui::Id::unique(("editor", &tab.path));
         let size = cfg.font_size;
@@ -983,7 +1126,9 @@ impl App {
             let byte = editor::line_start(&tab.text, line);
             let ccursor = CCursor::new(editor::char_of_byte(&tab.text, byte));
             let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
-            state.cursor.set_char_range(Some(CCursorRange::one(ccursor)));
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(ccursor)));
             state.store(&ctx, id);
             ctx.memory_mut(|m| m.request_focus(id));
             scroll_to = Some(ccursor);
@@ -1010,12 +1155,16 @@ impl App {
         let pending = std::cell::Cell::new(false);
         let note_path = tab.path.clone();
         let load_image = |target: &str| -> Option<(egui::TextureId, egui::Vec2)> {
-            let rel = vault.resolve_file(target, &note_path).filter(|p| preview::is_image(p))?;
+            let rel = vault
+                .resolve_file(target, &note_path)
+                .filter(|p| preview::is_image(p))?;
             let uri = preview::file_uri(vault, rel);
             let options = egui::TextureOptions::LINEAR;
             match ctx.try_load_texture(&uri, options, egui::load::SizeHint::default()) {
                 Ok(egui::load::TexturePoll::Ready { texture }) => {
-                    let scale = (max_width / texture.size.x).min(420.0 / texture.size.y).min(1.0);
+                    let scale = (max_width / texture.size.x)
+                        .min(420.0 / texture.size.y)
+                        .min(1.0);
                     Some((texture.id, texture.size * scale))
                 }
                 Ok(egui::load::TexturePoll::Pending { .. }) => {
@@ -1035,7 +1184,13 @@ impl App {
         let Tab { text, layout, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
-                let options = editor::Options { size, colors: &colors, live, cursor, image: &image_size };
+                let options = editor::Options {
+                    size,
+                    colors: &colors,
+                    live,
+                    cursor,
+                    image: &image_size,
+                };
                 *layout = editor::layout(buf.as_str(), &options);
             }
             let mut job = layout.job.clone();
@@ -1065,7 +1220,9 @@ impl App {
                     .inner;
                 if let Some(ccursor) = scroll_to {
                     let rect = output.galley.pos_from_cursor(ccursor);
-                    let rect = rect.translate(output.galley_pos.to_vec2()).expand2(egui::vec2(0.0, 60.0));
+                    let rect = rect
+                        .translate(output.galley_pos.to_vec2())
+                        .expand2(egui::vec2(0.0, 60.0));
                     ui.scroll_to_rect(rect, Some(Align::Center));
                 }
                 (output, background, ui.painter().clone())
@@ -1085,7 +1242,12 @@ impl App {
         let left = output.galley_pos.x;
         // 右端はエディタ自身の幅で決める（分割表示で隣の列にはみ出さないように）
         let right = output.response.response.rect.right().max(left + 40.0);
-        let row = |ch: usize| output.galley.pos_from_cursor(CCursor::new(ch)).translate(origin);
+        let row = |ch: usize| {
+            output
+                .galley
+                .pos_from_cursor(CCursor::new(ch))
+                .translate(origin)
+        };
         let mut behind = Vec::new();
         let mut toggle = None;
         for deco in &tab.layout.decos {
@@ -1093,7 +1255,10 @@ impl App {
             if b.bottom() < clip.top() || a.top() > clip.bottom() {
                 continue;
             }
-            let span = egui::Rect::from_min_max(a.left_top(), egui::pos2(b.right().max(a.left()), a.bottom()));
+            let span = egui::Rect::from_min_max(
+                a.left_top(),
+                egui::pos2(b.right().max(a.left()), a.bottom()),
+            );
             match &deco.kind {
                 editor::DecoKind::Code => {
                     let rect = egui::Rect::from_min_max(
@@ -1108,7 +1273,8 @@ impl App {
                 editor::DecoKind::Quote => {
                     let x = left + 2.0;
                     let stroke = egui::Stroke::new(3.0, colors.dim.gamma_multiply(0.7));
-                    painter.line_segment([egui::pos2(x, a.top()), egui::pos2(x, b.bottom())], stroke);
+                    painter
+                        .line_segment([egui::pos2(x, a.top()), egui::pos2(x, b.bottom())], stroke);
                 }
                 editor::DecoKind::Rule => {
                     let y = a.center().y;
@@ -1184,13 +1350,20 @@ impl App {
                             None => row(table_row.chars.end).bottom(),
                         };
                         if r == 0 {
-                            let header = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(table_right, bottom));
+                            let header = egui::Rect::from_min_max(
+                                egui::pos2(left, top),
+                                egui::pos2(table_right, bottom),
+                            );
                             painter.rect_filled(header, 0.0, colors.code_bg);
                             painter.hline(left..=table_right, top, line);
                         }
                         for (col, galley) in galleys.iter().enumerate() {
                             let y = (top + bottom - galley.size().y) * 0.5;
-                            painter.galley(egui::pos2(xs[col] + pad.x, y), galley.clone(), colors.text);
+                            painter.galley(
+                                egui::pos2(xs[col] + pad.x, y),
+                                galley.clone(),
+                                colors.text,
+                            );
                         }
                         painter.hline(left..=table_right, bottom, line);
                     }
@@ -1202,7 +1375,8 @@ impl App {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;
                         let rect = egui::Rect::from_min_size(egui::pos2(left, top), image_size);
-                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                         painter.image(texture, rect, uv, egui::Color32::WHITE);
                     }
                 }
@@ -1212,7 +1386,8 @@ impl App {
         if let Some((ch, checked)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
             if tab.text.is_char_boundary(byte) && tab.text.is_char_boundary(byte + 1) {
-                tab.text.replace_range(byte..byte + 1, if checked { "x" } else { " " });
+                tab.text
+                    .replace_range(byte..byte + 1, if checked { "x" } else { " " });
                 tab.dirty = true;
                 tab.edited_at = Some(Instant::now());
                 tab.version += 1;
@@ -1232,7 +1407,10 @@ impl App {
         // Ctrl+クリックでリンクを辿る
         if response.clicked() && ctx.input(|i| i.modifiers.command) {
             if let Some(target) = editor::link_at(&tab.text, tab.cursor.min(tab.text.len())) {
-                actions.push(Action::FollowLink { target, from: tab.path.clone() });
+                actions.push(Action::FollowLink {
+                    target,
+                    from: tab.path.clone(),
+                });
             }
         }
 
@@ -1242,12 +1420,19 @@ impl App {
             if let Some(c) = completion.take() {
                 if let Some((insert, _)) = c.items.get(c.selected) {
                     let start = c.start.min(cursor);
-                    let close = if tab.text[cursor..].starts_with("]]") { "" } else { "]]" };
-                    tab.text.replace_range(start..cursor, &format!("{insert}{close}"));
+                    let close = if tab.text[cursor..].starts_with("]]") {
+                        ""
+                    } else {
+                        "]]"
+                    };
+                    tab.text
+                        .replace_range(start..cursor, &format!("{insert}{close}"));
                     let new_cursor = start + insert.len() + 2;
                     let ccursor = CCursor::new(editor::char_of_byte(&tab.text, new_cursor));
                     let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
-                    state.cursor.set_char_range(Some(CCursorRange::one(ccursor)));
+                    state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::one(ccursor)));
                     state.store(&ctx, id);
                     tab.cursor = new_cursor;
                     tab.dirty = true;
@@ -1268,7 +1453,10 @@ impl App {
             return;
         };
         let query = &tab.text[start..cursor];
-        if completion.as_ref().is_none_or(|c| c.start != start || c.query != query) {
+        if completion
+            .as_ref()
+            .is_none_or(|c| c.start != start || c.query != query)
+        {
             let items = search::fuzzy(vault, query, 8)
                 .into_iter()
                 .filter(|p| *p != tab.path)
@@ -1280,9 +1468,16 @@ impl App {
                     (if unique { name } else { full }.to_string(), path.clone())
                 })
                 .collect();
-            *completion = Some(Completion { start, query: query.to_string(), items, selected: 0 });
+            *completion = Some(Completion {
+                start,
+                query: query.to_string(),
+                items,
+                selected: 0,
+            });
         }
-        let Some(c) = completion.as_mut().filter(|c| !c.items.is_empty()) else { return };
+        let Some(c) = completion.as_mut().filter(|c| !c.items.is_empty()) else {
+            return;
+        };
         let cursor_rect = output
             .galley
             .pos_from_cursor(CCursor::new(cursor_char.unwrap_or(0)))
@@ -1295,7 +1490,9 @@ impl App {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(260.0);
                     for (i, (insert, path)) in c.items.iter().enumerate() {
-                        let row = ui.selectable_label(i == c.selected, insert).on_hover_text(path);
+                        let row = ui
+                            .selectable_label(i == c.selected, insert)
+                            .on_hover_text(path);
                         if row.clicked() {
                             clicked = Some(i);
                         }
@@ -1321,30 +1518,50 @@ impl App {
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let Self { tabs, vault, md_cache, generation, active, .. } = self;
-        let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else { return };
-        if tab.preview.as_ref().is_none_or(|(v, g, _)| (*v, *g) != (tab.version, *generation)) {
+        let Self {
+            tabs,
+            vault,
+            md_cache,
+            generation,
+            active,
+            ..
+        } = self;
+        let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
+            return;
+        };
+        if tab
+            .preview
+            .as_ref()
+            .is_none_or(|(v, g, _)| (*v, *g) != (tab.version, *generation))
+        {
             let src = preview::to_preview(&tab.text, &tab.path, vault);
             tab.preview = Some((tab.version, *generation, src));
         }
-        let Some((_, _, src)) = &tab.preview else { return };
+        let Some((_, _, src)) = &tab.preview else {
+            return;
+        };
         ScrollArea::vertical()
             .id_salt(("preview-scroll", &tab.path))
             .auto_shrink(false)
             .show(ui, |ui| {
-                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(24, 12)).show(ui, |ui| {
-                    let width = ui.available_width().max(100.0) as usize;
-                    CommonMarkViewer::new()
-                        .max_image_width(Some(width))
-                        .show(ui, md_cache, src);
-                });
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(24, 12))
+                    .show(ui, |ui| {
+                        let width = ui.available_width().max(100.0) as usize;
+                        CommonMarkViewer::new()
+                            .max_image_width(Some(width))
+                            .show(ui, md_cache, src);
+                    });
             });
         // プレビュー内のwikilinkクリックを横取りしてノートを開く
         ui.ctx().output_mut(|out| {
             out.commands.retain(|cmd| {
                 if let egui::OutputCommand::OpenUrl(open) = cmd {
                     if let Some(target) = preview::decode_link(&open.url) {
-                        actions.push(Action::FollowLink { target, from: tab.path.clone() });
+                        actions.push(Action::FollowLink {
+                            target,
+                            from: tab.path.clone(),
+                        });
                         return false;
                     }
                 }
@@ -1354,7 +1571,9 @@ impl App {
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        let Some(p) = self.palette.as_mut() else { return };
+        let Some(p) = self.palette.as_mut() else {
+            return;
+        };
         let mut close = false;
         let mut chosen = None;
         let (up, down, enter, shift_enter) = ctx.input_mut(|i| {
@@ -1372,13 +1591,19 @@ impl App {
             let q = p.query.trim();
             if p.commands {
                 let q = q.to_lowercase();
-                let hits = COMMANDS.iter().enumerate().filter(|(_, c)| c.1.to_lowercase().contains(&q));
+                let hits = COMMANDS
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.1.to_lowercase().contains(&q));
                 p.items.extend(hits.map(|(i, _)| PaletteItem::Cmd(i)));
             } else if let Some(vault) = &self.vault {
                 let notes = search::fuzzy(vault, q, 30);
                 let exact = notes.iter().any(|n| {
-                    n.strip_suffix(".md").is_some_and(|s| s.eq_ignore_ascii_case(q))
-                        || file_name(n).strip_suffix(".md").is_some_and(|s| s.eq_ignore_ascii_case(q))
+                    n.strip_suffix(".md")
+                        .is_some_and(|s| s.eq_ignore_ascii_case(q))
+                        || file_name(n)
+                            .strip_suffix(".md")
+                            .is_some_and(|s| s.eq_ignore_ascii_case(q))
                 });
                 p.items.extend(notes.into_iter().map(PaletteItem::Note));
                 if !q.is_empty() && !exact {
@@ -1433,15 +1658,16 @@ impl App {
                                     })
                                     .inner
                                 }
-                                PaletteItem::Create(name) => {
-                                    ui.selectable_label(selected, format!("＋ 「{name}」を新規作成"))
-                                }
+                                PaletteItem::Create(name) => ui
+                                    .selectable_label(selected, format!("＋ 「{name}」を新規作成")),
                                 PaletteItem::Cmd(ci) => {
                                     let (_, label, shortcut) = COMMANDS[*ci];
                                     ui.horizontal(|ui| {
                                         let r = ui.selectable_label(selected, label);
                                         if let Some((mods, key)) = shortcut {
-                                            ui.weak(ui.ctx().format_shortcut(&KeyboardShortcut::new(mods, key)));
+                                            ui.weak(ui.ctx().format_shortcut(
+                                                &KeyboardShortcut::new(mods, key),
+                                            ));
                                         }
                                         r
                                     })
@@ -1482,14 +1708,18 @@ impl App {
     }
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.dialog.as_mut() else { return };
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
         let mut confirm = false;
         let modal = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
             ui.set_width(420.0);
             let input = |ui: &mut egui::Ui, title: &str, hint: &str, value: &mut String| {
                 ui.heading(title);
                 ui.add_space(6.0);
-                let edit = TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY);
+                let edit = TextEdit::singleline(value)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY);
                 let response = ui.add(edit);
                 response.request_focus();
             };
@@ -1512,7 +1742,9 @@ impl App {
                 }
                 Dialog::Rename { path, new } => {
                     input(ui, "改名 / 移動", "新しいパス", new);
-                    ui.weak(format!("元: {path}  ・このノートへのリンクは自動で書き換えます"));
+                    ui.weak(format!(
+                        "元: {path}  ・このノートへのリンクは自動で書き換えます"
+                    ));
                 }
                 Dialog::Delete { path } => {
                     ui.heading("ゴミ箱へ移動");
@@ -1537,7 +1769,11 @@ impl App {
         }
         let join = |dir: &str, name: &str| {
             let name = name.trim().trim_matches('/');
-            if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+            if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{dir}/{name}")
+            }
         };
         match self.dialog.take() {
             Some(Dialog::NewNote { dir, name }) if !name.trim().is_empty() => {
@@ -1551,7 +1787,9 @@ impl App {
                     }
                 }
             }
-            Some(Dialog::Rename { path, new }) if !new.trim().is_empty() => self.rename(&path, &new),
+            Some(Dialog::Rename { path, new }) if !new.trim().is_empty() => {
+                self.rename(&path, &new)
+            }
             Some(Dialog::Delete { path }) => self.delete(&path),
             _ => {}
         }
@@ -1596,13 +1834,22 @@ fn tree_ui(
         header.header_response.context_menu(|ui| {
             let path = dir.path.clone();
             if ui.button("ここに新規ノート").clicked() {
-                actions.push(Action::Dialog(Dialog::NewNote { dir: path.clone(), name: String::new() }));
+                actions.push(Action::Dialog(Dialog::NewNote {
+                    dir: path.clone(),
+                    name: String::new(),
+                }));
             }
             if ui.button("ここに新規フォルダ").clicked() {
-                actions.push(Action::Dialog(Dialog::NewFolder { dir: path.clone(), name: String::new() }));
+                actions.push(Action::Dialog(Dialog::NewFolder {
+                    dir: path.clone(),
+                    name: String::new(),
+                }));
             }
             if ui.button("改名/移動…").clicked() {
-                actions.push(Action::Dialog(Dialog::Rename { new: path.clone(), path: path.clone() }));
+                actions.push(Action::Dialog(Dialog::Rename {
+                    new: path.clone(),
+                    path: path.clone(),
+                }));
             }
             if ui.button("ゴミ箱へ移動").clicked() {
                 actions.push(Action::Dialog(Dialog::Delete { path }));
@@ -1610,7 +1857,11 @@ fn tree_ui(
         });
     }
     for (name, path, note) in &tree[idx].files {
-        let text = if *note { RichText::new(name) } else { RichText::new(name).weak() };
+        let text = if *note {
+            RichText::new(name)
+        } else {
+            RichText::new(name).weak()
+        };
         let row = ui.selectable_label(active == Some(path.as_str()), text);
         if row.clicked() {
             actions.push(if *note {
@@ -1621,7 +1872,10 @@ fn tree_ui(
         }
         row.context_menu(|ui| {
             if ui.button("改名/移動…").clicked() {
-                actions.push(Action::Dialog(Dialog::Rename { path: path.clone(), new: path.clone() }));
+                actions.push(Action::Dialog(Dialog::Rename {
+                    path: path.clone(),
+                    new: path.clone(),
+                }));
             }
             if ui.button("ゴミ箱へ移動").clicked() {
                 actions.push(Action::Dialog(Dialog::Delete { path: path.clone() }));
@@ -1637,7 +1891,11 @@ impl eframe::App for App {
         self.poll_watcher(&ctx);
         self.autosave(&ctx);
         // ウィンドウからフォーカスが外れたら即保存する
-        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
+        if ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(false)))
+        }) {
             self.save_all();
         }
 
@@ -1653,7 +1911,8 @@ impl eframe::App for App {
                 .size_range(160.0..=500.0)
                 .show(ui, |ui| self.left_panel(ui, &mut actions));
         }
-        if self.vault.is_some() && self.cfg.show_right && !self.tabs.is_empty() && !self.show_graph {
+        if self.vault.is_some() && self.cfg.show_right && !self.tabs.is_empty() && !self.show_graph
+        {
             egui::Panel::right("right")
                 .default_size(240.0)
                 .size_range(160.0..=500.0)

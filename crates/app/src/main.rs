@@ -37,13 +37,19 @@ const CJK_FONTS: &[&str] = &[
 /// `ROBSIDIAN_FONT` で任意のフォントファイルを指定できる。
 fn install_cjk_font(ctx: &egui::Context) {
     let custom = std::env::var_os("ROBSIDIAN_FONT").map(PathBuf::from);
-    let candidates = custom.iter().map(PathBuf::as_path).chain(CJK_FONTS.iter().map(Path::new));
+    let candidates = custom
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(CJK_FONTS.iter().map(Path::new));
     let Some(bytes) = candidates.filter_map(|p| std::fs::read(p).ok()).next() else {
         eprintln!("robsidian: 日本語フォントが見つかりません（ROBSIDIAN_FONT で指定できます）");
         return;
     };
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        Arc::new(egui::FontData::from_owned(bytes)),
+    );
     for family in fonts.families.values_mut() {
         family.push("cjk".to_owned());
     }
@@ -61,7 +67,10 @@ fn main() -> eframe::Result {
         Ok(icon) => viewport.with_icon(icon),
         Err(_) => viewport,
     };
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
     eframe::run_native(
         "robsidian",
         options,

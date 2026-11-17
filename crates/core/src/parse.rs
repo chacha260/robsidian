@@ -308,7 +308,9 @@ fn push_mdlink(dest: &str, dest_base: usize, embed: bool, line: usize, out: &mut
     let mut path = dest.trim();
     if let Some(stripped) = path.strip_prefix('<') {
         // <path with spaces> 形式
-        let Some(end) = stripped.find('>') else { return };
+        let Some(end) = stripped.find('>') else {
+            return;
+        };
         path = &stripped[..end];
         return finish_mdlink(path, dest_base + lead + 1, embed, line, out);
     }

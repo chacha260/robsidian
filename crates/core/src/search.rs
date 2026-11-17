@@ -30,7 +30,11 @@ pub fn fuzzy(vault: &Vault, query: &str, limit: usize) -> Vec<String> {
     if query.is_empty() {
         let mut notes: Vec<_> = vault.notes().collect();
         notes.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
-        return notes.into_iter().take(limit).map(|n| n.path.clone()).collect();
+        return notes
+            .into_iter()
+            .take(limit)
+            .map(|n| n.path.clone())
+            .collect();
     }
     let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
     let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
@@ -49,7 +53,11 @@ pub fn fuzzy(vault: &Vault, query: &str, limit: usize) -> Vec<String> {
             .iter()
             .filter_map(|a| pattern.score(Utf32Str::new(a, &mut buf), &mut matcher))
             .max();
-        if let Some(score) = [path_score, name_score, alias_score].into_iter().flatten().max() {
+        if let Some(score) = [path_score, name_score, alias_score]
+            .into_iter()
+            .flatten()
+            .max()
+        {
             scored.push((score, &note.path));
         }
     }
@@ -58,7 +66,11 @@ pub fn fuzzy(vault: &Vault, query: &str, limit: usize) -> Vec<String> {
             .then_with(|| a.1.len().cmp(&b.1.len()))
             .then_with(|| a.1.cmp(b.1))
     });
-    scored.into_iter().take(limit).map(|(_, p)| p.to_string()).collect()
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, p)| p.to_string())
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -127,7 +139,9 @@ pub fn search(vault: &Vault, query: &str, limit: usize) -> Vec<NoteHit> {
             let has_tag = |want: &String| {
                 note.parsed.tags.iter().any(|t| {
                     let t = t.to_lowercase();
-                    t == *want || t.strip_prefix(want.as_str()).is_some_and(|r| r.starts_with('/'))
+                    t == *want
+                        || t.strip_prefix(want.as_str())
+                            .is_some_and(|r| r.starts_with('/'))
                 })
             };
             if !q.tags.iter().all(has_tag) {

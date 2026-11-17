@@ -514,8 +514,10 @@ impl Vault {
         }
         atomic_write(&abs, text.as_bytes()).with_context(|| format!("failed to save {rel}"))?;
         self.register_dirs(rel);
-        self.notes
-            .insert(rel.to_string(), make_note(rel, text.to_string(), mtime_secs(&abs)));
+        self.notes.insert(
+            rel.to_string(),
+            make_note(rel, text.to_string(), mtime_secs(&abs)),
+        );
         self.rebuild_links();
         Ok(())
     }
@@ -623,10 +625,7 @@ impl Vault {
                         if dst_new.is_none() && src_new.is_none() {
                             continue;
                         }
-                        parse::percent_encode_path(&relative_path(
-                            parent_dir(src_final),
-                            dst_final,
-                        ))
+                        parse::percent_encode_path(&relative_path(parent_dir(src_final), dst_final))
                     }
                 };
                 if note.text[link.span.clone()] != replacement {
@@ -759,7 +758,10 @@ mod tests {
     #[test]
     fn rename_updates_links() {
         let (d, mut v) = vault(&[
-            ("a.md", "[[old]] [[old#h|alias]] [m](notes/old.md) ![[pic.png]]"),
+            (
+                "a.md",
+                "[[old]] [[old#h|alias]] [m](notes/old.md) ![[pic.png]]",
+            ),
             ("notes/old.md", "[[a]] [rel](../a.md)"),
             ("pic.png", ""),
         ]);
@@ -770,7 +772,10 @@ mod tests {
             a,
             "[[New Name]] [[New Name#h|alias]] [m](archive/New%20Name.md) ![[pic.png]]"
         );
-        assert_eq!(v.note("archive/New Name.md").unwrap().text, "[[a]] [rel](../a.md)");
+        assert_eq!(
+            v.note("archive/New Name.md").unwrap().text,
+            "[[a]] [rel](../a.md)"
+        );
         assert_eq!(v.backlinks("archive/New Name.md").len(), 1);
 
         v.rename("pic.png", "img/photo.png").unwrap();
