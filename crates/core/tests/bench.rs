@@ -25,8 +25,11 @@ fn bench_big_vault() {
     let t = Instant::now();
     let orphans = v.orphans().len();
     let orphan_time = t.elapsed();
+    let t = Instant::now();
+    let related = robsidian_core::related::related(&v, &rel, 10).len();
+    let related_time = t.elapsed();
     eprintln!(
-        "notes {} / open {open:?} / save 1 note {save:?} / orphans {orphans} in {orphan_time:?}",
+        "notes {} / open {open:?} / save 1 note {save:?} / orphans {orphans} in {orphan_time:?} / related {related} in {related_time:?}",
         v.note_count()
     );
 }

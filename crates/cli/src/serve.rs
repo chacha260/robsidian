@@ -5,7 +5,7 @@
 //! 索引を持ち続けるので、問い合わせのたびにvaultを読み直さない（変わったファイルだけ読み直す）。
 
 use anyhow::{bail, Context, Result};
-use robsidian_core::{search, Vault};
+use robsidian_core::{related, search, Vault};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -80,6 +80,7 @@ pub fn handle(vault: &mut Vault, method: &str, params: &Value) -> Result<Value> 
                 .or_else(|| vault.resolve_file(target, from)))
         }
         "mentions" => json!(vault.unlinked_mentions(&note(vault, params)?)),
+        "related" => json!(related::related(vault, &note(vault, params)?, limit)),
         "write" => {
             let rel = str_param(params, "note")?.to_string();
             vault.write_note(&rel, str_param(params, "text")?)?;

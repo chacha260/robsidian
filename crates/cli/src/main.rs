@@ -9,7 +9,7 @@ mod serve;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use robsidian_core::{git, search, usercmd, Vault};
+use robsidian_core::{git, related, search, usercmd, Vault};
 use serde_json::json;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -47,6 +47,12 @@ enum Cmd {
     Cat { note: String },
     /// このノートにリンクしているノート
     Backlinks { note: String },
+    /// 直接はリンクしていないが関係の深いノート（共通のリンク先・リンク元・タグの重なりで順位付け）
+    Related {
+        note: String,
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+    },
     /// このノートの名前がリンクにならずに書かれている箇所（未リンクの言及）
     Mentions {
         note: String,
@@ -266,6 +272,15 @@ fn run(cli: Cli) -> Result<()> {
             let rel = note_arg(&vault, &note)?;
             let text = &vault.note(&rel).context("note vanished")?.text;
             out.w.write_all(text.as_bytes())?;
+        }
+        Cmd::Related { note, limit } => {
+            let rel = note_arg(&vault, &note)?;
+            let found = related::related(&vault, &rel, limit);
+            if out.json {
+                out.value(&serde_json::to_value(&found)?)?;
+            } else {
+                out.lines(found.iter().map(|r| format!("{:.2}\t{}", r.score, r.path)))?;
+            }
         }
         Cmd::Backlinks { note } => {
             let rel = note_arg(&vault, &note)?;

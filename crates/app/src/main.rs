@@ -15,6 +15,7 @@ mod hover;
 mod preview;
 mod props_ui;
 mod settings;
+mod theme;
 mod vim;
 mod workspace;
 
