@@ -102,7 +102,7 @@ cargo run --release -p robsidian -- /path/to/vault
 |---|---|
 | 移動 | `h j k l` `w b e` `W B E` `0 ^ $` `gg G` `{n}G` `f F t T ; ,` `{ }` `%` Ctrl+D / Ctrl+U、数値の前置（`3w`） |
 | 挿入 | `i a I A o O s S C` |
-| 演算子 | `d c y > < gu gU g~` ＋ 移動 / テキストオブジェクト（`iw aw iW aW ip ap i( a( i[ i{ i< i" i' i\``）、`dd cc yy >> <<` |
+| 演算子 | `d c y > < gu gU g~` ＋ 移動 / テキストオブジェクト（`iw aw iW aW ip ap i( a( i[ i{ i< i" i'` と、バッククォートの内側）、`dd cc yy >> <<` |
 | 編集 | `x X D Y r~ J p P`、`.`（繰り返し）、`u` / Ctrl+R（元に戻す / やり直し） |
 | ビジュアル | `v` `V`、選択中に `d c y > < u U ~ o` |
 | 検索 | `/` `?`（検索バー）、`n N`、`* #`（カーソル下の語） |
