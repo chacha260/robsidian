@@ -1,6 +1,7 @@
 //! アプリ本体: 状態管理と画面全体のレイアウト。
 
 use crate::config::{Config, ViewMode};
+use crate::edit;
 use crate::editor::{self, Colors};
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
@@ -124,7 +125,7 @@ const COMMANDS: &[CommandEntry] = &[
     (
         Command::ToggleLeft,
         "左サイドバーの表示切替",
-        Some((CTRL, Key::B)),
+        Some((CTRL, Key::Backslash)),
     ),
     (
         Command::ToggleRight,
@@ -172,6 +173,7 @@ enum Action {
     OpenVault(PathBuf),
     Run(Command),
     History(String),
+    PasteImage(std::sync::Arc<egui::ColorImage>),
     ToggleBookmark(String),
 }
 
@@ -372,6 +374,10 @@ pub struct App {
     completion_dismissed: Option<usize>,
     dialog: Option<Dialog>,
     history: Option<HistoryView>,
+    /// 順序を保つために次のフレームへ回した入力イベント
+    deferred_events: Vec<egui::Event>,
+    /// IMEで変換中か（変換中のEnterやTabは編集補助の対象にしない）
+    ime_composing: bool,
     workspace: Workspace,
     /// 戻る/進むの履歴: (ノートのパス, カーソルのあった行)
     nav_back: Vec<(String, usize)>,
@@ -410,6 +416,8 @@ impl App {
             completion_dismissed: None,
             dialog: None,
             history: None,
+            deferred_events: Vec::new(),
+            ime_composing: false,
             workspace: Workspace::default(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
@@ -1107,6 +1115,46 @@ impl App {
         }
     }
 
+    /// クリップボードの画像を添付フォルダにPNGで保存し、カーソル位置に埋め込む。
+    fn paste_image(&mut self, image: &egui::ColorImage) {
+        let Some(path) = self.current().map(|t| t.path.clone()) else {
+            return;
+        };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let [w, h] = image.size;
+        let rgba: Vec<u8> = image
+            .pixels
+            .iter()
+            .flat_map(|c| c.to_srgba_unmultiplied())
+            .collect();
+        let mut png = Vec::new();
+        let encoded = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+            .map(|img| img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png));
+        if !matches!(encoded, Some(Ok(()))) {
+            self.toast("画像を変換できませんでした");
+            return;
+        }
+        let name = format!(
+            "Pasted image {}.png",
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
+        let rel = vault.attachment_path(&path, &name);
+        if let Err(e) = vault.write_file(&rel, &png) {
+            self.toast(format!("画像を保存できません: {e:#}"));
+            return;
+        }
+        self.generation += 1;
+        // ファイル名だけで一意に辿れるならObsidianと同じく名前だけで書く
+        let shown = if vault.resolve_file(file_name(&rel), &path) == Some(rel.as_str()) {
+            file_name(&rel).to_string()
+        } else {
+            rel.clone()
+        };
+        self.insert_at_cursor(&format!("![[{shown}]]"));
+    }
+
     fn close_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.save_tab(idx);
@@ -1138,6 +1186,7 @@ impl App {
             Action::OpenVault(path) => self.open_vault(path, ctx),
             Action::Run(cmd) => self.run(cmd, ctx),
             Action::History(path) => self.open_history(&path),
+            Action::PasteImage(image) => self.paste_image(&image),
             Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
         }
     }
@@ -1420,7 +1469,7 @@ impl App {
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(self.cfg.show_left, "一覧")
-                .on_hover_text("サイドバー (Ctrl+B)")
+                .on_hover_text("サイドバー (Ctrl+\\)")
                 .clicked()
             {
                 self.cfg.show_left = !self.cfg.show_left;
@@ -1564,6 +1613,8 @@ impl App {
             completion_dismissed,
             cfg,
             active,
+            deferred_events,
+            ime_composing,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -1590,6 +1641,60 @@ impl App {
                     *completion_dismissed = Some(c.start);
                 }
             });
+        }
+
+        // ---- 編集補助（リストの継続、インデント、チェックボックス、強調、括弧、貼り付け） ----
+        let popup_open = completion.as_ref().is_some_and(|c| !c.items.is_empty());
+        if ctx.memory(|m| m.has_focus(id)) && !popup_open && !*ime_composing {
+            let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+            let range = state.cursor.char_range();
+            let chars = range.map_or(0..0, |r| {
+                let r = r.as_sorted_char_range();
+                r.start.0..r.end.0
+            });
+            let sel = editor::byte_of_char(&tab.text, chars.start)
+                ..editor::byte_of_char(&tab.text, chars.end);
+            let text = &tab.text;
+            let picked = ctx.input_mut(|input| {
+                take_edit_event(&mut input.events, deferred_events, |key| match key {
+                    EditKey::Enter => edit::on_enter(text, sel.clone()).map(Some),
+                    EditKey::Tab(outdent) => edit::on_tab(text, sel.clone(), *outdent).map(Some),
+                    EditKey::Checkbox => Some(Some(edit::toggle_checkbox(text, sel.clone()))),
+                    EditKey::Wrap(marker) => {
+                        Some(Some(edit::toggle_wrap(text, sel.clone(), marker)))
+                    }
+                    EditKey::Type(ch) => edit::on_type(text, sel.clone(), *ch).map(Some),
+                    EditKey::Paste(pasted) => edit::paste_url(text, sel.clone(), pasted).map(Some),
+                    EditKey::PasteImage(_) => Some(None),
+                })
+            });
+            match picked {
+                Some((_, Some(change))) => {
+                    // 変更前の状態をTextEditの「元に戻す」履歴に積んでおく（Ctrl+Zで戻せるように）
+                    let mut undoer = state.undoer();
+                    undoer.add_undo(&(range.unwrap_or_default(), tab.text.clone()));
+                    state.set_undoer(undoer);
+                    change.apply(&mut tab.text);
+                    let a = CCursor::new(editor::char_of_byte(&tab.text, change.select.start));
+                    let b = CCursor::new(editor::char_of_byte(&tab.text, change.select.end));
+                    let new_range = if a == b {
+                        CCursorRange::one(a)
+                    } else {
+                        CCursorRange::two(a, b)
+                    };
+                    state.cursor.set_char_range(Some(new_range));
+                    state.store(&ctx, id);
+                    tab.cursor = change.select.end;
+                    tab.dirty = true;
+                    tab.edited_at = Some(Instant::now());
+                    tab.version += 1;
+                }
+                Some((EditKey::PasteImage(image), None)) => {
+                    tab.cursor = sel.end;
+                    actions.push(Action::PasteImage(image));
+                }
+                _ => {}
+            }
         }
 
         if std::mem::take(&mut tab.focus) {
@@ -1869,8 +1974,17 @@ impl App {
         if let Some((ch, checked)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
             if tab.text.is_char_boundary(byte) && tab.text.is_char_boundary(byte + 1) {
+                // Ctrl+Zで戻せるよう、変更前の状態をTextEditの履歴に積む
+                let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
+                let range = state.cursor.char_range().unwrap_or_default();
+                let mut undoer = state.undoer();
+                undoer.add_undo(&(range, tab.text.clone()));
+                state.set_undoer(undoer);
+                state.store(&ctx, id);
                 tab.text
                     .replace_range(byte..byte + 1, if checked { "x" } else { " " });
+                // チェックボックスのクリックでエディタのフォーカスが外れないようにする
+                ctx.memory_mut(|m| m.request_focus(id));
                 tab.dirty = true;
                 tab.edited_at = Some(Instant::now());
                 tab.version += 1;
@@ -2391,6 +2505,105 @@ impl App {
     }
 }
 
+/// 編集補助が受け取る入力。
+enum EditKey {
+    Enter,
+    /// trueならShift+Tab
+    Tab(bool),
+    Checkbox,
+    Wrap(&'static str),
+    Type(char),
+    Paste(String),
+    PasteImage(std::sync::Arc<egui::ColorImage>),
+}
+
+fn classify(event: &egui::Event) -> Option<EditKey> {
+    use egui::Event;
+    match event {
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => match (key, *modifiers) {
+            (Key::Enter, m) if m.is_none() => Some(EditKey::Enter),
+            (Key::Tab, m) if m.is_none() => Some(EditKey::Tab(false)),
+            (Key::Tab, m) if m == Modifiers::SHIFT => Some(EditKey::Tab(true)),
+            (Key::L, m) if m.command_only() => Some(EditKey::Checkbox),
+            (Key::B, m) if m.command_only() => Some(EditKey::Wrap("**")),
+            (Key::I, m) if m.command_only() => Some(EditKey::Wrap("*")),
+            _ => None,
+        },
+        Event::Text(t) => {
+            let mut chars = t.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if "([{\"`*_=~)]".contains(c) => Some(EditKey::Type(c)),
+                _ => None,
+            }
+        }
+        Event::Paste(t) => Some(EditKey::Paste(t.clone())),
+        Event::PasteImage(img) => Some(EditKey::PasteImage(img.clone())),
+        _ => None,
+    }
+}
+
+/// TextEditが本文を変える入力か（編集補助の入力より前にあると、順序が崩れる）。
+fn changes_text(event: &egui::Event) -> bool {
+    use egui::Event;
+    match event {
+        Event::Text(_) | Event::Paste(_) | Event::Cut | Event::Ime(_) => true,
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => {
+            modifiers.command
+                || matches!(
+                    key,
+                    Key::Enter
+                        | Key::Tab
+                        | Key::Backspace
+                        | Key::Delete
+                        | Key::ArrowLeft
+                        | Key::ArrowRight
+                        | Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::Home
+                        | Key::End
+                        | Key::PageUp
+                        | Key::PageDown
+                )
+        }
+        _ => false,
+    }
+}
+
+/// 入力の中から、編集補助で扱える最初のものを取り出す。`try_edit` が Some を返したものだけを取る
+/// （Noneなら通常の入力としてTextEditに任せる）。それより前に本文を変える入力があれば、
+/// 順序を保つためにその入力以降を次のフレームへ回す。
+fn take_edit_event<T>(
+    events: &mut Vec<egui::Event>,
+    deferred: &mut Vec<egui::Event>,
+    mut try_edit: impl FnMut(&EditKey) -> Option<T>,
+) -> Option<(EditKey, T)> {
+    let mut blocked = false;
+    for i in 0..events.len() {
+        if let Some(key) = classify(&events[i]) {
+            if let Some(result) = try_edit(&key) {
+                if blocked {
+                    deferred.extend(events.drain(i..));
+                    return None;
+                }
+                events.remove(i);
+                return Some((key, result));
+            }
+        }
+        blocked |= changes_text(&events[i]);
+    }
+    None
+}
+
 fn response_focus(output: &egui::text_edit::TextEditOutput) -> bool {
     output.response.response.has_focus()
 }
@@ -2482,6 +2695,22 @@ impl eframe::App for App {
             self.save_all();
         }
 
+        // 前のフレームから回した入力を先頭に戻し、IMEの変換状態を追う
+        ctx.input_mut(|input| {
+            if !self.deferred_events.is_empty() {
+                let mut events = std::mem::take(&mut self.deferred_events);
+                events.append(&mut input.events);
+                input.events = events;
+            }
+            for event in &input.events {
+                if let egui::Event::Ime(ime) = event {
+                    self.ime_composing = match ime {
+                        egui::ImeEvent::Preedit { text, .. } => !text.is_empty(),
+                        _ => false,
+                    };
+                }
+            }
+        });
         let mut actions = Vec::new();
         if self.palette.is_none() {
             self.shortcuts(&ctx, &mut actions);
@@ -2529,6 +2758,9 @@ impl eframe::App for App {
             self.apply(action, &ctx);
         }
         self.persist_session();
+        if !self.deferred_events.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

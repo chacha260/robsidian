@@ -158,6 +158,15 @@ impl Painter<'_> {
         self.chars..self.chars + text.chars().count()
     }
 
+    /// 行頭の字下げ。タブ文字は狭く描かれるので、空白4つぶん程度まで広げる。
+    fn indent_fmt(&self, indent: &str) -> TextFormat {
+        let mut f = self.fmt(self.c.text);
+        if indent.contains('\t') {
+            f.extra_letter_spacing = self.size * 1.2;
+        }
+        f
+    }
+
     fn mono(&self, color: Color32) -> TextFormat {
         TextFormat {
             font_id: FontId::new(self.size * 0.93, FontFamily::Monospace),
@@ -330,7 +339,7 @@ impl Painter<'_> {
         if trimmed.starts_with("> ") || trimmed == ">" {
             let end = (indent + 2).min(line.len());
             let hide = self.hidden(self.ahead(&line[..end]));
-            self.push(&line[..indent], self.fmt(text));
+            self.push(&line[..indent], self.indent_fmt(&line[..indent]));
             self.push(&line[indent..end], self.ghost(hide));
             return (end, self.c.quote, hide);
         }
@@ -341,7 +350,7 @@ impl Painter<'_> {
             if checked || rest.starts_with("[ ] ") {
                 // `- [ ] ` → 先頭の `- ` を畳み、`[ ]` の位置にチェックボックスを描く
                 let hide = self.hidden(self.ahead(&line[..indent + 5]));
-                self.push(&line[..indent], self.fmt(text));
+                self.push(&line[..indent], self.indent_fmt(&line[..indent]));
                 self.push(&line[indent..indent + 2], self.mark(hide));
                 let range = self.push(&line[indent + 2..indent + 5], self.ghost(hide));
                 if hide {
@@ -351,7 +360,7 @@ impl Painter<'_> {
                 return (indent + 6, if checked { self.c.dim } else { text }, false);
             }
             let hide = self.hidden(self.ahead(&line[..indent + 1]));
-            self.push(&line[..indent], self.fmt(text));
+            self.push(&line[..indent], self.indent_fmt(&line[..indent]));
             let range = self.push(&line[indent..indent + 1], self.ghost(hide));
             if hide {
                 self.deco(DecoKind::Bullet, range);

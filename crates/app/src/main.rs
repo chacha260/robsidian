@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod edit;
 mod editor;
 mod graph;
 mod highlight;

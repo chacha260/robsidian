@@ -684,6 +684,52 @@ impl Vault {
         (!s.is_empty()).then(|| s.to_string())
     }
 
+    /// ノートに貼り付ける添付ファイルの保存先パス（vault相対）。Obsidianの設定
+    /// （`.obsidian/app.json` の attachmentFolderPath）に従い、同名があれば番号を付ける。
+    /// 設定が無ければvaultのルート。`./` で始まる設定はノートと同じフォルダからの相対。
+    pub fn attachment_path(&self, note: &str, name: &str) -> String {
+        let setting = self.obsidian_setting("app.json", "attachmentFolderPath");
+        let folder = match setting.as_deref() {
+            None => String::new(),
+            Some(".") => parent_dir(note).to_string(),
+            Some(s) if s.starts_with("./") => {
+                join_normalized(parent_dir(note), &s[2..]).unwrap_or_default()
+            }
+            Some(s) => s.to_string(),
+        };
+        let join = |file: &str| {
+            if folder.is_empty() {
+                file.to_string()
+            } else {
+                format!("{folder}/{file}")
+            }
+        };
+        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+        let mut candidate = join(name);
+        let mut n = 1;
+        while self.abs(&candidate).exists() {
+            candidate = join(&format!("{stem} {n}.{ext}"));
+            n += 1;
+        }
+        candidate
+    }
+
+    /// 添付ファイル（ノート以外）を書き込む。
+    pub fn write_file(&mut self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let abs = self.checked(rel)?;
+        if is_note_path(rel) {
+            bail!("use write_note for notes: {rel}");
+        }
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&abs, bytes).with_context(|| format!("failed to save {rel}"))?;
+        self.register_dirs(rel);
+        self.files.insert(rel.to_string());
+        self.rebuild_links();
+        Ok(())
+    }
+
     /// テンプレートを置くフォルダ。Obsidianの設定（`.obsidian/templates.json` の folder）、
     /// 無ければ `templates`。
     pub fn template_folder(&self) -> String {
@@ -853,6 +899,27 @@ mod tests {
         v.rename("a.md", "b").unwrap();
         assert_eq!(history::list(d.path(), "b.md").len(), 1);
         assert_eq!(v.disk_text("b.md").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn attachments() {
+        let (d, mut v) = vault(&[("notes/a.md", "")]);
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "p.png");
+        v.write_file("p.png", b"x").unwrap();
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "p 1.png");
+        assert_eq!(v.resolve_file("p.png", "notes/a.md"), Some("p.png"));
+        assert!(v.write_file("x.md", b"").is_err());
+        fs::create_dir_all(d.path().join(".obsidian")).unwrap();
+        let set = |value: &str| {
+            let json = format!(r#"{{"attachmentFolderPath":"{value}"}}"#);
+            fs::write(d.path().join(".obsidian/app.json"), json).unwrap();
+        };
+        set("./");
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "notes/p.png");
+        set("./img");
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "notes/img/p.png");
+        set("assets");
+        assert_eq!(v.attachment_path("notes/a.md", "p.png"), "assets/p.png");
     }
 
     #[test]
