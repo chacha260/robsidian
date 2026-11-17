@@ -4,6 +4,7 @@
 //! 本文もメモリに保持するので、検索やバックリンク表示はディスクI/Oなしで返る。
 //! Obsidianのvaultとそのまま互換（`[[wikilink]]`、`#tag`、frontmatter）。
 
+use crate::history;
 use crate::parse::{self, Link, LinkKind, Parsed};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
@@ -506,11 +507,24 @@ impl Vault {
         Ok(self.root.join(rel))
     }
 
-    /// ノートを保存する（アトミック書き込み）。
+    /// ディスク上のノートの現在の内容（索引ではなく実ファイルを読む）。無ければ None。
+    pub fn disk_text(&self, rel: &str) -> Option<String> {
+        let bytes = fs::read(self.checked(rel).ok()?).ok()?;
+        Some(
+            String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        )
+    }
+
+    /// ノートを保存する（アトミック書き込み）。上書きされる内容はローカル履歴に残す。
     pub fn write_note(&mut self, rel: &str, text: &str) -> Result<()> {
         let abs = self.checked(rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if let Some(old) = self.disk_text(rel).filter(|old| old != text) {
+            // 履歴が残せなくても保存自体は止めない
+            let _ = history::snapshot(&self.root, rel, &old);
         }
         atomic_write(&abs, text.as_bytes()).with_context(|| format!("failed to save {rel}"))?;
         self.register_dirs(rel);
@@ -647,6 +661,7 @@ impl Vault {
         }
         fs::rename(&old_abs, &new_abs)
             .with_context(|| format!("failed to rename {old} -> {new}"))?;
+        history::rename(&self.root, old, &new);
 
         let mut updated = Vec::new();
         for (path, text) in rewrites {
@@ -780,6 +795,21 @@ mod tests {
 
         v.rename("pic.png", "img/photo.png").unwrap();
         assert!(v.note("a.md").unwrap().text.ends_with("![[photo.png]]"));
+    }
+
+    #[test]
+    fn overwrites_are_kept_in_history() {
+        let (d, mut v) = vault(&[("a.md", "first")]);
+        v.write_note("a.md", "second").unwrap();
+        v.write_note("a.md", "second").unwrap();
+        let versions = history::list(d.path(), "a.md");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].read().unwrap(), "first");
+        // 履歴は索引に載らない
+        assert_eq!(v.note_count(), 1);
+        v.rename("a.md", "b").unwrap();
+        assert_eq!(history::list(d.path(), "b.md").len(), 1);
+        assert_eq!(v.disk_text("b.md").as_deref(), Some("second"));
     }
 
     #[test]

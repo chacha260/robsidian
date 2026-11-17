@@ -3,6 +3,7 @@
 use crate::config::{Config, ViewMode};
 use crate::editor::{self, Colors};
 use crate::graph::Graph;
+use crate::history_view::{self, HistoryView};
 use crate::preview;
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
@@ -38,6 +39,7 @@ enum Command {
     FollowLink,
     Rename,
     Delete,
+    History,
     OpenVault,
     ToggleTheme,
     Rescan,
@@ -47,6 +49,34 @@ const CTRL: Modifiers = Modifiers::COMMAND;
 const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 /// (コマンド, 表示名, ショートカット)。Shift付きを先に並べること（先に一致した方が勝つ）。
+impl Command {
+    /// コマンドパレットで英語でも検索できるようにするための語（小文字、空白区切り）。
+    fn keywords(self) -> &'static str {
+        match self {
+            Command::QuickSwitch => "open note quick switcher",
+            Command::Palette => "command palette",
+            Command::SearchAll => "search find grep",
+            Command::NewNote => "new note create",
+            Command::Daily => "daily note today journal",
+            Command::Save => "save",
+            Command::CloseTab => "close tab",
+            Command::NextTab => "next tab",
+            Command::PrevTab => "previous prev tab",
+            Command::ToggleView => "toggle view mode live source preview split",
+            Command::ToggleGraph => "graph view",
+            Command::ToggleLeft => "toggle left sidebar files",
+            Command::ToggleRight => "toggle right sidebar backlinks outline",
+            Command::FollowLink => "follow link open",
+            Command::Rename => "rename move",
+            Command::Delete => "delete trash remove",
+            Command::History => "history restore version undo diff",
+            Command::OpenVault => "open vault folder",
+            Command::ToggleTheme => "theme dark light",
+            Command::Rescan => "rescan reload refresh index",
+        }
+    }
+}
+
 type CommandEntry = (Command, &'static str, Option<(Modifiers, Key)>);
 const COMMANDS: &[CommandEntry] = &[
     (
@@ -101,6 +131,7 @@ const COMMANDS: &[CommandEntry] = &[
         Some((Modifiers::NONE, Key::F2)),
     ),
     (Command::Delete, "現在のノートをゴミ箱へ", None),
+    (Command::History, "現在のノートの履歴（復元）", None),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
@@ -116,6 +147,7 @@ enum Action {
     Dialog(Dialog),
     OpenVault(PathBuf),
     Run(Command),
+    History(String),
 }
 
 enum Dialog {
@@ -131,11 +163,17 @@ type LayoutKey = (f32, bool, bool, Option<(usize, usize)>, u32);
 struct Tab {
     path: String,
     text: String,
+    /// 編集の元になったディスク上の内容。保存前にディスクと比べて、外部での変更を検知する
+    base: String,
+    /// 未保存の編集中に外部で書き換えられたときの、ディスク側の内容
+    conflict: Option<String>,
     dirty: bool,
     edited_at: Option<Instant>,
     version: u64,
     /// 次の描画でこの行（0始まり）へカーソルを移動する
     jump: Option<usize>,
+    /// 次の描画でエディタにフォーカスを移す
+    focus: bool,
     /// 最後に確認したカーソル位置（バイト）
     cursor: usize,
     layout: editor::Layout,
@@ -150,11 +188,14 @@ impl Tab {
     fn new(path: String, text: String) -> Self {
         Self {
             path,
+            base: text.clone(),
             text,
+            conflict: None,
             dirty: false,
             edited_at: None,
             version: 0,
             jump: None,
+            focus: false,
             cursor: 0,
             layout: editor::Layout::default(),
             layout_key: None,
@@ -277,6 +318,7 @@ pub struct App {
     completion: Option<Completion>,
     completion_dismissed: Option<usize>,
     dialog: Option<Dialog>,
+    history: Option<HistoryView>,
     file_dialog: egui_file_dialog::FileDialog,
     md_cache: CommonMarkCache,
     graph: Graph,
@@ -308,6 +350,7 @@ impl App {
             completion: None,
             completion_dismissed: None,
             dialog: None,
+            history: None,
             file_dialog: egui_file_dialog::FileDialog::new().title("vaultフォルダを選択"),
             md_cache: CommonMarkCache::default(),
             graph: Graph::new(true),
@@ -437,8 +480,16 @@ impl App {
         let before = self.tabs.len();
         self.tabs.retain_mut(|tab| match vault.note(&tab.path) {
             Some(note) => {
-                if !tab.dirty && note.text != tab.text {
+                if note.text == tab.text {
+                    // 外部で同じ内容になった（または自分の保存が反映された）
+                    tab.base.clone_from(&note.text);
+                    tab.conflict = None;
+                } else if !tab.dirty {
                     tab.set_text(note.text.clone());
+                    tab.base.clone_from(&note.text);
+                } else if note.text != tab.base {
+                    // 未保存の編集中に外部で書き換えられた。黙って上書きしない
+                    tab.conflict = Some(note.text.clone());
                 }
                 true
             }
@@ -456,10 +507,24 @@ impl App {
         if !tab.dirty {
             return;
         }
+        if tab.conflict.is_some() {
+            // 解決前にタブを閉じたり終了したりしても編集が消えないよう、履歴に退避しておく
+            let _ = robsidian_core::history::snapshot(vault.root(), &tab.path, &tab.text);
+            return;
+        }
+        // 索引の更新（ファイル監視）を待たず、実ファイルで外部の変更を確かめる
+        if let Some(disk) = vault.disk_text(&tab.path) {
+            if disk != tab.base && disk != tab.text {
+                tab.conflict = Some(disk);
+                tab.edited_at = None;
+                return;
+            }
+        }
         match vault.write_note(&tab.path, &tab.text) {
             Ok(()) => {
                 tab.dirty = false;
                 tab.edited_at = None;
+                tab.base.clone_from(&tab.text);
                 self.generation += 1;
             }
             Err(e) => {
@@ -503,6 +568,7 @@ impl App {
         };
         self.active = idx;
         self.tabs[idx].jump = line.or(self.tabs[idx].jump);
+        self.tabs[idx].focus = true;
         self.show_graph = false;
         self.completion = None;
     }
@@ -662,6 +728,11 @@ impl App {
                     self.dialog = Some(Dialog::Delete { path });
                 }
             }
+            Command::History => {
+                if let Some(path) = current {
+                    self.open_history(&path);
+                }
+            }
             Command::OpenVault => self.file_dialog.pick_directory(),
             Command::ToggleTheme => self.cfg.dark = !self.cfg.dark,
             Command::Rescan => {
@@ -670,6 +741,122 @@ impl App {
                     self.generation += 1;
                     self.sync_tabs();
                 }
+            }
+        }
+    }
+
+    fn open_history(&mut self, path: &str) {
+        if let Some(vault) = &self.vault {
+            self.history = Some(HistoryView::new(vault.root(), path));
+        }
+    }
+
+    fn history_ui(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.history.as_mut() else {
+            return;
+        };
+        let current = match self.tabs.iter().find(|t| t.path == view.path) {
+            Some(tab) => tab.text.clone(),
+            None => self
+                .vault
+                .as_ref()
+                .and_then(|v| v.note(&view.path))
+                .map_or_else(String::new, |n| n.text.clone()),
+        };
+        let colors = Colors::new(self.cfg.dark);
+        let Some(outcome) = view.show(ctx, &current, &colors) else {
+            return;
+        };
+        let path = view.path.clone();
+        self.history = None;
+        if let history_view::Outcome::Restore(text) = outcome {
+            self.open_note(&path, None);
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
+                // 通常の編集と同じ扱いにする（自動保存され、上書き前の内容は履歴に残る）
+                tab.set_text(text);
+                tab.dirty = true;
+                tab.edited_at = Some(Instant::now());
+                self.toast("履歴の版に戻しました");
+            }
+        }
+    }
+
+    /// 未保存の編集中に外部でノートが書き換えられたときの選択肢を出す。
+    fn conflict_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(disk) = tab.conflict.clone() else {
+            return;
+        };
+        let colors = Colors::new(self.cfg.dark);
+        let mut choice = None;
+        egui::Frame::NONE
+            .fill(colors.warn_bg)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("このノートは、編集中に外部（別のアプリや同期）で変更されました。").strong());
+                ui.weak("保存を止めています。どちらの内容を残すか選んでください。どれを選んでも、消える側の内容は履歴に残ります。");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("外部の変更を読み込む").on_hover_text("自分の編集を破棄（履歴に残す）").clicked() {
+                        choice = Some(0);
+                    }
+                    if ui.button("自分の編集で上書き").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("両方残す").on_hover_text("自分の編集を別名のノートとして保存し、外部の変更を読み込む").clicked() {
+                        choice = Some(2);
+                    }
+                    if ui.button("差分を見る").on_hover_text("履歴から比べる").clicked() {
+                        choice = Some(3);
+                    }
+                });
+            });
+        ui.add_space(4.0);
+        let Some(choice) = choice else { return };
+        let idx = self.active;
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let tab = &mut self.tabs[idx];
+        match choice {
+            0 => {
+                let _ = robsidian_core::history::snapshot(vault.root(), &tab.path, &tab.text);
+                tab.set_text(disk.clone());
+                tab.base = disk;
+                tab.dirty = false;
+                tab.edited_at = None;
+                tab.conflict = None;
+            }
+            1 => {
+                tab.base = disk;
+                tab.conflict = None;
+                self.save_tab(idx);
+            }
+            2 => {
+                let stem = tab.path.strip_suffix(".md").unwrap_or(&tab.path);
+                let stamp = chrono::Local::now().format("%Y-%m-%d %H%M%S");
+                let copy = format!("{stem} (競合 {stamp})");
+                match vault.create_note(&copy, &tab.text) {
+                    Ok(created) => {
+                        tab.set_text(disk.clone());
+                        tab.base = disk;
+                        tab.dirty = false;
+                        tab.edited_at = None;
+                        tab.conflict = None;
+                        self.generation += 1;
+                        self.toast(format!("自分の編集を「{created}」に保存しました"));
+                    }
+                    Err(e) => self.toast(format!("別名で保存できません: {e:#}")),
+                }
+            }
+            _ => {
+                // 外部の内容を履歴に入れておくと、履歴ダイアログで自分の編集と比べられる
+                let path = tab.path.clone();
+                let _ = robsidian_core::history::snapshot(vault.root(), &path, &disk);
+                self.open_history(&path);
             }
         }
     }
@@ -704,11 +891,12 @@ impl App {
             Action::Dialog(d) => self.dialog = Some(d),
             Action::OpenVault(path) => self.open_vault(path, ctx),
             Action::Run(cmd) => self.run(cmd, ctx),
+            Action::History(path) => self.open_history(&path),
         }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.dialog.is_some() {
+        if self.dialog.is_some() || self.history.is_some() {
             return;
         }
         ctx.input_mut(|input| {
@@ -1051,6 +1239,7 @@ impl App {
             return;
         }
         self.active = self.active.min(self.tabs.len() - 1);
+        self.conflict_banner(ui);
         match self.cfg.view_mode {
             ViewMode::Live => self.editor_ui(ui, actions, true),
             ViewMode::Edit => self.editor_ui(ui, actions, false),
@@ -1121,6 +1310,9 @@ impl App {
             });
         }
 
+        if std::mem::take(&mut tab.focus) {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
         let mut scroll_to = None;
         if let Some(line) = tab.jump.take() {
             let byte = editor::line_start(&tab.text, line);
@@ -1591,10 +1783,10 @@ impl App {
             let q = p.query.trim();
             if p.commands {
                 let q = q.to_lowercase();
-                let hits = COMMANDS
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.1.to_lowercase().contains(&q));
+                let hits = COMMANDS.iter().enumerate().filter(|(_, c)| {
+                    // IMEをオフにしたまま英語でも引けるようにする
+                    c.1.to_lowercase().contains(&q) || c.0.keywords().contains(q.as_str())
+                });
                 p.items.extend(hits.map(|(i, _)| PaletteItem::Cmd(i)));
             } else if let Some(vault) = &self.vault {
                 let notes = search::fuzzy(vault, q, 30);
@@ -1871,6 +2063,9 @@ fn tree_ui(
             });
         }
         row.context_menu(|ui| {
+            if *note && ui.button("履歴…").clicked() {
+                actions.push(Action::History(path.clone()));
+            }
             if ui.button("改名/移動…").clicked() {
                 actions.push(Action::Dialog(Dialog::Rename {
                     path: path.clone(),
@@ -1922,6 +2117,7 @@ impl eframe::App for App {
 
         self.palette_ui(&ctx, &mut actions);
         self.dialog_ui(&ctx);
+        self.history_ui(&ctx);
         self.file_dialog.update(&ctx);
         if let Some(path) = self.file_dialog.take_picked() {
             actions.push(Action::OpenVault(path));

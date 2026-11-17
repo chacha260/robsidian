@@ -19,6 +19,9 @@ pub struct Colors {
     pub code_bg: Color32,
     pub quote: Color32,
     pub mark_bg: Color32,
+    pub diff_add: Color32,
+    pub diff_del: Color32,
+    pub warn_bg: Color32,
 }
 
 impl Colors {
@@ -36,6 +39,9 @@ impl Colors {
                 code_bg: Color32::from_rgb(0x26, 0x29, 0x30),
                 quote: Color32::from_rgb(0xa6, 0xab, 0xb5),
                 mark_bg: Color32::from_rgb(0x5c, 0x4d, 0x12),
+                diff_add: Color32::from_rgb(0x1f, 0x3d, 0x2a),
+                diff_del: Color32::from_rgb(0x4a, 0x22, 0x26),
+                warn_bg: Color32::from_rgb(0x4a, 0x3a, 0x12),
             }
         } else {
             Self {
@@ -50,6 +56,9 @@ impl Colors {
                 code_bg: Color32::from_rgb(0xee, 0xef, 0xf2),
                 quote: Color32::from_rgb(0x5c, 0x61, 0x6b),
                 mark_bg: Color32::from_rgb(0xff, 0xec, 0x99),
+                diff_add: Color32::from_rgb(0xd8, 0xf5, 0xdf),
+                diff_del: Color32::from_rgb(0xfb, 0xdd, 0xdd),
+                warn_bg: Color32::from_rgb(0xfd, 0xf0, 0xc8),
             }
         }
     }

@@ -2,6 +2,7 @@
 //!
 //! GUI（`robsidian`）とCLI（`rob`）の両方がこのクレートだけに依存する。
 
+pub mod history;
 pub mod parse;
 pub mod search;
 pub mod vault;

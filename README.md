@@ -60,6 +60,8 @@ cargo run --release -p robsidian -- /path/to/vault
 | 保存 | 自動保存（入力後約1秒・フォーカス喪失時・終了時）、アトミック書き込み |
 | 外部変更の追従 | 別エディタやObsidian本体、`git pull` による変更を監視して即反映 |
 | 削除 | OSのゴミ箱へ移動（完全削除はしない） |
+| 競合の検知 | 編集中に外部（Obsidian本体・同期・別エディタ）でノートが変わったら保存を止め、「外部の変更を読み込む / 自分の編集で上書き / 両方残す / 差分を見る」から選べる |
+| ローカル履歴 | 保存で上書きされる直前の内容を `.robsidian/history` に残す（最大50件・30日）。差分を見て任意の版に戻せる |
 
 ### Live Preview
 
@@ -97,6 +99,8 @@ cargo run --release -p robsidian -- /path/to/vault
 | Ctrl+B / Ctrl+J | 左 / 右サイドバー |
 | Ctrl+Tab / Ctrl+W | 次のタブ / タブを閉じる |
 | Ctrl+O | 別のvaultを開く |
+
+コマンドパレットは英語でも検索できます（例: `history`、`daily`、`graph`）。
 | Ctrl + `+` / `-` | 全体の拡大縮小 |
 
 macOSでは Ctrl の代わりに Cmd です。

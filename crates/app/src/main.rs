@@ -6,6 +6,7 @@ mod config;
 mod editor;
 mod graph;
 mod highlight;
+mod history_view;
 mod preview;
 
 use eframe::egui;

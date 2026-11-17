@@ -2543,9 +2543,10 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "robsidian"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "eframe",
  "egui-file-dialog",
@@ -2556,13 +2557,14 @@ dependencies = [
  "robsidian-core",
  "serde",
  "serde_json",
+ "similar",
  "syntect",
  "trash",
 ]
 
 [[package]]
 name = "robsidian-cli"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2573,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "robsidian-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2748,6 +2750,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "siphasher"
