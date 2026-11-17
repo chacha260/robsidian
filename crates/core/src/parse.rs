@@ -52,6 +52,9 @@ pub struct Parsed {
     pub body_start: usize,
     /// タスク（`- [ ] ...`）。コードブロックの中は含まない
     pub tasks: Vec<crate::task::Task>,
+    /// 本文中の `#タグ` のタグ名（`#` を除く）のバイト範囲。frontmatterのタグは含まない
+    #[serde(skip)]
+    pub tag_spans: Vec<Range<usize>>,
 }
 
 pub fn parse(text: &str) -> Parsed {
@@ -269,6 +272,8 @@ fn scan_inline(line: &str, base: usize, line_no: usize, out: &mut Parsed) {
                     let tag = rest[..end].trim_end_matches('/');
                     if !tag.is_empty() && !tag.chars().all(|c| c.is_ascii_digit()) {
                         push_unique(&mut out.tags, tag);
+                        let start = base + i + 1;
+                        out.tag_spans.push(start..start + tag.len());
                     }
                     i += 1 + end;
                     continue;
@@ -408,6 +413,7 @@ mod tests {
         assert_eq!(p.links[2].heading.as_deref(), Some("sec"));
         assert_eq!(&src[p.links[2].span.clone()], "dir/b%20c.md");
         assert_eq!(p.tags, vec!["project/alpha"]);
+        assert_eq!(&src[p.tag_spans[0].clone()], "project/alpha");
     }
 
     #[test]

@@ -3,11 +3,15 @@
 //! 出力は1行1件のプレーンテキスト（`--json` でJSON）なので、
 //! fzf / xargs / jq / nushell などにそのままパイプできる。
 
-use anyhow::{Context, Result};
+mod export;
+mod lint;
+mod serve;
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use robsidian_core::{search, Vault};
+use robsidian_core::{git, search, usercmd, Vault};
 use serde_json::json;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -96,6 +100,40 @@ enum Cmd {
     },
     /// vaultの統計
     Stats,
+    /// リンク切れ・埋め込み先なし・曖昧なリンクなどを報告する（エラーがあれば終了コード1）
+    Lint {
+        /// 孤立ノートも警告する
+        #[arg(long)]
+        orphans: bool,
+        /// 警告もエラーとして扱う（終了コード1にする）
+        #[arg(long)]
+        strict: bool,
+    },
+    /// vaultを静的なHTMLサイトとして書き出す
+    Export {
+        /// 書き出し先のフォルダ
+        out: PathBuf,
+        /// 空でないフォルダにも書き出す
+        #[arg(long)]
+        force: bool,
+    },
+    /// タグを改名する（本文の #タグ と子タグ、frontmatterの tags）
+    TagRename { old: String, new: String },
+    /// 標準入出力で、1行1リクエストのJSONに答え続ける（エディタ連携用）
+    Serve,
+    /// ユーザーコマンド（.robsidian/commands.toml）を実行する。名前を省くと一覧
+    Run {
+        name: Option<String>,
+        /// このノートについて実行する（ROB_NOTE などに入る。input = "note" なら本文を標準入力に渡す）
+        #[arg(short, long)]
+        note: Option<String>,
+    },
+    /// vault以下の変更をgitにコミットする（スナップショット）
+    Snapshot {
+        /// コミットメッセージ（省略時は日時）
+        #[arg(short, long)]
+        message: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -412,6 +450,94 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Lint { orphans, strict } => {
+            let issues = lint::run(&vault, orphans);
+            let errors = issues
+                .iter()
+                .filter(|i| i.level == lint::Level::Error)
+                .count();
+            let warnings = issues.len() - errors;
+            if out.json {
+                out.value(&serde_json::to_value(&issues)?)?;
+            } else {
+                for i in &issues {
+                    let level = match i.level {
+                        lint::Level::Error => "error",
+                        lint::Level::Warning => "warning",
+                    };
+                    writeln!(
+                        out.w,
+                        "{}:{}: {level}[{}]: {}",
+                        i.path, i.line, i.code, i.message
+                    )?;
+                }
+            }
+            out.w.flush()?;
+            eprintln!("{errors}件のエラー、{warnings}件の警告");
+            if errors > 0 || (strict && warnings > 0) {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Export { out: dest, force } => {
+            let n = export::run(&vault, &dest, force)?;
+            eprintln!("{n}ページを {} に書き出しました", dest.display());
+        }
+        Cmd::TagRename { old, new } => {
+            let changed = vault.rename_tag(&old, &new)?;
+            eprintln!("{}件のノートを書き換えました", changed.len());
+            out.lines(changed)?;
+        }
+        Cmd::Serve => {
+            out.w.flush()?;
+            return serve::run(vault);
+        }
+        Cmd::Run { name, note } => {
+            let list = usercmd::load(vault.root())?
+                .map(|(_, l)| l)
+                .unwrap_or_default();
+            let Some(name) = name else {
+                if out.json {
+                    let v: Vec<_> = list
+                        .iter()
+                        .map(|c| json!({"name": c.name, "run": c.run, "key": c.key}))
+                        .collect();
+                    out.value(&json!(v))?;
+                } else {
+                    out.lines(list.iter().map(|c| format!("{}\t{}", c.name, c.run)))?;
+                }
+                return Ok(());
+            };
+            let Some(cmd) = list.iter().find(|c| c.name == name) else {
+                bail!("ユーザーコマンドが見つかりません: {name}");
+            };
+            let note = note.map(|n| note_arg(&vault, &n)).transpose()?;
+            let input = match (cmd.input, &note) {
+                (usercmd::Input::Note, Some(n)) => {
+                    vault.note(n).map_or_else(String::new, |n| n.text.clone())
+                }
+                (usercmd::Input::None, _) => String::new(),
+                _ if std::io::stdin().is_terminal() => String::new(),
+                _ => std::io::read_to_string(std::io::stdin())?,
+            };
+            let env = usercmd::Env { note, line: None };
+            let done = usercmd::execute(cmd, vault.root(), &env, &input)?;
+            out.w.write_all(done.stdout.as_bytes())?;
+            eprint!("{}", done.stderr);
+            if !done.success {
+                out.w.flush()?;
+                std::process::exit(1);
+            }
+        }
+        Cmd::Snapshot { message } => {
+            if !git::is_repo(vault.root()) {
+                bail!("vaultはgitのリポジトリの中にありません");
+            }
+            let message = message.unwrap_or_else(snapshot_message);
+            match git::snapshot(vault.root(), &message)? {
+                Some(hash) => eprintln!("コミットしました: {hash} {message}"),
+                None => eprintln!("コミットする変更はありません"),
+            }
+        }
         Cmd::Stats => {
             let links: usize = vault.notes().map(|n| n.parsed.links.len()).sum();
             let words: usize = vault
@@ -440,4 +566,12 @@ fn run(cli: Cli) -> Result<()> {
     }
     out.w.flush()?;
     Ok(())
+}
+
+/// 既定のスナップショットのメッセージ
+fn snapshot_message() -> String {
+    format!(
+        "スナップショット {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M")
+    )
 }

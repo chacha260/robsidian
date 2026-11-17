@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod edit;
 mod editor;
+mod external;
 mod find;
 mod fonts;
 mod graph;

@@ -16,3 +16,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
+[dev-dependencies]
+tempfile = "3"
