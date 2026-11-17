@@ -1,12 +1,14 @@
 //! エディタ用のMarkdownシンタックスハイライトと、カーソル位置まわりの補助関数。
 
 use eframe::egui::text::{LayoutJob, TextFormat};
-use eframe::egui::{Color32, FontFamily, FontId, Stroke, Vec2};
+use crate::highlight;
+use eframe::egui::{Align, Color32, FontFamily, FontId, Stroke, Vec2};
 use std::ops::Range;
 use robsidian_core::{parse, LinkKind};
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Colors {
+    pub dark: bool,
     pub text: Color32,
     pub dim: Color32,
     pub heading: Color32,
@@ -23,6 +25,7 @@ impl Colors {
     pub fn new(dark: bool) -> Self {
         if dark {
             Self {
+                dark,
                 text: Color32::from_rgb(0xd4, 0xd7, 0xdd),
                 dim: Color32::from_rgb(0x74, 0x7a, 0x86),
                 heading: Color32::from_rgb(0xf2, 0xf3, 0xf5),
@@ -36,6 +39,7 @@ impl Colors {
             }
         } else {
             Self {
+                dark,
                 text: Color32::from_rgb(0x2a, 0x2d, 0x33),
                 dim: Color32::from_rgb(0x8a, 0x8f, 0x99),
                 heading: Color32::from_rgb(0x10, 0x12, 0x16),
@@ -56,6 +60,11 @@ const HIDDEN_SIZE: f32 = 0.01;
 
 /// 本文の行の高さ（文字サイズに対する倍率）。
 const LINE_HEIGHT: f32 = 1.5;
+
+/// 本文1行ぶんの高さ。
+pub fn line_height(size: f32) -> f32 {
+    size * LINE_HEIGHT
+}
 
 /// 文字の上（または背面）に重ねて描く装飾。範囲は**文字数**での位置。
 #[derive(Debug, Clone, PartialEq)]
@@ -94,8 +103,8 @@ pub struct Options<'a> {
     pub colors: &'a Colors,
     /// Live Preview: カーソルの無い行の記法を畳む
     pub live: bool,
-    /// 記法をそのまま見せる行の範囲（カーソルや選択のある行。0始まり、両端含む）
-    pub reveal: Option<(usize, usize)>,
+    /// カーソル（選択範囲）の文字位置（両端含む）。これに触れている要素だけ記法をそのまま見せる
+    pub cursor: Option<(usize, usize)>,
     /// 画像リンク先 → 表示サイズ。読み込めない・未読み込みなら None
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
 }
@@ -113,6 +122,8 @@ struct Painter<'a> {
     chars: usize,
     size: f32,
     c: &'a Colors,
+    live: bool,
+    cursor: Option<(usize, usize)>,
 }
 
 impl Painter<'_> {
@@ -123,6 +134,16 @@ impl Painter<'_> {
             color,
             ..Default::default()
         }
+    }
+
+    /// この文字範囲の記法を畳んでよいか（Live Previewで、カーソルが触れていない）。
+    fn hidden(&self, chars: Range<usize>) -> bool {
+        self.live && !self.cursor.is_some_and(|(a, b)| a <= chars.end && chars.start <= b)
+    }
+
+    /// いま積んでいる位置から `text` ぶんの文字範囲。
+    fn ahead(&self, text: &str) -> Range<usize> {
+        self.chars..self.chars + text.chars().count()
     }
 
     fn mono(&self, color: Color32) -> TextFormat {
@@ -165,7 +186,7 @@ impl Painter<'_> {
     }
 
     /// 1行ぶんのインライン要素（コード・リンク・強調・タグ）を積む。
-    fn inline(&mut self, line: &str, hide: bool, base: Color32) {
+    fn inline(&mut self, line: &str, base: Color32) {
         let b = line.as_bytes();
         let mut plain_from = 0;
         let mut i = 0;
@@ -267,6 +288,8 @@ impl Painter<'_> {
             match token {
                 Some((start, inner_start, inner_end, end, format)) => {
                     self.push(&line[plain_from..start], self.fmt(base));
+                    // カーソルがこの要素に触れている間だけ記法を見せる
+                    let hide = self.hidden(self.ahead(&line[start..end]));
                     self.push(&line[start..inner_start], self.mark(hide));
                     self.push(&line[inner_start..inner_end], format);
                     self.push(&line[inner_end..end], self.mark(hide));
@@ -280,45 +303,51 @@ impl Painter<'_> {
     }
 
     /// 行頭の記号（リスト・タスク・引用）を積み、残りの本文の開始位置と文字色を返す。
-    fn block_prefix(&mut self, line: &str, hide: bool) -> (usize, Color32) {
+    /// 行頭の記号（リスト・タスク・引用）を積み、残りの本文の開始位置と文字色、
+    /// 引用の縦線を描くかどうかを返す。記号は、カーソルが触れている間だけそのまま見せる。
+    fn block_prefix(&mut self, line: &str) -> (usize, Color32, bool) {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         let text = self.c.text;
         if trimmed.starts_with("> ") || trimmed == ">" {
-            self.push(&line[..indent], self.fmt(text));
             let end = (indent + 2).min(line.len());
+            let hide = self.hidden(self.ahead(&line[..end]));
+            self.push(&line[..indent], self.fmt(text));
             self.push(&line[indent..end], self.ghost(hide));
-            return (end, self.c.quote);
+            return (end, self.c.quote, hide);
         }
         let bullet = ["- ", "* ", "+ "].iter().any(|m| trimmed.starts_with(m));
         if bullet {
-            self.push(&line[..indent], self.fmt(text));
             let rest = &trimmed[2..];
             let checked = rest.starts_with("[x] ") || rest.starts_with("[X] ");
             if checked || rest.starts_with("[ ] ") {
                 // `- [ ] ` → 先頭の `- ` を畳み、`[ ]` の位置にチェックボックスを描く
+                let hide = self.hidden(self.ahead(&line[..indent + 5]));
+                self.push(&line[..indent], self.fmt(text));
                 self.push(&line[indent..indent + 2], self.mark(hide));
                 let range = self.push(&line[indent + 2..indent + 5], self.ghost(hide));
                 if hide {
                     self.deco(DecoKind::Checkbox(checked), range);
                 }
                 self.push(" ", self.fmt(text));
-                return (indent + 6, if checked { self.c.dim } else { text });
+                return (indent + 6, if checked { self.c.dim } else { text }, false);
             }
+            let hide = self.hidden(self.ahead(&line[..indent + 1]));
+            self.push(&line[..indent], self.fmt(text));
             let range = self.push(&line[indent..indent + 1], self.ghost(hide));
             if hide {
                 self.deco(DecoKind::Bullet, range);
             }
             self.push(" ", self.fmt(text));
-            return (indent + 2, text);
+            return (indent + 2, text, false);
         }
         let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
         if digits > 0 && trimmed[digits..].starts_with(". ") {
             let end = indent + digits + 2;
             self.push(&line[..end], self.fmt(self.c.dim));
-            return (end, text);
+            return (end, text, false);
         }
-        (0, text)
+        (0, text, false)
     }
 }
 
@@ -368,8 +397,16 @@ fn is_table_separator(line: &str) -> bool {
 
 /// 表のセルなど、エディタ外に描く短い文字列をインライン記法つきで組む。
 pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> LayoutJob {
-    let mut p = Painter { job: LayoutJob::default(), decos: Vec::new(), chars: 0, size, c: colors };
-    p.inline(text, true, color);
+    let mut p = Painter {
+        job: LayoutJob::default(),
+        decos: Vec::new(),
+        chars: 0,
+        size,
+        c: colors,
+        live: true,
+        cursor: None,
+    };
+    p.inline(text, color);
     p.job
 }
 
@@ -388,12 +425,17 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         chars: 0,
         size: opt.size,
         c: opt.colors,
+        live: opt.live,
+        cursor: opt.cursor,
     };
     let size = opt.size;
     let mut in_frontmatter = text.starts_with("---\n") || text.starts_with("---\r\n");
     let mut fence: Option<(u8, usize)> = None;
-    // 処理中の表: (最後の行, 整形表示するか, 表の開始文字位置, 集めた行)
+    // 処理中の表: (最後の行, 整形表示するか, 表の開始文字位置, 集めた行) と、その最初の行
     let mut table: Option<(usize, bool, usize, Vec<TableRow>)> = None;
+    let mut first_line = 0;
+    // 処理中のコードブロックの色分け結果: (本文の最初の行, 行ごとの (色, バイト数))
+    let mut code: Option<(usize, highlight::Lines)> = None;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     fn content(raw: &str) -> &str {
         raw.trim_end_matches(['\n', '\r'])
@@ -403,8 +445,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         let line = content(raw);
         let eol = &raw[line.len()..];
         let trimmed = line.trim_start();
-        let revealed = opt.reveal.is_some_and(|(a, b)| (a..=b).contains(&n));
-        let hide = opt.live && !revealed;
+        // 行全体が1つの要素（水平線・画像・コードフェンス）のときの判定
+        let hide = p.hidden(p.ahead(line));
 
         if in_frontmatter {
             p.push(raw, p.mono(p.c.dim));
@@ -423,25 +465,57 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         };
         let closes = matches!((marker, fence), (Some((c, l)), Some((oc, ol))) if c == oc && l >= ol);
         if fence.is_some() || marker.is_some() {
-            let is_fence_line = (fence.is_none() && marker.is_some()) || closes;
-            let color = if is_fence_line { p.c.dim } else { p.c.code };
+            let opens = fence.is_none();
             let start = p.chars;
-            if is_fence_line && hide {
-                // ``` は畳み、言語名だけ小さく残す（閉じる側の行は高さごと畳まれる）
+            if opens || closes {
+                // ``` は畳むが、行の高さは固定する（カーソルの出入りで下の行が動かないように）。
+                // 開く側は言語名だけ薄く残す。
                 let ticks = line.len() - trimmed.len() + marker.map_or(0, |(_, len)| len);
-                p.push(&line[..ticks], p.mark(true));
-                let mut small = p.mono(p.c.dim);
-                small.font_id.size = opt.size * 0.75;
-                p.push(&line[ticks..], small);
+                let row = Some(size * 1.3);
+                let mut mark = if hide { p.mark(true) } else { p.mono(p.c.dim) };
+                mark.line_height = row;
+                let mut label = p.mono(p.c.dim);
+                label.line_height = row;
+                p.push(&line[..ticks], mark);
+                p.push(&line[ticks..], label.clone());
+                p.push(eol, label);
             } else {
-                p.push(line, p.mono(color));
+                let colored = code.as_ref().and_then(|(first, spans)| spans.get(n - first));
+                match colored {
+                    Some(spans) => {
+                        // 色分け済みの断片は、行末の改行まで含めて元の行をちょうど覆う
+                        let mut at = 0;
+                        for &(color, len) in spans {
+                            let end = (at + len).min(raw.len());
+                            p.push(&raw[at..end], p.mono(color));
+                            at = end;
+                        }
+                        p.push(&raw[at..], p.mono(p.c.code));
+                    }
+                    None => {
+                        p.push(raw, p.mono(p.c.code));
+                    }
+                }
             }
-            p.deco(DecoKind::Code, start..p.chars);
-            p.push(eol, p.mono(color));
-            if fence.is_none() {
+            p.deco(DecoKind::Code, start..start + line.chars().count());
+            if opens {
                 fence = marker;
+                let lang = trimmed.trim_start_matches(['`', '~']).trim();
+                let lang = lang.split([' ', ',', '{']).next().unwrap_or("");
+                // ブロックの終わり（閉じフェンスの手前、無ければ文書の最後）までを一度に色分けする
+                let (ch, len) = marker.unwrap_or((b'`', 3));
+                let body_end = (n + 1..lines.len())
+                    .find(|&i| {
+                        let t = content(lines[i]).trim_start();
+                        let run = t.bytes().take_while(|&c| c == ch).count();
+                        run >= len && t[run..].trim().is_empty()
+                    })
+                    .unwrap_or(lines.len());
+                code = highlight::code(lang, &lines[n + 1..body_end], opt.colors.dark)
+                    .map(|spans| (n + 1, spans));
             } else if closes {
                 fence = None;
+                code = None;
             }
             continue;
         }
@@ -455,6 +529,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             format.font_id.size = size * scale;
             format.line_height = Some(size * scale * LINE_HEIGHT);
             let marker_end = (line.len() - trimmed.len() + level + 1).min(line.len());
+            // `# ` は、カーソルがそこに触れているときだけ見せる
+            let hide = p.hidden(p.ahead(&line[..marker_end]));
             let mut mark = p.mark(hide);
             if !hide {
                 mark.font_id.size = size * scale;
@@ -468,12 +544,14 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                 p.deco(DecoKind::Rule, range);
             }
         } else if let Some((target, image_size)) = image_only(line)
-            .filter(|_| hide)
+            .filter(|_| opt.live)
             .and_then(|t| (opt.image)(&t).map(|s| (t, s)))
         {
-            // 行の文字は畳み、行の高さを画像ぶん確保して、そこへ画像を描く
-            let mut format = p.mark(true);
-            format.line_height = Some(image_size.y + 8.0);
+            // 記法の行（1行ぶん）の下に画像の場所を確保する。行の高さは、記法を見せるときも
+            // 畳むときも同じにして、カーソルの出入りで下の内容が動かないようにする。
+            let mut format = if hide { p.mark(true) } else { p.fmt(p.c.dim) };
+            format.line_height = Some(line_height(size) + image_size.y + 8.0);
+            format.valign = Align::TOP;
             let range = p.push(line, format);
             p.deco(DecoKind::Image(target), range);
         } else if table.is_some() || trimmed.starts_with('|') {
@@ -489,19 +567,26 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                     n
                 };
                 // 表の中にカーソルがある間は、表全体をソースのまま見せる
-                let touched = opt.reveal.is_some_and(|(a, b)| a <= end && n <= b);
-                table = Some((end, is_table && opt.live && !touched, p.chars, Vec::new()));
+                let block: usize = lines[n..=end].iter().map(|l| l.chars().count()).sum();
+                let pretty = is_table && p.hidden(p.chars..p.chars + block);
+                table = Some((end, pretty, p.chars, Vec::new()));
+                first_line = n;
             }
             let (end, pretty, start, mut rows) = table.take().expect("set above");
-            if !pretty {
-                p.push(line, p.mono(p.c.text));
-            } else if rows.len() == 1 && is_table_separator(line) {
-                p.push(line, p.mark(true));
+            // 表の行の高さは、整形表示でもソース表示でも同じにする（カーソルが表に入っても
+            // 下の内容が動かないように）。区切り行は低くして、整形表示では見出し行の一部として描く。
+            let separator = n == first_line + 1 && is_table_separator(line);
+            let row_height = opt.live.then_some(size * if separator { 1.0 } else { 1.7 });
+            let mut format = if !pretty {
+                p.mono(p.c.text)
+            } else if separator {
+                p.mark(true)
             } else {
-                // 文字は透明にして行の高さだけ確保し、上に表を描く
-                let mut ghost = p.ghost(true);
-                ghost.line_height = Some(size * 1.9);
-                let chars = p.push(line, ghost);
+                p.ghost(true)
+            };
+            format.line_height = row_height;
+            let chars = p.push(line, format);
+            if pretty && !separator {
                 rows.push(TableRow { chars, cells: table_cells(line) });
             }
             if n < end {
@@ -511,9 +596,9 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             }
         } else {
             let start = p.chars;
-            let (body, color) = p.block_prefix(line, hide);
-            p.inline(&line[body..], hide, color);
-            if hide && color == p.c.quote {
+            let (body, color, quote_bar) = p.block_prefix(line);
+            p.inline(&line[body..], color);
+            if quote_bar {
                 p.deco(DecoKind::Quote, start..p.chars);
             }
         }
@@ -588,18 +673,18 @@ mod tests {
         assert_eq!(char_of_byte(t, byte_of_char(t, 5)), 5);
     }
 
-    fn run(text: &str, live: bool, reveal: Option<(usize, usize)>) -> Layout {
+    fn run(text: &str, live: bool, cursor: Option<(usize, usize)>) -> Layout {
         let colors = Colors::new(true);
         let image = |t: &str| (t == "pic.png").then_some(Vec2::new(100.0, 50.0));
-        layout(text, &Options { size: 14.0, colors: &colors, live, reveal, image: &image })
+        layout(text, &Options { size: 14.0, colors: &colors, live, cursor, image: &image })
     }
 
     const SAMPLE: &str = "---\na: b\n---\n# H\n- [ ] `c` [[l|別名]] **b** *i* ~~s~~ ==m== #tag [x](y)\n- item\n> quote\n---\n![[pic.png]]\n```\ncode\n```\n| a | b |\n|---|---|\n| 1 | x \\| y |\nsnake_case_name tail";
 
     #[test]
     fn layout_never_changes_the_text() {
-        for (live, reveal) in [(false, None), (true, None), (true, Some((4, 5)))] {
-            let out = run(SAMPLE, live, reveal);
+        for (live, cursor) in [(false, None), (true, None), (true, Some((20, 60)))] {
+            let out = run(SAMPLE, live, cursor);
             assert_eq!(out.job.text, SAMPLE);
             let total: usize = out.job.sections.iter().map(|s| s.byte_range.end.0 - s.byte_range.start.0).sum();
             assert_eq!(total, SAMPLE.len());
@@ -647,14 +732,51 @@ mod tests {
         let chars: String = SAMPLE.chars().skip(cb.start).take(cb.len()).collect();
         assert_eq!(chars, "[ ]");
 
-        // カーソルのある行は記法をそのまま見せる
-        let revealed = run(SAMPLE, true, Some((3, 13)));
-        assert_eq!(hidden(&revealed), "");
-        assert!(revealed.decos.iter().all(|d| d.kind == DecoKind::Code));
-        // ソース表示では何も畳まない
+        // カーソルが触れている要素だけ記法を見せる（同じ行の他の要素は畳んだまま）
+        let at = |needle: &str| SAMPLE[..SAMPLE.find(needle).unwrap()].chars().count();
+        let bold = at("**b**") + 3;
+        let on_bold = run(SAMPLE, true, Some((bold, bold)));
+        assert_eq!(
+            hidden(&on_bold),
+            "# ¦- ¦`¦`¦[[l|¦]]¦*¦*¦~~¦~~¦==¦==¦[¦](y)¦![[pic.png]]¦```¦```¦|---|---|"
+        );
+        // 行頭に置くと、その行の行頭記号だけが見える
+        let task = at("- [ ]");
+        let on_task = run(SAMPLE, true, Some((task, task)));
+        assert!(hidden(&on_task).starts_with("# ¦`¦`¦[[l|"));
+        assert!(!on_task.decos.iter().any(|d| matches!(d.kind, DecoKind::Checkbox(_))));
+        // 表の中に置くと、表全体がソース表示に戻る
+        let cell = at("| 1 |") + 2;
+        let on_table = run(SAMPLE, true, Some((cell, cell)));
+        assert!(!hidden(&on_table).contains("|---|"));
+        assert!(!on_table.decos.iter().any(|d| matches!(d.kind, DecoKind::Table(_))));
+        // 全選択すればすべての記法が見える。ソース表示では何も畳まない
+        let all = run(SAMPLE, true, Some((0, SAMPLE.chars().count())));
+        assert_eq!(hidden(&all), "");
         let source = run(SAMPLE, false, None);
         assert_eq!(hidden(&source), "");
         assert!(source.decos.iter().all(|d| d.kind == DecoKind::Code));
+    }
+
+    #[test]
+    fn row_heights_do_not_depend_on_the_cursor() {
+        // カーソルの出入りで行の高さが変わると表示が上下に動くので、どの要素でも一定に保つ
+        let text = "# H\n**b** [[l|a]]\n- [ ] t\n> q\n```rust\nfn f() {}\n```\n![[pic.png]]\n| a | b |\n|---|---|\n| 1 | 2 |\nend";
+        let heights = |cursor| -> Vec<Option<u32>> {
+            let out = run(text, true, cursor);
+            let mut rows = vec![None; text.lines().count()];
+            for section in &out.job.sections {
+                let line = text[..section.byte_range.start.0].matches('\n').count();
+                let size = section.format.font_id.size;
+                let h = section.format.line_height.unwrap_or(if size > 1.0 { size } else { 0.0 });
+                rows[line] = rows[line].max(Some((h * 100.0) as u32));
+            }
+            rows
+        };
+        let unfocused = heights(None);
+        for cursor in 0..=text.chars().count() {
+            assert_eq!(heights(Some((cursor, cursor))), unfocused, "cursor at {cursor}");
+        }
     }
 
     #[test]

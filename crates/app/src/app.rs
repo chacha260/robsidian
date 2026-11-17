@@ -89,7 +89,7 @@ enum Dialog {
     Delete { path: String },
 }
 
-/// 組版結果を使い回せる条件: (文字サイズ, ダーク, Live Preview, 記法を見せる行, 画像の最大幅)
+/// 組版結果を使い回せる条件: (文字サイズ, ダーク, Live Preview, カーソルの文字範囲, 画像の最大幅)
 type LayoutKey = (f32, bool, bool, Option<(usize, usize)>, u32);
 
 struct Tab {
@@ -989,20 +989,18 @@ impl App {
             scroll_to = Some(ccursor);
         }
 
-        // Live Preview: カーソル（選択範囲）のある行だけ記法を見せる。
-        // 組版はTextEditが入力を処理する前の状態で決めるので、行が変わった直後は1フレーム遅れる
+        // Live Preview: カーソル（選択範囲）が触れている要素だけ記法を見せる。
+        // 組版はTextEditが入力を処理する前の状態で決めるので、カーソルが動いた直後は1フレーム遅れる
         // （下で再描画を要求して追従させる）。
-        let line_of = |text: &str, ch: usize| text.chars().take(ch).filter(|&c| c == '\n').count();
-        let cursor_lines = |text: &str, range: Option<CCursorRange>| {
+        let span = |range: Option<CCursorRange>| {
             range.map(|r| {
-                let (a, b) = (line_of(text, r.primary.index.0), line_of(text, r.secondary.index.0));
+                let (a, b) = (r.primary.index.0, r.secondary.index.0);
                 (a.min(b), a.max(b))
             })
         };
         let focused = ctx.memory(|m| m.has_focus(id));
-        let reveal = if live && focused {
-            let state = TextEdit::load_state(&ctx, id);
-            cursor_lines(&tab.text, state.and_then(|s| s.cursor.char_range()))
+        let cursor = if live && focused {
+            span(TextEdit::load_state(&ctx, id).and_then(|s| s.cursor.char_range()))
         } else {
             None
         };
@@ -1029,7 +1027,7 @@ impl App {
         };
         let image_size = |target: &str| load_image(target).map(|(_, size)| size);
 
-        let key: LayoutKey = (size, cfg.dark, live, reveal, max_width as u32);
+        let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32);
         if tab.layout_key != Some(key) || tab.layout_stale {
             tab.layout_key = Some(key);
             tab.layout = editor::Layout::default();
@@ -1037,7 +1035,7 @@ impl App {
         let Tab { text, layout, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
-                let options = editor::Options { size, colors: &colors, live, reveal, image: &image_size };
+                let options = editor::Options { size, colors: &colors, live, cursor, image: &image_size };
                 *layout = editor::layout(buf.as_str(), &options);
             }
             let mut job = layout.job.clone();
@@ -1077,7 +1075,7 @@ impl App {
         if tab.layout_stale {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-        if live && response_focus(&output) && cursor_lines(&tab.text, output.cursor_range) != reveal {
+        if live && response_focus(&output) && span(output.cursor_range) != cursor {
             ctx.request_repaint();
         }
 
@@ -1179,7 +1177,12 @@ impl App {
                     let table_right = xs[columns];
                     let line = egui::Stroke::new(1.0, colors.dim.gamma_multiply(0.5));
                     for (r, (table_row, galleys)) in rows.iter().zip(&cells).enumerate() {
-                        let (top, bottom) = (row(table_row.chars.start).top(), row(table_row.chars.end).bottom());
+                        let top = row(table_row.chars.start).top();
+                        // 見出し行は、畳んだ区切り行の高さも含めて次の行の上端までとする
+                        let bottom = match rows.get(r + 1).filter(|_| r == 0) {
+                            Some(next) => row(next.chars.start).top(),
+                            None => row(table_row.chars.end).bottom(),
+                        };
                         if r == 0 {
                             let header = egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(table_right, bottom));
                             painter.rect_filled(header, 0.0, colors.code_bg);
@@ -1197,7 +1200,8 @@ impl App {
                 }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
-                        let rect = egui::Rect::from_min_size(egui::pos2(left, a.top() + 4.0), image_size);
+                        let top = a.top() + editor::line_height(size) + 4.0;
+                        let rect = egui::Rect::from_min_size(egui::pos2(left, top), image_size);
                         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                         painter.image(texture, rect, uv, egui::Color32::WHITE);
                     }
