@@ -6047,19 +6047,6 @@ impl eframe::App for App {
     }
 }
 
-#[cfg(test)]
-mod composer_tests {
-    use super::*;
-
-    #[test]
-    fn names_for_extracted_notes() {
-        assert_eq!(suggested_name("\n\n## 設計の方針\n本文"), "設計の方針");
-        assert_eq!(suggested_name("- 買い物: 牛乳/卵 [[x]]"), "買い物 牛乳卵 x");
-        assert_eq!(sanitize_name("  a#b^c?  "), "abc");
-        assert_eq!(sanitize_name(&"長".repeat(80)).chars().count(), 50);
-    }
-}
-
 /// 歯車のアイコンのボタン（フォントに歯車の字が無いことがあるので、図形で描く）
 fn gear_button(ui: &mut egui::Ui) -> egui::Response {
     let size = egui::vec2(18.0, 18.0);
@@ -6100,4 +6087,17 @@ fn gear_button(ui: &mut egui::Ui) -> egui::Response {
     painter.circle_filled(c, r * 0.72, color);
     painter.circle_filled(c, r * 0.3, ui.visuals().panel_fill);
     response
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+
+    #[test]
+    fn names_for_extracted_notes() {
+        assert_eq!(suggested_name("\n\n## 設計の方針\n本文"), "設計の方針");
+        assert_eq!(suggested_name("- 買い物: 牛乳/卵 [[x]]"), "買い物 牛乳卵 x");
+        assert_eq!(sanitize_name("  a#b^c?  "), "abc");
+        assert_eq!(sanitize_name(&"長".repeat(80)).chars().count(), 50);
+    }
 }
