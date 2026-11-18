@@ -242,23 +242,43 @@ filters:            # すべてのビューに効く条件。and / or / not を�
   and:
     - file.hasTag("book")
     - 'status != "読了"'
+formulas:           # 計算列。列や並べ替えでは formula.名前 と書く
+  星: 'if(rating, "★".repeat(rating), "未評価")'
+  経過年: 'if(published, today().year - published.year + "年前", "")'
 properties:
   author:
     displayName: 著者
+  formula.星:
+    displayName: 評価
 views:
   - type: table
     name: 読書中
-    order: [file.name, author, status]   # 列
+    order: [file.name, author, status, formula.星]   # 列
     sort:
       - property: rating
         direction: DESC
     limit: 20
     filters: 'rating >= 4'               # このビューだけの条件
+  - type: cards                          # カード
+    name: 表紙
+    image: note.cover                    # 画像にするプロパティ（[[表紙.png]]・ファイル名・URL）
+    cardSize: 200                        # カードの幅
+    imageAspectRatio: 1.4                # 画像の高さ / 幅
+    imageFit: contain                    # 全体を収める（既定は枠いっぱいに切り抜く）
 ```
 
-- 条件式：比較（`==` `!=` `>` `<` `>=` `<=`）、`file.hasTag()` `file.inFolder()` `file.hasLink()` `file.hasProperty()`、`プロパティ.contains()`、先頭の `!` による否定
-- プロパティ：frontmatter のキー（`note.` は省略可）と、`file.name` `file.path` `file.folder` `file.mtime` `file.tags` `file.links` など
-- 未対応：`formulas`（計算式）、表以外のビュー（カードなど）、グループ分け。未対応の式は、黙って無視せずエラーとして表示します
+- 式（条件と計算列で同じ）
+  - 演算子：`+ - * / %`、比較（`==` `!=` `>` `<` `>=` `<=`）、`&&` `||` `!`、`条件 ? A : B`、かっこ、リスト `[a, b]`
+  - 参照：frontmatter のキー（`note.x`、空白などを含む名前は `note["x y"]`）、`file.name` `file.basename` `file.path` `file.folder` `file.ext` `file.size` `file.mtime` `file.ctime` `file.tags` `file.links` `file.backlinks`、`formula.x`
+  - ファイル：`file.hasTag()` `file.inFolder()` `file.hasLink()` `file.hasProperty()`
+  - 関数：`if()` `now()` `today()` `date()` `number()` `string()` `list()` `link()` `max()` `min()` `duration()`
+  - 文字列：`.length` `contains()` `containsAny()` `containsAll()` `startsWith()` `endsWith()` `lower()` `upper()` `title()` `trim()` `replace()` `repeat()` `slice()` `split()`
+  - 数値：`toFixed()` `round()` `abs()` `ceil()` `floor()`
+  - リスト：`.length` `[番号]` `contains()` `containsAny()` `containsAll()` `join()` `reverse()` `sort()` `unique()` `flat()` `slice()`
+  - 日付：`.year` `.month` `.day` `.hour` `.minute` `format("YYYY-MM-DD")` `date()` `time()` `relative()`、期間の足し引き（`now() - "7d"`、単位は `y` `M` `w` `d` `h` `m` `s`）、日付どうしの差（ミリ秒）
+  - どの値にも：`isEmpty()` `toString()`
+- 未対応：グループ分け（`groupBy`）、集計（`summaries`）、`this`、ラムダ式（`map` / `filter`）。未対応のものは、黙って無視せずエラーとして表示します
+- カードのビューは、ノートの中の埋め込みやプレビューでは、画像を先頭の列にした表として出します
 
 ### 関連ノート
 

@@ -1,32 +1,38 @@
-//! Bases（Obsidian の `.base`）: ノートのプロパティを表にして、絞り込み・並べ替えをする。
+//! Bases（Obsidian の `.base`）: ノートのプロパティを表やカードにして、絞り込み・並べ替えをする。
 //!
-//! Obsidian の書き方のうち、よく使う部分だけを読む。
+//! Obsidian の書き方のうち、よく使う部分を読む（Obsidian の仕様との突き合わせはまだで、互換は一部）。
 //!
 //! ```yaml
 //! filters:
 //!   and:
 //!     - file.hasTag("book")
 //!     - 'status != "done"'
+//! formulas:
+//!   税込: 'if(price, (price * 1.1).round() + "円")'
 //! properties:
 //!   status:
 //!     displayName: 状態
+//!   formula.税込:
+//!     displayName: 税込価格
 //! views:
 //!   - type: table
 //!     name: 読書中
-//!     order: [file.name, author, status]
+//!     order: [file.name, author, status, formula.税込]
 //!     sort:
 //!       - property: file.mtime
 //!         direction: DESC
 //!     limit: 20
+//!   - type: cards
+//!     name: 表紙
+//!     image: note.cover
 //! ```
 //!
-//! 条件式は、比較（`==` `!=` `>` `<` `>=` `<=`）、`file.hasTag()` `file.inFolder()` `file.hasLink()`
-//! `file.hasProperty()`、`プロパティ.contains()`、先頭の `!` による否定に対応する。
-//! それ以外（式の計算 `formulas`、カード表示など）は未対応で、未対応の式はエラーとして見せる。
+//! 条件式と計算列の式は [`crate::formula`] で計算する。未対応の関数やメソッドはエラーとして見せる。
 
-use crate::props::{self, Value as PropValue};
+use crate::formula::{self, Ctx, Expr, Val};
+use crate::props;
 use crate::{Note, Vault};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use yaml_rust2::{Yaml, YamlLoader};
@@ -42,6 +48,7 @@ pub enum Filter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
+    /// `table` か `cards`（それ以外は表として出す）
     pub kind: String,
     pub name: String,
     pub filters: Option<Filter>,
@@ -49,11 +56,38 @@ pub struct View {
     /// (プロパティ, 降順か)
     pub sort: Vec<(String, bool)>,
     pub limit: Option<usize>,
+    /// カードの画像にするプロパティ（`note.cover` など）
+    pub image: Option<String>,
+    /// カードの幅（px）
+    pub card_size: Option<f32>,
+    /// 画像の縦横比（高さ / 幅）
+    pub image_aspect: Option<f32>,
+    /// 画像を枠いっぱいに切り抜くか（`cover`）、全体を収めるか（`contain`）
+    pub image_fit: Option<String>,
+}
+
+impl View {
+    fn table() -> Self {
+        View {
+            kind: "table".into(),
+            name: "表".into(),
+            filters: None,
+            order: Vec::new(),
+            sort: Vec::new(),
+            limit: None,
+            image: None,
+            card_size: None,
+            image_aspect: None,
+            image_fit: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Base {
     pub filters: Option<Filter>,
+    /// 計算列（名前 → 式）
+    pub formulas: BTreeMap<String, String>,
     pub views: Vec<View>,
     /// プロパティ → 表示名
     pub display: BTreeMap<String, String>,
@@ -63,17 +97,24 @@ pub struct Base {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Table {
     pub view: String,
+    /// ビューの種類（`table` / `cards`）
+    pub kind: String,
     /// (プロパティ, 表示名)
     pub columns: Vec<(String, String)>,
     pub rows: Vec<Row>,
     /// 当てはまったノートの数（`limit` で切る前）
     pub total: usize,
+    pub card_size: Option<f32>,
+    pub image_aspect: Option<f32>,
+    pub image_fit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub path: String,
     pub cells: Vec<String>,
+    /// カードの画像（vault 内のパスか URL）
+    pub image: Option<String>,
 }
 
 fn filter_of(y: &Yaml) -> Result<Option<Filter>> {
@@ -117,6 +158,15 @@ fn text_of(y: &Yaml) -> Option<String> {
     }
 }
 
+fn number_of(y: &Yaml) -> Option<f32> {
+    match y {
+        Yaml::Integer(i) => Some(*i as f32),
+        Yaml::Real(r) => r.parse().ok(),
+        Yaml::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 /// `.base` の本文（YAML）を読む。
 pub fn parse(text: &str) -> Result<Base> {
     let docs = YamlLoader::load_from_str(text).map_err(|e| anyhow!("YAML の誤り: {e}"))?;
@@ -127,6 +177,13 @@ pub fn parse(text: &str) -> Result<Base> {
         filters: filter_of(&doc["filters"])?,
         ..Base::default()
     };
+    if let Yaml::Hash(formulas) = &doc["formulas"] {
+        for (k, v) in formulas {
+            if let (Some(k), Some(e)) = (text_of(k), text_of(v)) {
+                base.formulas.insert(k, e);
+            }
+        }
+    }
     if let Yaml::Hash(props) = &doc["properties"] {
         for (k, v) in props {
             if let (Some(k), Some(name)) = (k.as_str(), v["displayName"].as_str()) {
@@ -160,264 +217,88 @@ pub fn parse(text: &str) -> Result<Base> {
                 order,
                 sort,
                 limit: v["limit"].as_i64().and_then(|n| usize::try_from(n).ok()),
+                image: text_of(&v["image"]),
+                card_size: number_of(&v["cardSize"]),
+                image_aspect: number_of(&v["imageAspectRatio"]),
+                image_fit: text_of(&v["imageFit"]),
             });
         }
     }
     if base.views.is_empty() {
-        base.views.push(View {
-            kind: "table".into(),
-            name: "表".into(),
-            filters: None,
-            order: Vec::new(),
-            sort: Vec::new(),
-            limit: None,
-        });
+        base.views.push(View::table());
     }
     Ok(base)
 }
 
-/// 比較に使う値
-#[derive(Debug, Clone, PartialEq)]
-enum Val {
-    Null,
-    Bool(bool),
-    Num(f64),
-    Str(String),
-    List(Vec<String>),
+/// 式を読んでおいた絞り込み
+enum Compiled {
+    And(Vec<Compiled>),
+    Or(Vec<Compiled>),
+    Not(Vec<Compiled>),
+    Expr(Expr),
 }
 
-impl Val {
-    fn from_text(s: &str) -> Val {
-        let t = s.trim().trim_matches(['"', '\'']);
-        match t {
-            "true" => Val::Bool(true),
-            "false" => Val::Bool(false),
-            "" => Val::Null,
-            _ => t
-                .parse::<f64>()
-                .map_or_else(|_| Val::Str(t.to_string()), Val::Num),
-        }
-    }
-
-    fn display(&self) -> String {
-        match self {
-            Val::Null => String::new(),
-            Val::Bool(b) => b.to_string(),
-            Val::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => format!("{}", *n as i64),
-            Val::Num(n) => n.to_string(),
-            Val::Str(s) => s.clone(),
-            Val::List(l) => l.join(", "),
-        }
-    }
-
-    fn truthy(&self) -> bool {
-        match self {
-            Val::Null => false,
-            Val::Bool(b) => *b,
-            Val::Num(n) => *n != 0.0,
-            Val::Str(s) => !s.is_empty(),
-            Val::List(l) => !l.is_empty(),
-        }
-    }
-
-    fn cmp(&self, other: &Val) -> Option<Ordering> {
-        match (self, other) {
-            (Val::Num(a), Val::Num(b)) => a.partial_cmp(b),
-            (Val::Null, Val::Null) => Some(Ordering::Equal),
-            (Val::Null, _) | (_, Val::Null) => None,
-            (a, b) => Some(a.display().to_lowercase().cmp(&b.display().to_lowercase())),
-        }
-    }
-}
-
-fn frontmatter(note: &Note) -> Vec<props::Prop> {
-    props::read(&note.text).unwrap_or_default()
-}
-
-/// ノートのプロパティの値。`file.` で始まるものはファイルの情報、`note.` は省略できる。
-fn property(vault: &Vault, note: &Note, fm: &[props::Prop], key: &str) -> Val {
-    match key {
-        "file.name" => return Val::Str(note.name.clone()),
-        "file.basename" => return Val::Str(note.name.clone()),
-        "file.path" => return Val::Str(note.path.clone()),
-        "file.folder" => return Val::Str(crate::vault::parent_dir(&note.path).to_string()),
-        "file.ext" => return Val::Str("md".into()),
-        "file.size" => return Val::Num(note.text.len() as f64),
-        "file.mtime" | "file.ctime" => return Val::Num(note.mtime as f64),
-        "file.tags" => return Val::List(note.parsed.tags.clone()),
-        "file.links" => {
-            return Val::List(
-                vault
-                    .outgoing(&note.path)
-                    .into_iter()
-                    .filter_map(|(_, dst)| dst.map(str::to_string))
-                    .collect(),
-            )
-        }
-        _ => {}
-    }
-    let key = key.strip_prefix("note.").unwrap_or(key);
-    match fm.iter().find(|p| p.key == key).map(|p| &p.value) {
-        Some(PropValue::Text(t)) => Val::from_text(t),
-        Some(PropValue::List(l)) => Val::List(l.clone()),
-        Some(PropValue::Raw(r)) => Val::Str(r.trim().to_string()),
-        None => Val::Null,
-    }
-}
-
-/// 関数の引数（`"a", "b"`）を読む
-fn args(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(|a| a.trim().trim_matches(['"', '\'']).to_string())
-        .filter(|a| !a.is_empty())
-        .collect()
-}
-
-/// 条件式を1つ評価する。
-fn eval(vault: &Vault, note: &Note, fm: &[props::Prop], expr: &str) -> Result<bool> {
-    let e = expr.trim();
-    if let Some(rest) = e.strip_prefix('!') {
-        return Ok(!eval(vault, note, fm, rest)?);
-    }
-    if let Some(inner) = e.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
-        return eval(vault, note, fm, inner);
-    }
-    // 関数呼び出し: name(args)
-    if let Some(open) = e.find('(') {
-        if e.ends_with(')') && !e[..open].contains([' ', '=', '<', '>']) {
-            let name = &e[..open];
-            let a = args(&e[open + 1..e.len() - 1]);
-            return match name {
-                "file.hasTag" => Ok(a.iter().any(|t| {
-                    let t = t.trim_start_matches('#').to_lowercase();
-                    note.parsed.tags.iter().any(|nt| {
-                        let nt = nt.to_lowercase();
-                        nt == t || nt.starts_with(&format!("{t}/"))
-                    })
-                })),
-                "file.inFolder" => Ok(a.iter().any(|f| {
-                    let f = f.trim_matches('/');
-                    f.is_empty() || note.path.starts_with(&format!("{f}/"))
-                })),
-                "file.hasLink" => Ok(a.iter().any(|target| {
-                    let target_path = vault.resolve(target, &note.path).map(str::to_string);
-                    vault
-                        .outgoing(&note.path)
-                        .iter()
-                        .any(|(_, dst)| dst.is_some() && dst.map(str::to_string) == target_path)
-                })),
-                "file.hasProperty" => Ok(a.iter().any(|p| fm.iter().any(|f| f.key == *p))),
-                _ => {
-                    // プロパティ.contains("x")
-                    if let Some(prop) = name.strip_suffix(".contains") {
-                        let v = property(vault, note, fm, prop);
-                        let needle = a.first().map(|s| s.to_lowercase()).unwrap_or_default();
-                        Ok(match v {
-                            Val::List(l) => l.iter().any(|x| x.to_lowercase() == needle),
-                            other => other.display().to_lowercase().contains(&needle),
-                        })
-                    } else {
-                        bail!("未対応の関数です: {name}()")
-                    }
-                }
-            };
-        }
-    }
-    // 比較: 左 演算子 右（長い演算子から探す）
-    for op in ["==", "!=", ">=", "<=", ">", "<"] {
-        if let Some(i) = find_op(e, op) {
-            let left = operand(vault, note, fm, &e[..i]);
-            let right = operand(vault, note, fm, &e[i + op.len()..]);
-            let ord = left.cmp(&right);
-            return Ok(match op {
-                "==" => ord == Some(Ordering::Equal),
-                "!=" => ord != Some(Ordering::Equal),
-                ">" => ord == Some(Ordering::Greater),
-                "<" => ord == Some(Ordering::Less),
-                ">=" => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
-                _ => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
-            });
-        }
-    }
-    match e {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        // プロパティだけなら、値があるか
-        _ if e
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-')) =>
-        {
-            Ok(property(vault, note, fm, e).truthy())
-        }
-        _ => bail!("未対応の条件です: {e}"),
-    }
-}
-
-/// 引用符の外にある演算子の位置
-fn find_op(e: &str, op: &str) -> Option<usize> {
-    let mut quote: Option<char> = None;
-    for (i, c) in e.char_indices() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if e[i..].starts_with(op) => {
-                // `>=` を `>` と読まないよう、次の文字が `=` なら飛ばす（`==` `!=` `>=` `<=` を先に探している）
-                if matches!(op, ">" | "<") && e[i + 1..].starts_with('=') {
-                    continue;
-                }
-                return Some(i);
-            }
-            None => {}
-        }
-    }
-    None
-}
-
-fn operand(vault: &Vault, note: &Note, fm: &[props::Prop], s: &str) -> Val {
-    let t = s.trim();
-    if t.starts_with('"') || t.starts_with('\'') {
-        return Val::Str(t.trim_matches(['"', '\'']).to_string());
-    }
-    if let Ok(n) = t.parse::<f64>() {
-        return Val::Num(n);
-    }
-    match t {
-        "true" => Val::Bool(true),
-        "false" => Val::Bool(false),
-        "null" => Val::Null,
-        _ => property(vault, note, fm, t),
-    }
-}
-
-fn matches(vault: &Vault, note: &Note, fm: &[props::Prop], f: &Filter) -> Result<bool> {
+fn compile(f: &Filter) -> Result<Compiled> {
+    let all = |list: &[Filter]| list.iter().map(compile).collect::<Result<Vec<_>>>();
     Ok(match f {
-        Filter::And(list) => {
+        Filter::And(l) => Compiled::And(all(l)?),
+        Filter::Or(l) => Compiled::Or(all(l)?),
+        Filter::Not(l) => Compiled::Not(all(l)?),
+        Filter::Expr(e) => {
+            Compiled::Expr(formula::parse(e).with_context(|| format!("条件を読めません: {e}"))?)
+        }
+    })
+}
+
+fn matches(ctx: &Ctx, f: &Compiled) -> Result<bool> {
+    Ok(match f {
+        Compiled::And(list) => {
             for f in list {
-                if !matches(vault, note, fm, f)? {
+                if !matches(ctx, f)? {
                     return Ok(false);
                 }
             }
             true
         }
-        Filter::Or(list) => {
+        Compiled::Or(list) => {
             for f in list {
-                if matches(vault, note, fm, f)? {
+                if matches(ctx, f)? {
                     return Ok(true);
                 }
             }
             list.is_empty()
         }
-        Filter::Not(list) => {
+        Compiled::Not(list) => {
             for f in list {
-                if matches(vault, note, fm, f)? {
+                if matches(ctx, f)? {
                     return Ok(false);
                 }
             }
             true
         }
-        Filter::Expr(e) => eval(vault, note, fm, e)?,
+        Compiled::Expr(e) => ctx.eval(e)?.truthy(),
     })
+}
+
+/// 画像のプロパティの値（`[[表紙.png]]`・`表紙.png`・URL）を、vault 内のパスか URL にする
+fn image_of(vault: &Vault, note: &Note, v: &Val) -> Option<String> {
+    let first = match v {
+        Val::List(l) => l.first()?.display(),
+        other => other.display(),
+    };
+    let t = first.trim();
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return Some(t.to_string());
+    }
+    let t = t
+        .trim_start_matches('!')
+        .trim_start_matches("[[")
+        .trim_end_matches("]]");
+    let t = t.split('|').next()?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    vault.resolve_file(t, &note.path).map(str::to_string)
 }
 
 /// ビューの名前（無ければ最初のビュー）で表を作る。
@@ -430,37 +311,72 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
             .ok_or_else(|| anyhow!("ビューがありません: {name}"))?,
         None => &base.views[0],
     };
+    let formulas: BTreeMap<String, Expr> = base
+        .formulas
+        .iter()
+        .map(|(k, e)| {
+            formula::parse(e)
+                .with_context(|| format!("計算列 {k} の式を読めません: {e}"))
+                .map(|x| (k.clone(), x))
+        })
+        .collect::<Result<_>>()?;
+    let filters: Vec<Compiled> = [&base.filters, &v.filters]
+        .into_iter()
+        .flatten()
+        .map(compile)
+        .collect::<Result<_>>()?;
     let mut hits: Vec<(&Note, Vec<props::Prop>)> = Vec::new();
     for note in vault.notes() {
-        let fm = frontmatter(note);
-        let ok = match (&base.filters, &v.filters) {
-            (None, None) => true,
-            (a, b) => {
-                a.as_ref()
-                    .map_or(Ok(true), |f| matches(vault, note, &fm, f))?
-                    && b.as_ref()
-                        .map_or(Ok(true), |f| matches(vault, note, &fm, f))?
-            }
+        let fm = props::read(&note.text).unwrap_or_default();
+        let ctx = Ctx {
+            vault,
+            note,
+            fm: &fm,
+            formulas: &formulas,
+            depth: 0,
         };
+        let mut ok = true;
+        for f in &filters {
+            if !matches(&ctx, f)? {
+                ok = false;
+                break;
+            }
+        }
         if ok {
             hits.push((note, fm));
         }
     }
-    // 並べ替え（指定が無ければ名前順）
+    // 並べ替えの値は先に計算しておく（比べるたびに式を計算しないように）
     let sort = if v.sort.is_empty() {
         vec![("file.name".to_string(), false)]
     } else {
         v.sort.clone()
     };
-    hits.sort_by(|(a, fa), (b, fb)| {
-        for (prop, desc) in &sort {
-            let (x, y) = (property(vault, a, fa, prop), property(vault, b, fb, prop));
+    let mut keyed: Vec<(Vec<Val>, &Note, Vec<props::Prop>)> = hits
+        .into_iter()
+        .map(|(note, fm)| {
+            let ctx = Ctx {
+                vault,
+                note,
+                fm: &fm,
+                formulas: &formulas,
+                depth: 0,
+            };
+            let keys = sort
+                .iter()
+                .map(|(prop, _)| ctx.column(prop))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((keys, note, fm))
+        })
+        .collect::<Result<_>>()?;
+    keyed.sort_by(|(ka, a, _), (kb, b, _)| {
+        for ((x, y), (_, desc)) in ka.iter().zip(kb).zip(&sort) {
             // 値の無いものは常に後ろ
-            let ord = match (&x, &y) {
+            let ord = match (x, y) {
                 (Val::Null, Val::Null) => Ordering::Equal,
                 (Val::Null, _) => return Ordering::Greater,
                 (_, Val::Null) => return Ordering::Less,
-                _ => x.cmp(&y).unwrap_or(Ordering::Equal),
+                _ => x.compare(y).unwrap_or(Ordering::Equal),
             };
             let ord = if *desc { ord.reverse() } else { ord };
             if ord != Ordering::Equal {
@@ -469,15 +385,15 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
         }
         a.path.cmp(&b.path)
     });
-    let total = hits.len();
+    let total = keyed.len();
     if let Some(n) = v.limit {
-        hits.truncate(n);
+        keyed.truncate(n);
     }
-    // 列（指定が無ければ、名前と、当てはまったノートの frontmatter のキー）
+    // 列（指定が無ければ、名前と、当てはまったノートの frontmatter のキーと、計算列）
     let keys: Vec<String> = if v.order.is_empty() {
         let mut seen = BTreeSet::new();
         let mut keys = vec!["file.name".to_string()];
-        for (_, fm) in &hits {
+        for (_, _, fm) in &keyed {
             for p in fm {
                 if seen.insert(p.key.clone()) {
                     keys.push(p.key.clone());
@@ -485,6 +401,7 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
             }
         }
         keys.truncate(8);
+        keys.extend(base.formulas.keys().map(|k| format!("formula.{k}")));
         keys
     } else {
         v.order.clone()
@@ -495,63 +412,73 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
             let shown = base
                 .display
                 .get(k)
+                .or_else(|| base.display.get(k.strip_prefix("note.").unwrap_or(k)))
                 .cloned()
                 .unwrap_or_else(|| match k.as_str() {
                     "file.name" => "名前".to_string(),
                     "file.path" => "パス".to_string(),
                     "file.folder" => "フォルダ".to_string(),
                     "file.mtime" => "更新".to_string(),
+                    "file.ctime" => "作成".to_string(),
                     "file.tags" => "タグ".to_string(),
-                    other => other.strip_prefix("note.").unwrap_or(other).to_string(),
+                    other => other
+                        .strip_prefix("note.")
+                        .or_else(|| other.strip_prefix("formula."))
+                        .unwrap_or(other)
+                        .to_string(),
                 });
             (k.clone(), shown)
         })
         .collect();
-    let rows = hits
-        .iter()
-        .map(|(note, fm)| Row {
+    let mut rows = Vec::with_capacity(keyed.len());
+    for (_, note, fm) in &keyed {
+        let ctx = Ctx {
+            vault,
+            note,
+            fm,
+            formulas: &formulas,
+            depth: 0,
+        };
+        let cells = keys
+            .iter()
+            .map(|k| ctx.column(k).map(|v| v.display()))
+            .collect::<Result<Vec<_>>>()?;
+        let image = match &v.image {
+            Some(prop) => image_of(vault, note, &ctx.column(prop)?),
+            None => None,
+        };
+        rows.push(Row {
             path: note.path.clone(),
-            cells: keys
-                .iter()
-                .map(|k| match k.as_str() {
-                    "file.mtime" | "file.ctime" => {
-                        chrono::DateTime::from_timestamp(note.mtime as i64, 0)
-                            .map(|t| {
-                                t.with_timezone(&chrono::Local)
-                                    .format("%Y-%m-%d %H:%M")
-                                    .to_string()
-                            })
-                            .unwrap_or_default()
-                    }
-                    _ => property(vault, note, fm, k).display(),
-                })
-                .collect(),
-        })
-        .collect();
+            cells,
+            image,
+        });
+    }
     Ok(Table {
         view: v.name.clone(),
+        kind: v.kind.clone(),
         columns,
         rows,
         total,
+        card_size: v.card_size,
+        image_aspect: v.image_aspect,
+        image_fit: v.image_fit.clone(),
     })
 }
 
 /// 表を Markdown の表にする（プレビューや埋め込みで使う）。名前の列はノートへのリンクにする。
+/// カードのビューは、画像を先頭の列にした表にする。
 pub fn to_markdown(table: &Table) -> String {
     let esc = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    let cards = table.kind == "cards" && table.rows.iter().any(|r| r.image.is_some());
     let mut out = String::new();
-    out.push_str(&format!(
-        "| {} |\n",
-        table
-            .columns
-            .iter()
-            .map(|(_, n)| esc(n))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    ));
-    out.push_str(&format!("|{}\n", " --- |".repeat(table.columns.len())));
+    let mut header: Vec<String> = table.columns.iter().map(|(_, n)| esc(n)).collect();
+    if cards {
+        header.insert(0, "画像".to_string());
+    }
+    out.push_str(&format!("| {} |\n", header.join(" | ")));
+    out.push_str(&format!("|{}\n", " --- |".repeat(header.len())));
     for row in &table.rows {
-        let cells: Vec<String> = row
+        let mut cells: Vec<String> = row
             .cells
             .iter()
             .zip(&table.columns)
@@ -564,6 +491,16 @@ pub fn to_markdown(table: &Table) -> String {
                 }
             })
             .collect();
+        if cards {
+            cells.insert(
+                0,
+                match &row.image {
+                    Some(url) if url.contains("://") => format!("![]({url})"),
+                    Some(path) => format!("![[{path}\\|120]]"),
+                    None => String::new(),
+                },
+            );
+        }
         out.push_str(&format!("| {} |\n", cells.join(" | ")));
     }
     if table.rows.is_empty() {
@@ -685,6 +622,62 @@ views:
         assert_eq!(check("status"), ["books/a.md", "books/b.md", "notes/d.md"]);
         let bad = parse("filters: 'pages + 1 ~ 2'").unwrap();
         assert!(run(&v, &bad, None).is_err());
+    }
+
+    #[test]
+    fn formulas_and_cards() {
+        let (d, v) = vault();
+        fs::write(d.path().join("books/a.png"), "png").unwrap();
+        fs::write(
+            d.path().join("books/a.md"),
+            "---\ntags: [book]\nauthor: 太宰\nstatus: done\npages: 120\ncover: \"[[a.png]]\"\n---\n",
+        )
+        .unwrap();
+        let v2 = Vault::open(d.path()).unwrap();
+        drop(v);
+        let base = parse(
+            r#"
+filters: file.hasTag("book")
+formulas:
+  half: pages / 2
+  label: 'if(pages > 100, "厚い", "薄い") + "(" + formula.half + ")"'
+properties:
+  formula.label:
+    displayName: 厚さ
+views:
+  - type: table
+    name: 表
+    order: [file.name, formula.label]
+    sort:
+      - property: formula.half
+        direction: DESC
+  - type: cards
+    name: カード
+    image: note.cover
+    cardSize: 180
+    imageAspectRatio: 1.5
+"#,
+        )
+        .unwrap();
+        let t = run(&v2, &base, None).unwrap();
+        assert_eq!(t.columns[1].1, "厚さ");
+        let cells: Vec<&str> = t.rows.iter().map(|r| r.cells[1].as_str()).collect();
+        assert_eq!(cells, ["厚い(150)", "厚い(60)", "薄い(40)"]);
+
+        let t = run(&v2, &base, Some("カード")).unwrap();
+        assert_eq!(t.kind, "cards");
+        assert_eq!(t.card_size, Some(180.0));
+        assert_eq!(t.image_aspect, Some(1.5));
+        assert_eq!(t.rows[0].image.as_deref(), Some("books/a.png"));
+        assert_eq!(t.rows[1].image, None);
+        // 列の指定が無ければ、計算列も並ぶ
+        assert!(t.columns.iter().any(|(k, _)| k == "formula.half"));
+        let md = to_markdown(&t);
+        assert!(md.starts_with("| 画像 |"), "{md}");
+        assert!(md.contains("![[books/a.png\\|120]]"), "{md}");
+
+        let bad = parse("formulas:\n  x: 'nope('").unwrap();
+        assert!(run(&v2, &bad, None).is_err());
     }
 
     #[test]
