@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/cli", "crates/app"]
+# 取り込んだ外部のクレート（手を入れたもの）。fmt と clippy の対象にしない
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.2.13"
@@ -22,3 +24,7 @@ strip = true
 # GUIはデバッグビルドでも実用的な速度で動くよう依存だけ最適化する
 [profile.dev.package."*"]
 opt-level = 2
+
+# egui_commonmark の描画部分に、プレビューのリンクのホバーを知らせる口を足したもの（vendor/README.md）
+[patch.crates-io]
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
