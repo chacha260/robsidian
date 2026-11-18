@@ -76,7 +76,124 @@ pub struct Config {
     pub trusted_commands: std::collections::BTreeMap<String, String>,
     /// Mermaid図を画像にするコマンド（空なら使わない）。`-i 入力 -o 出力 -b transparent -t テーマ` を後ろに付けて実行する
     pub mermaid_command: String,
+    /// Obsidian のコアプラグインに当たる機能のオン・オフ
+    pub features: Features,
 }
+
+/// Obsidian のコアプラグインに当たる機能のオン・オフ（設定画面の「コアプラグイン」）。
+/// 新しく足した項目は、古い設定ファイルでもオンで始まる
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Features {
+    pub outgoing_links: bool,
+    pub footnotes: bool,
+    pub word_count: bool,
+    pub related: bool,
+    pub random_note: bool,
+    pub unique_note: bool,
+    pub slash_commands: bool,
+    pub note_composer: bool,
+    pub workspaces: bool,
+    pub bases: bool,
+    pub slides: bool,
+    pub canvas: bool,
+    pub audio: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self {
+            outgoing_links: true,
+            footnotes: true,
+            word_count: true,
+            related: true,
+            random_note: true,
+            unique_note: true,
+            slash_commands: true,
+            note_composer: true,
+            workspaces: true,
+            bases: true,
+            slides: true,
+            canvas: true,
+            audio: true,
+        }
+    }
+}
+
+/// 設定画面に並べる項目（名前, 説明, 値）
+pub struct FeatureInfo {
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub value: fn(&mut Features) -> &mut bool,
+}
+
+pub const FEATURES: &[FeatureInfo] = &[
+    FeatureInfo {
+        name: "発リンク",
+        hint: "右サイドバーに、このノートからのリンクの一覧を出す",
+        value: |f| &mut f.outgoing_links,
+    },
+    FeatureInfo {
+        name: "脚注ビュー",
+        hint: "右サイドバーに、脚注の一覧を出す",
+        value: |f| &mut f.footnotes,
+    },
+    FeatureInfo {
+        name: "文字数カウント",
+        hint: "ステータスバーに文字数と単語数を出す",
+        value: |f| &mut f.word_count,
+    },
+    FeatureInfo {
+        name: "関連ノート",
+        hint: "右サイドバーに、リンクやタグが近いノートを出す",
+        value: |f| &mut f.related,
+    },
+    FeatureInfo {
+        name: "ランダムノート",
+        hint: "コマンド「ランダムなノートを開く」",
+        value: |f| &mut f.random_note,
+    },
+    FeatureInfo {
+        name: "ユニークノート",
+        hint: "コマンド「ユニークノートを作成」",
+        value: |f| &mut f.unique_note,
+    },
+    FeatureInfo {
+        name: "スラッシュコマンド",
+        hint: "行頭で / を入力すると、コマンドパレットを開く",
+        value: |f| &mut f.slash_commands,
+    },
+    FeatureInfo {
+        name: "ノートコンポーザー",
+        hint: "選択範囲の切り出しと、ノートの結合",
+        value: |f| &mut f.note_composer,
+    },
+    FeatureInfo {
+        name: "ワークスペース",
+        hint: "タブと分割の配置を保存して開く",
+        value: |f| &mut f.workspaces,
+    },
+    FeatureInfo {
+        name: "Bases",
+        hint: ".base を表やカードで表示する。オフなら既定のアプリで開く",
+        value: |f| &mut f.bases,
+    },
+    FeatureInfo {
+        name: "スライド",
+        hint: "コマンド「スライドとして表示」",
+        value: |f| &mut f.slides,
+    },
+    FeatureInfo {
+        name: "Canvas",
+        hint: ".canvas を表示・編集する。オフなら既定のアプリで開く",
+        value: |f| &mut f.canvas,
+    },
+    FeatureInfo {
+        name: "音声録音",
+        hint: "録音と、埋め込んだ WAV のその場での再生。オフなら既定のアプリで開く",
+        value: |f| &mut f.audio,
+    },
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -105,6 +222,7 @@ impl Default for Config {
             split_focus_right: false,
             trusted_commands: Default::default(),
             mermaid_command: "mmdc".into(),
+            features: Features::default(),
         }
     }
 }
@@ -143,5 +261,29 @@ impl Config {
         self.recent_vaults.insert(0, path.clone());
         self.recent_vaults.truncate(8);
         self.vault = Some(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn features_default_on_and_keep_unknown_off() {
+        // 古い設定ファイル（features が無い）では、すべてオン
+        let cfg: Config = serde_json::from_str(r#"{"dark": false}"#).unwrap();
+        assert_eq!(cfg.features, Features::default());
+        // 一部だけ書いてあれば、書いていない項目はオン
+        let cfg: Config = serde_json::from_str(r#"{"features": {"canvas": false}}"#).unwrap();
+        assert!(!cfg.features.canvas && cfg.features.bases);
+        // 設定画面の一覧は、すべての項目を指している
+        let mut f = Features::default();
+        for info in FEATURES {
+            *(info.value)(&mut f) = false;
+        }
+        assert_eq!(
+            serde_json::to_string(&f).unwrap().matches("true").count(),
+            0
+        );
     }
 }

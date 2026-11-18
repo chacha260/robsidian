@@ -868,8 +868,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             format.valign = Align::TOP;
             let range = p.push(line, format);
             p.deco(DecoKind::Image(target), range);
-        } else if let Some(target) =
-            embed_only(line).filter(|t| opt.live && crate::player::is_audio(t))
+        } else if let Some(target) = embed_only(line)
+            .filter(|t| opt.live && crate::preview::audio_on() && crate::player::is_audio(t))
         {
             // 記法の行の下に、再生ボタンの場所を確保する
             let mut format = if hide { p.mark(true) } else { p.fmt(p.c.dim) };

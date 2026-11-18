@@ -1,6 +1,6 @@
 //! 設定画面。変更はすぐに反映し、閉じるときに保存する。
 
-use crate::config::{Config, ViewMode};
+use crate::config::{Config, Features, ViewMode, FEATURES};
 use eframe::egui::{self, RichText, Slider};
 use robsidian_core::Vault;
 
@@ -135,6 +135,31 @@ impl SettingsView {
                             .on_hover_text("後ろに -i 入力 -o 出力 -b transparent -t テーマ を付けて実行します。空にすると使いません");
                     });
                     ui.weak("mermaid-cli（mmdc）が入っていれば、```mermaid の図を画像にして表示します");
+
+                    section(ui, "コアプラグイン");
+                    ui.weak("Obsidian のコアプラグインに当たる機能です。使わないものはオフにできます");
+                    egui::Grid::new("features")
+                        .num_columns(2)
+                        .spacing([24.0, 6.0])
+                        .show(ui, |ui| {
+                            for (i, info) in FEATURES.iter().enumerate() {
+                                ui.checkbox((info.value)(&mut cfg.features), info.name)
+                                    .on_hover_text(info.hint);
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("すべてオン").clicked() {
+                            cfg.features = Features::default();
+                        }
+                        if ui.small_button("すべてオフ").clicked() {
+                            for info in FEATURES {
+                                *(info.value)(&mut cfg.features) = false;
+                            }
+                        }
+                    });
 
                     section(ui, "ローカル履歴");
                     ui.weak("保存で上書きされる直前の内容を .robsidian/history に残します");

@@ -145,6 +145,21 @@ impl Command {
 }
 
 type CommandEntry = (Command, &'static str, Option<(Modifiers, Key)>);
+
+impl Command {
+    /// 設定の「コアプラグイン」でオフにされていないか
+    fn enabled(self, f: &crate::config::Features) -> bool {
+        match self {
+            Command::RandomNote => f.random_note,
+            Command::UniqueNote => f.unique_note,
+            Command::ExtractNote | Command::MergeNote => f.note_composer,
+            Command::SaveLayout | Command::OpenLayout | Command::DeleteLayout => f.workspaces,
+            Command::Slides => f.slides,
+            Command::Record => f.audio,
+            _ => true,
+        }
+    }
+}
 const COMMANDS: &[CommandEntry] = &[
     (
         Command::Palette,
@@ -637,6 +652,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, vault_arg: Option<PathBuf>) -> Self {
         let cfg = Config::load();
+        preview::set_features(&cfg.features);
         let font = fonts::install(
             &cc.egui_ctx,
             (!cfg.font_path.is_empty()).then(|| std::path::Path::new(&cfg.font_path)),
@@ -1089,7 +1105,7 @@ impl App {
                 self.jump_to_heading(&path, heading);
             }
         } else if let Some(file) = vault.resolve_file(target, from).map(str::to_string) {
-            if crate::player::is_audio(&file) {
+            if self.cfg.features.audio && crate::player::is_audio(&file) {
                 // 録音などの音声は、その場で鳴らす（もう一度で止める）
                 self.toggle_audio(&file);
             } else {
@@ -1214,6 +1230,12 @@ impl App {
     // ---- コマンド ----
 
     fn run(&mut self, cmd: Command, ctx: &egui::Context) {
+        // オフにした機能は動かさない（録音中にオフにしたときは、止めることだけはできる）
+        if !cmd.enabled(&self.cfg.features) && !(cmd == Command::Record && self.recorder.is_some())
+        {
+            self.toast("この機能は設定（コアプラグイン）でオフになっています");
+            return;
+        }
         let current = self.current().map(|t| t.path.clone());
         match cmd {
             Command::QuickSwitch | Command::Palette => {
@@ -2245,6 +2267,7 @@ impl App {
         };
         let note = self.tabs.get(self.active).map(|t| t.path.as_str());
         let before = self.cfg.history_limits();
+        let features_before = self.cfg.features;
         let out = view.show(
             ctx,
             &mut self.cfg,
@@ -2264,6 +2287,9 @@ impl App {
                 );
             }
         }
+        if self.cfg.features != features_before {
+            self.apply_features();
+        }
         if self.cfg.history_limits() != before {
             if let Some(vault) = self.vault.as_mut() {
                 vault.history_limits = self.cfg.history_limits();
@@ -2272,6 +2298,27 @@ impl App {
         if out.close {
             self.settings = None;
             self.cfg.save();
+        }
+    }
+
+    /// 「コアプラグイン」のオン・オフを反映する
+    fn apply_features(&mut self) {
+        let f = self.cfg.features;
+        preview::set_features(&f);
+        // プレビューとエディタの組版をやり直す
+        self.generation += 1;
+        for tab in &mut self.tabs {
+            tab.layout_stale = true;
+            tab.preview = None;
+        }
+        if !f.bases {
+            self.base_view = None;
+        }
+        if !f.canvas {
+            self.canvas_view = None;
+        }
+        if !f.audio {
+            self.player = None;
         }
     }
 
@@ -2487,12 +2534,12 @@ impl App {
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Open(path, line) => self.open_note(&path, line),
-            Action::OpenExternal(path) if path.ends_with(".base") => {
+            Action::OpenExternal(path) if path.ends_with(".base") && self.cfg.features.bases => {
                 self.base_view = Some(crate::base_view::BaseView::new(path));
                 self.canvas_view = None;
                 self.show_graph = false;
             }
-            Action::OpenExternal(path) if path.ends_with(".canvas") => {
+            Action::OpenExternal(path) if path.ends_with(".canvas") && self.cfg.features.canvas => {
                 self.canvas_view = Some(crate::canvas_view::CanvasView::new(path));
                 self.base_view = None;
                 self.show_graph = false;
@@ -2558,6 +2605,9 @@ impl App {
                 }
             }
             for &(cmd, _, shortcut) in COMMANDS {
+                if !cmd.enabled(&self.cfg.features) {
+                    continue;
+                }
                 if vim_normal && cmd == Command::Daily {
                     continue;
                 }
@@ -2714,11 +2764,13 @@ impl App {
                     } else {
                         "保存済み"
                     });
+                    if self.cfg.features.word_count {
                     let counts = tab.counts();
                     ui.weak(format!("{}文字 ・ {}語", counts.chars, counts.words))
                         .on_hover_text("文字数は空白を除く。単語数は、欧文は語、日本語などは1文字を1語と数える");
+                    }
                     let sel = selection_bytes(ui.ctx(), tab);
-                    if !sel.is_empty() {
+                    if self.cfg.features.word_count && !sel.is_empty() {
                         let c = robsidian_core::text::count(&tab.text[sel]);
                         ui.weak(format!("選択 {}文字 ・ {}語", c.chars, c.words));
                     }
@@ -2973,6 +3025,7 @@ impl App {
         let mentions_cache = &mut self.mentions;
         let related_cache = &mut self.related;
         let generation = self.generation;
+        let features = self.cfg.features;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.add_space(4.0);
@@ -3061,6 +3114,7 @@ impl App {
                 *mentions_cache = None;
             }
 
+            if features.related {
             ui.add_space(6.0);
             let header = egui::CollapsingHeader::new(RichText::new("関連ノート").strong())
                 .id_salt("related-notes")
@@ -3115,8 +3169,10 @@ impl App {
             if header.body_returned.is_none() {
                 *related_cache = None;
             }
+            }
 
             // 発リンク（このノートから出ているリンク。存在しないリンク先は薄く表示し、クリックで作る）
+            if features.outgoing_links {
             ui.add_space(6.0);
             let outgoing = vault.outgoing(&tab.path);
             let mut seen = std::collections::HashSet::new();
@@ -3163,8 +3219,14 @@ impl App {
                     }
                 });
 
+            }
+
             // 脚注（あるときだけ）。定義の行へ移動する
-            let notes = robsidian_core::text::footnotes(&tab.text);
+            let notes = if features.footnotes {
+                robsidian_core::text::footnotes(&tab.text)
+            } else {
+                Vec::new()
+            };
             if !notes.is_empty() {
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(RichText::new(format!("脚注 ({})", notes.len())).strong())
@@ -4429,7 +4491,10 @@ impl App {
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
             });
-            if typed_slash && !(vim_on && vim_state.mode != vim::Mode::Insert) {
+            if typed_slash
+                && cfg.features.slash_commands
+                && !(vim_on && vim_state.mode != vim::Mode::Insert)
+            {
                 if let Some(c) = output.cursor_range.map(|r| r.primary.index.0) {
                     let at = editor::byte_of_char(&tab.text, c);
                     if at > 0 && tab.text[..at].ends_with('/') {
@@ -4752,7 +4817,11 @@ impl App {
                 );
             } else if p.mode == PaletteMode::Commands {
                 let q = q.to_lowercase();
+                let features = self.cfg.features;
                 let hits = COMMANDS.iter().enumerate().filter(|(_, c)| {
+                    if !c.0.enabled(&features) {
+                        return false;
+                    }
                     // IMEをオフにしたまま英語でも引けるようにする。空白で区切った語がすべて含まれれば一致
                     let label = c.1.to_lowercase();
                     let keywords = c.0.keywords();
