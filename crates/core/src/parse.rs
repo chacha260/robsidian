@@ -89,12 +89,15 @@ pub fn parse(text: &str) -> Parsed {
             }
             scan_inline(line, offset, line_no, &mut out);
             if let Some((at, status, body)) = crate::task::task_in_line(line) {
-                let (text, due) = crate::task::split_due(body);
+                let m = crate::task::meta(body);
                 out.tasks.push(crate::task::Task {
                     line: line_no,
                     status,
-                    text,
-                    due,
+                    text: m.text,
+                    due: m.due,
+                    done_date: m.done,
+                    priority: m.priority,
+                    recurrence: m.recurrence,
                     marker: offset + at..offset + at + status.len_utf8(),
                 });
             }

@@ -2497,7 +2497,7 @@ impl App {
                 body.lines()
                     .nth(n)
                     .and_then(task::task_in_line)
-                    .is_some_and(|(_, _, b)| task::split_due(b).0 == text)
+                    .is_some_and(|(_, _, b)| task::meta(b).text == text)
             };
             if same(line) {
                 return Some(line);
@@ -3141,7 +3141,9 @@ impl App {
                         ui.weak("ノートに `- [ ] やること` と書くと、ここに集まります。期日は `📅 2026-01-31` か `due:2026-01-31`");
                     }
                     for (g, title) in TITLES.iter().enumerate() {
-                        let items: Vec<&search::TaskHit> = tasks.iter().filter(|t| group(t) == g).collect();
+                        let mut items: Vec<&search::TaskHit> = tasks.iter().filter(|t| group(t) == g).collect();
+                        // 同じ区分の中は優先度の高い順（同じなら期日順のまま）
+                        items.sort_by_key(|t| robsidian_core::task::Priority::rank(t.task.priority));
                         if items.is_empty() {
                             continue;
                         }
@@ -3154,6 +3156,17 @@ impl App {
                                 if ui.checkbox(&mut done, "").changed() {
                                     actions.push(Action::ToggleTask(t.path.clone(), t.task.line, t.task.text.clone()));
                                 }
+                                // 優先度（指定があるときだけ）
+                                if let Some(p) = t.task.priority {
+                                    use robsidian_core::task::Priority;
+                                    let color = match p {
+                                        Priority::Highest | Priority::High => egui::Color32::from_rgb(0xe0, 0x5a, 0x5a),
+                                        Priority::Medium => egui::Color32::from_rgb(0xe0, 0x9a, 0x3a),
+                                        Priority::Low | Priority::Lowest => ui.visuals().weak_text_color(),
+                                    };
+                                    ui.label(RichText::new(p.label()).small().strong().color(color))
+                                        .on_hover_text(format!("優先度: {}", p.label()));
+                                }
                                 let text = if t.task.text.is_empty() { "（本文なし）" } else { t.task.text.as_str() };
                                 let label = if t.task.done() { RichText::new(text).weak().strikethrough() } else { RichText::new(text) };
                                 let row = ui.add(egui::Button::new(label).frame(false));
@@ -3163,10 +3176,16 @@ impl App {
                                 row.on_hover_preview(|ui| hover::note_preview(ui, vault, &mut self.hover_cache, &t.path, None));
                             });
                             let note = file_name(&t.path).trim_end_matches(".md");
-                            let meta = match t.task.due {
+                            let mut meta = match t.task.due {
                                 Some(d) => format!("{note} ・ {d}"),
                                 None => note.to_string(),
                             };
+                            if let Some(rule) = &t.task.recurrence {
+                                meta.push_str(&format!(" ・ 繰り返し {rule}"));
+                            }
+                            if let Some(d) = t.task.done_date {
+                                meta.push_str(&format!(" ・ 完了 {d}"));
+                            }
                             ui.horizontal(|ui| {
                                 ui.add_space(26.0);
                                 ui.weak(RichText::new(meta).small());
@@ -4681,13 +4700,11 @@ impl App {
             let rect = egui::Rect::from_min_size(here.left_top(), egui::vec2(width, here.height()));
             painter.rect_filled(rect, 1.0, colors.accent.gamma_multiply(0.45));
         }
-        if let Some((ch, next)) = toggle {
+        if let Some((ch, _next)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
-            let end = tab.text[byte..]
-                .chars()
-                .next()
-                .map_or(byte, |c| byte + c.len_utf8());
-            if end > byte {
+            // 完了日や繰り返しの次の回も付ける（core::task::toggle。状態の切り替え方は Obsidian と同じ）
+            let line = tab.text[..byte].matches('\n').count();
+            if let Some(new) = robsidian_core::task::toggle(&tab.text, line) {
                 // Ctrl+Zで戻せるよう、変更前の状態をTextEditの履歴に積む
                 let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
                 let range = state.cursor.char_range().unwrap_or_default();
@@ -4695,7 +4712,7 @@ impl App {
                 undoer.add_undo(&(range, tab.text.clone()));
                 state.set_undoer(undoer);
                 state.store(&ctx, id);
-                tab.text.replace_range(byte..end, &next.to_string());
+                tab.text = new;
                 // チェックボックスのクリックでエディタのフォーカスが外れないようにする
                 ctx.memory_mut(|m| m.request_focus(id));
                 tab.dirty = true;

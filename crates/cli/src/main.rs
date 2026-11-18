@@ -226,7 +226,16 @@ fn print_query(vault: &Vault, query: &str, out: &mut Out) -> Result<()> {
         }
         search::QueryResult::Tasks(tasks) => {
             for t in tasks {
-                let due = t.task.due.map(|d| format!("  📅 {d}")).unwrap_or_default();
+                let mut due = t.task.due.map(|d| format!("  📅 {d}")).unwrap_or_default();
+                if let Some(p) = t.task.priority {
+                    due.push_str(&format!("  {}", p.symbol()));
+                }
+                if let Some(rule) = &t.task.recurrence {
+                    due.push_str(&format!("  🔁 {rule}"));
+                }
+                if let Some(d) = t.task.done_date {
+                    due.push_str(&format!("  ✅ {d}"));
+                }
                 writeln!(
                     out.w,
                     "{}:{}: [{}] {}{due}",
