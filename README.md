@@ -279,6 +279,14 @@ views:
     cardSize: 200                        # カードの幅
     imageAspectRatio: 1.4                # 画像の高さ / 幅
     imageFit: contain                    # 全体を収める（既定は枠いっぱいに切り抜く）
+  - type: table
+    name: 状態ごと
+    groupBy:                             # グループ分け
+      property: note.status
+      direction: ASC
+    summaries:                           # 集計（グループごと。グループ分けしなければ全体）
+      rating: Average
+      author: Unique
 ```
 
 - 式（条件と計算列で同じ）
@@ -291,7 +299,8 @@ views:
   - リスト：`.length` `[番号]` `contains()` `containsAny()` `containsAll()` `join()` `reverse()` `sort()` `unique()` `flat()` `slice()`
   - 日付：`.year` `.month` `.day` `.hour` `.minute` `format("YYYY-MM-DD")` `date()` `time()` `relative()`、期間の足し引き（`now() - "7d"`、単位は `y` `M` `w` `d` `h` `m` `s`）、日付どうしの差（ミリ秒）
   - どの値にも：`isEmpty()` `toString()`
-- 未対応：グループ分け（`groupBy`）、集計（`summaries`）、`this`、ラムダ式（`map` / `filter`）。未対応のものは、黙って無視せずエラーとして表示します
+- 集計の種類：`Sum` `Average` `Min` `Max` `Median` `Range` `Stddev` `Earliest` `Latest` `Checked` `Unchecked` `Empty` `Filled` `Unique` `Count`
+- 未対応：`this`、ラムダ式（`map` / `filter`）。未対応のものは、黙って無視せずエラーとして表示します
 - カードのビューは、ノートの中の埋め込みやプレビューでは、画像を先頭の列にした表として出します
 
 ### 関連ノート

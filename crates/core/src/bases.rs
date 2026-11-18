@@ -64,6 +64,10 @@ pub struct View {
     pub image_aspect: Option<f32>,
     /// 画像を枠いっぱいに切り抜くか（`cover`）、全体を収めるか（`contain`）
     pub image_fit: Option<String>,
+    /// グループ分け（プロパティ, 降順か）
+    pub group_by: Option<(String, bool)>,
+    /// 集計（列 → 集計の種類 `Sum` `Average` など）
+    pub summaries: Vec<(String, String)>,
 }
 
 impl View {
@@ -79,6 +83,8 @@ impl View {
             card_size: None,
             image_aspect: None,
             image_fit: None,
+            group_by: None,
+            summaries: Vec::new(),
         }
     }
 }
@@ -107,6 +113,19 @@ pub struct Table {
     pub card_size: Option<f32>,
     pub image_aspect: Option<f32>,
     pub image_fit: Option<String>,
+    /// グループ（`groupBy` が無ければ、名前の無い1つ）。行は `rows` の中の範囲
+    pub groups: Vec<Group>,
+    /// 集計の行があるか
+    pub has_summary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    /// グループの名前（`groupBy` の値。値が無ければ「（なし）」）。グループ分けしないときは空
+    pub label: String,
+    pub rows: std::ops::Range<usize>,
+    /// 列ごとの集計（集計しない列は空）
+    pub summary: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +240,22 @@ pub fn parse(text: &str) -> Result<Base> {
                 card_size: number_of(&v["cardSize"]),
                 image_aspect: number_of(&v["imageAspectRatio"]),
                 image_fit: text_of(&v["imageFit"]),
+                group_by: match &v["groupBy"] {
+                    Yaml::Hash(_) => text_of(&v["groupBy"]["property"]).map(|p| {
+                        let desc = v["groupBy"]["direction"]
+                            .as_str()
+                            .is_some_and(|d| d.eq_ignore_ascii_case("desc"));
+                        (p, desc)
+                    }),
+                    other => text_of(other).map(|p| (p, false)),
+                },
+                summaries: match &v["summaries"] {
+                    Yaml::Hash(h) => h
+                        .iter()
+                        .filter_map(|(k, f)| Some((text_of(k)?, text_of(f)?)))
+                        .collect(),
+                    _ => Vec::new(),
+                },
             });
         }
     }
@@ -430,7 +465,8 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
             (k.clone(), shown)
         })
         .collect();
-    let mut rows = Vec::with_capacity(keyed.len());
+    // 行ごとに、列の値・グループの値・画像を計算する
+    let mut built: Vec<(Val, Vec<Val>, Row)> = Vec::with_capacity(keyed.len());
     for (_, note, fm) in &keyed {
         let ctx = Ctx {
             vault,
@@ -439,20 +475,91 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
             formulas: &formulas,
             depth: 0,
         };
-        let cells = keys
+        let vals = keys
             .iter()
-            .map(|k| ctx.column(k).map(|v| v.display()))
+            .map(|k| ctx.column(k))
             .collect::<Result<Vec<_>>>()?;
         let image = match &v.image {
             Some(prop) => image_of(vault, note, &ctx.column(prop)?),
             None => None,
         };
-        rows.push(Row {
+        let group = match &v.group_by {
+            Some((prop, _)) => ctx.column(prop)?,
+            None => Val::Null,
+        };
+        let row = Row {
             path: note.path.clone(),
-            cells,
+            cells: vals.iter().map(Val::display).collect(),
             image,
+        };
+        built.push((group, vals, row));
+    }
+    // グループ分け: グループの値で並べ替える（同じグループの中は、上の並べ替えのまま）
+    if let Some((_, desc)) = &v.group_by {
+        built.sort_by(|(a, _, _), (b, _, _)| {
+            let ord = match (a, b) {
+                (Val::Null, Val::Null) => Ordering::Equal,
+                (Val::Null, _) => return Ordering::Greater,
+                (_, Val::Null) => return Ordering::Less,
+                _ => a.compare(b).unwrap_or(Ordering::Equal),
+            };
+            if *desc {
+                ord.reverse()
+            } else {
+                ord
+            }
         });
     }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut start = 0;
+    for i in 1..=built.len() {
+        let boundary = i == built.len()
+            || (v.group_by.is_some() && built[i].0.display() != built[start].0.display());
+        if !boundary {
+            continue;
+        }
+        let label = match &v.group_by {
+            None => String::new(),
+            Some(_) => {
+                let l = built[start].0.display();
+                if l.is_empty() {
+                    "（なし）".to_string()
+                } else {
+                    l
+                }
+            }
+        };
+        let summary = keys
+            .iter()
+            .enumerate()
+            .map(|(col, key)| {
+                let func = v
+                    .summaries
+                    .iter()
+                    .find(|(k, _)| {
+                        k == key
+                            || k.strip_prefix("note.") == Some(key.as_str())
+                            || key.strip_prefix("note.") == Some(k.as_str())
+                    })
+                    .map(|(_, f)| f);
+                match func {
+                    Some(f) => {
+                        let vals: Vec<&Val> = built[start..i].iter().map(|b| &b.1[col]).collect();
+                        summarize(f, &vals)
+                    }
+                    None => Ok(String::new()),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        groups.push(Group {
+            label,
+            rows: start..i,
+            summary,
+        });
+        start = i;
+    }
+    let rows: Vec<Row> = built.into_iter().map(|(_, _, r)| r).collect();
+    let has_summary = !v.summaries.is_empty();
     Ok(Table {
         view: v.name.clone(),
         kind: v.kind.clone(),
@@ -462,46 +569,188 @@ pub fn run(vault: &Vault, base: &Base, view: Option<&str>) -> Result<Table> {
         card_size: v.card_size,
         image_aspect: v.image_aspect,
         image_fit: v.image_fit.clone(),
+        groups,
+        has_summary,
+    })
+}
+
+/// 集計（Obsidian の集計の名前。大文字小文字は問わない）。結果は「平均 12.5」のような文字列
+pub fn summarize(func: &str, vals: &[&Val]) -> Result<String> {
+    let nums: Vec<f64> = vals
+        .iter()
+        .filter_map(|v| match v {
+            Val::Num(n) => Some(*n),
+            Val::Str(s) => s.trim().parse().ok(),
+            _ => None,
+        })
+        .collect();
+    let dates: Vec<chrono::NaiveDateTime> = vals
+        .iter()
+        .filter_map(|v| match v {
+            Val::Date(d, _) => Some(*d),
+            _ => None,
+        })
+        .collect();
+    let num = |n: f64| {
+        // 小数は2桁まで
+        Val::Num((n * 100.0).round() / 100.0).display()
+    };
+    let filled = |v: &&&Val| v.truthy() || matches!(v, Val::Num(_) | Val::Bool(_));
+    let date =
+        |d: &chrono::NaiveDateTime| Val::Date(*d, d.time() != chrono::NaiveTime::MIN).display();
+    let mut sorted = nums.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let (label, value) = match func.to_lowercase().as_str() {
+        "sum" => ("合計", num(nums.iter().sum())),
+        "average" | "avg" | "mean" => (
+            "平均",
+            if nums.is_empty() {
+                String::new()
+            } else {
+                num(nums.iter().sum::<f64>() / nums.len() as f64)
+            },
+        ),
+        "min" => match (sorted.first(), dates.iter().min()) {
+            (Some(n), _) => ("最小", num(*n)),
+            (None, Some(d)) => ("最小", date(d)),
+            _ => ("最小", String::new()),
+        },
+        "max" => match (sorted.last(), dates.iter().max()) {
+            (Some(n), _) => ("最大", num(*n)),
+            (None, Some(d)) => ("最大", date(d)),
+            _ => ("最大", String::new()),
+        },
+        "median" => (
+            "中央値",
+            match sorted.len() {
+                0 => String::new(),
+                n if n % 2 == 1 => num(sorted[n / 2]),
+                n => num((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0),
+            },
+        ),
+        "range" => match (
+            sorted.first(),
+            sorted.last(),
+            dates.iter().min(),
+            dates.iter().max(),
+        ) {
+            (Some(a), Some(b), _, _) => ("範囲", num(b - a)),
+            (_, _, Some(a), Some(b)) => ("範囲", format!("{}日", (*b - *a).num_days())),
+            _ => ("範囲", String::new()),
+        },
+        "stddev" => (
+            "標準偏差",
+            if nums.is_empty() {
+                String::new()
+            } else {
+                let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+                let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nums.len() as f64;
+                num(var.sqrt())
+            },
+        ),
+        "earliest" => ("最も早い", dates.iter().min().map(date).unwrap_or_default()),
+        "latest" => ("最も遅い", dates.iter().max().map(date).unwrap_or_default()),
+        "checked" => (
+            "チェック",
+            vals.iter()
+                .filter(|v| matches!(v, Val::Bool(true)))
+                .count()
+                .to_string(),
+        ),
+        "unchecked" => (
+            "未チェック",
+            vals.iter()
+                .filter(|v| !matches!(v, Val::Bool(true)))
+                .count()
+                .to_string(),
+        ),
+        "empty" => ("空", vals.iter().filter(|v| !filled(v)).count().to_string()),
+        "filled" => ("入力あり", vals.iter().filter(filled).count().to_string()),
+        "unique" => {
+            let set: BTreeSet<String> = vals.iter().filter(filled).map(|v| v.display()).collect();
+            ("種類", set.len().to_string())
+        }
+        "count" => ("件数", vals.len().to_string()),
+        other => bail!("未対応の集計です: {other}"),
+    };
+    Ok(if value.is_empty() {
+        String::new()
+    } else {
+        format!("{label} {value}")
     })
 }
 
 /// 表を Markdown の表にする（プレビューや埋め込みで使う）。名前の列はノートへのリンクにする。
-/// カードのビューは、画像を先頭の列にした表にする。
+/// カードのビューは、画像を先頭の列にした表にする。グループ分けしていれば、グループごとに見出しと表を出す。
+/// 集計があれば、表の最後に集計の行を足す。
 pub fn to_markdown(table: &Table) -> String {
     let esc = |s: &str| s.replace('|', "\\|").replace('\n', " ");
     let cards = table.kind == "cards" && table.rows.iter().any(|r| r.image.is_some());
-    let mut out = String::new();
     let mut header: Vec<String> = table.columns.iter().map(|(_, n)| esc(n)).collect();
     if cards {
         header.insert(0, "画像".to_string());
     }
-    out.push_str(&format!("| {} |\n", header.join(" | ")));
-    out.push_str(&format!("|{}\n", " --- |".repeat(header.len())));
-    for row in &table.rows {
-        let mut cells: Vec<String> = row
-            .cells
-            .iter()
-            .zip(&table.columns)
-            .map(|(c, (k, _))| {
-                if k == "file.name" {
-                    // 表の中では `|` を区切りと読まれないよう、パスと名前の間は `\|` にする
-                    format!("[[{}\\|{}]]", row.path.trim_end_matches(".md"), esc(c))
-                } else {
-                    esc(c)
-                }
-            })
-            .collect();
-        if cards {
-            cells.insert(
-                0,
-                match &row.image {
-                    Some(url) if url.contains("://") => format!("![]({url})"),
-                    Some(path) => format!("![[{path}\\|120]]"),
-                    None => String::new(),
-                },
-            );
+    let head = format!(
+        "| {} |\n|{}\n",
+        header.join(" | "),
+        " --- |".repeat(header.len())
+    );
+    let mut out = String::new();
+    for group in &table.groups {
+        if !group.label.is_empty() {
+            out.push_str(&format!(
+                "\n**{}**（{}件）\n\n",
+                esc(&group.label),
+                group.rows.len()
+            ));
         }
-        out.push_str(&format!("| {} |\n", cells.join(" | ")));
+        out.push_str(&head);
+        for row in &table.rows[group.rows.clone()] {
+            let mut cells: Vec<String> = row
+                .cells
+                .iter()
+                .zip(&table.columns)
+                .map(|(c, (k, _))| {
+                    if k == "file.name" {
+                        // 表の中では `|` を区切りと読まれないよう、パスと名前の間は `\|` にする
+                        format!("[[{}\\|{}]]", row.path.trim_end_matches(".md"), esc(c))
+                    } else {
+                        esc(c)
+                    }
+                })
+                .collect();
+            if cards {
+                cells.insert(
+                    0,
+                    match &row.image {
+                        Some(url) if url.contains("://") => format!("![]({url})"),
+                        Some(path) => format!("![[{path}\\|120]]"),
+                        None => String::new(),
+                    },
+                );
+            }
+            out.push_str(&format!("| {} |\n", cells.join(" | ")));
+        }
+        if table.has_summary {
+            let mut cells: Vec<String> = group
+                .summary
+                .iter()
+                .map(|c| {
+                    if c.is_empty() {
+                        String::new()
+                    } else {
+                        format!("*{}*", esc(c))
+                    }
+                })
+                .collect();
+            if cells.first().is_some_and(String::is_empty) {
+                cells[0] = "*集計*".to_string();
+            }
+            if cards {
+                cells.insert(0, String::new());
+            }
+            out.push_str(&format!("| {} |\n", cells.join(" | ")));
+        }
     }
     if table.rows.is_empty() {
         out.push_str("\n*当てはまるノートはありません*\n");
@@ -678,6 +927,54 @@ views:
 
         let bad = parse("formulas:\n  x: 'nope('").unwrap();
         assert!(run(&v2, &bad, None).is_err());
+    }
+
+    #[test]
+    fn groups_and_summaries() {
+        let (_d, v) = vault();
+        let base = parse(
+            r#"
+filters: file.hasTag("book")
+views:
+  - type: table
+    name: 状態ごと
+    order: [file.name, pages]
+    groupBy:
+      property: note.status
+      direction: ASC
+    summaries:
+      pages: Sum
+  - type: table
+    name: 全体
+    order: [file.name, pages, author]
+    summaries:
+      note.pages: Average
+      author: Unique
+"#,
+        )
+        .unwrap();
+        let t = run(&v, &base, None).unwrap();
+        let labels: Vec<&str> = t.groups.iter().map(|g| g.label.as_str()).collect();
+        // 値の無いもの（c は status が無い）は最後
+        assert_eq!(labels, ["done", "reading", "（なし）"]);
+        assert_eq!(t.groups[0].summary, ["", "合計 120"]);
+        assert_eq!(t.groups[2].summary, ["", "合計 80"]);
+        let md = to_markdown(&t);
+        assert!(md.contains("**reading**（1件）"), "{md}");
+        assert!(md.contains("| *集計* | *合計 300* |"), "{md}");
+
+        let t = run(&v, &base, Some("全体")).unwrap();
+        assert_eq!(t.groups.len(), 1);
+        assert_eq!(t.groups[0].label, "");
+        assert_eq!(t.groups[0].summary, ["", "平均 166.67", "種類 3"]);
+
+        let vals = [Val::Num(1.0), Val::Num(4.0), Val::Null, Val::Bool(true)];
+        let refs: Vec<&Val> = vals.iter().collect();
+        assert_eq!(summarize("median", &refs).unwrap(), "中央値 2.5");
+        assert_eq!(summarize("Range", &refs).unwrap(), "範囲 3");
+        assert_eq!(summarize("checked", &refs).unwrap(), "チェック 1");
+        assert_eq!(summarize("empty", &refs).unwrap(), "空 1");
+        assert!(summarize("nope", &refs).is_err());
     }
 
     #[test]
