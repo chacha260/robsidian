@@ -70,6 +70,10 @@ impl SettingsView {
                             ui.checkbox(&mut cfg.smooth_scroll, "マウスホイールでなめらかにスクロールする")
                                 .on_hover_text("オンにすると、ホイールを回してから少し遅れて、なめらかに動きます");
                             ui.end_row();
+                            ui.label("リボン");
+                            ui.checkbox(&mut cfg.show_ribbon, "左端にアイコンの列を出す")
+                                .on_hover_text("有効なコアプラグインのアイコンと、設定の歯車を並べます");
+                            ui.end_row();
                             ui.label("表示モード");
                             ui.horizontal(|ui| {
                                 for mode in ViewMode::ALL {

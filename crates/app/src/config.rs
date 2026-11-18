@@ -47,6 +47,8 @@ pub struct Config {
     pub view_mode: ViewMode,
     pub show_left: bool,
     pub show_right: bool,
+    /// リボン（左端のアイコンの列）を出す
+    pub show_ribbon: bool,
     pub font_size: f32,
     /// 日本語フォントのファイル（空なら自動で探す）
     pub font_path: String,
@@ -304,6 +306,7 @@ impl Default for Config {
             view_mode: ViewMode::Live,
             show_left: true,
             show_right: true,
+            show_ribbon: true,
             font_size: 15.0,
             font_path: String::new(),
             readable_width: true,

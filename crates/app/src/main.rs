@@ -20,6 +20,7 @@ mod player;
 mod preview;
 mod props_ui;
 mod recorder;
+mod ribbon;
 mod settings;
 mod theme;
 mod vim;
