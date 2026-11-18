@@ -215,6 +215,113 @@ pub fn block(text: &str) -> Option<Range<usize>> {
     bounds(text).map(|(_, end)| 0..end)
 }
 
+/// プロパティの型（Obsidian の `.obsidian/types.json` と同じ考え方）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropType {
+    Text,
+    List,
+    Number,
+    Checkbox,
+    Date,
+    DateTime,
+}
+
+impl PropType {
+    pub const ALL: [PropType; 6] = [
+        PropType::Text,
+        PropType::List,
+        PropType::Number,
+        PropType::Checkbox,
+        PropType::Date,
+        PropType::DateTime,
+    ];
+
+    /// `types.json` の書き方から
+    pub fn from_obsidian(name: &str) -> Option<Self> {
+        Some(match name {
+            "text" => PropType::Text,
+            "multitext" | "tags" | "aliases" => PropType::List,
+            "number" => PropType::Number,
+            "checkbox" => PropType::Checkbox,
+            "date" => PropType::Date,
+            "datetime" => PropType::DateTime,
+            _ => return None,
+        })
+    }
+
+    /// `types.json` に書く名前
+    pub fn obsidian_name(self) -> &'static str {
+        match self {
+            PropType::Text => "text",
+            PropType::List => "multitext",
+            PropType::Number => "number",
+            PropType::Checkbox => "checkbox",
+            PropType::Date => "date",
+            PropType::DateTime => "datetime",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PropType::Text => "テキスト",
+            PropType::List => "リスト",
+            PropType::Number => "数値",
+            PropType::Checkbox => "チェックボックス",
+            PropType::Date => "日付",
+            PropType::DateTime => "日付と時刻",
+        }
+    }
+
+    /// 型の指定が無いとき、キーと値から推測する
+    pub fn infer(key: &str, value: &Value) -> Self {
+        if matches!(key, "tags" | "aliases" | "cssclasses") {
+            return PropType::List;
+        }
+        let Value::Text(t) = value else {
+            return match value {
+                Value::List(_) => PropType::List,
+                _ => PropType::Text,
+            };
+        };
+        let t = t.trim();
+        if matches!(t, "true" | "false") {
+            PropType::Checkbox
+        } else if !t.is_empty() && t.parse::<f64>().is_ok() {
+            PropType::Number
+        } else if parse_date(t).is_some() {
+            PropType::Date
+        } else if parse_datetime(t).is_some() {
+            PropType::DateTime
+        } else {
+            PropType::Text
+        }
+    }
+}
+
+/// `2026-01-31`
+pub fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
+}
+
+/// `2026-01-31T09:30`（秒と、空白区切りも受け付ける）
+pub fn parse_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
+    let s = s.trim();
+    [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ]
+    .iter()
+    .find_map(|f| chrono::NaiveDateTime::parse_from_str(s, f).ok())
+}
+
+/// 引用符を付けずに書く値（チェックボックスの `true` / `false` など）を設定した本文
+pub fn set_plain(text: &str, key: &str, raw: &str) -> String {
+    let key = key.trim();
+    set(text, key, &Value::Raw(format!("{key}: {raw}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +383,28 @@ mod tests {
                 .unwrap();
             assert_eq!(back.value, v);
         }
+    }
+
+    #[test]
+    fn infers_types_and_writes_plain_values() {
+        let t = |s: &str| Value::Text(s.into());
+        assert_eq!(PropType::infer("done", &t("true")), PropType::Checkbox);
+        assert_eq!(PropType::infer("pages", &t("120")), PropType::Number);
+        assert_eq!(PropType::infer("due", &t("2026-01-31")), PropType::Date);
+        assert_eq!(
+            PropType::infer("at", &t("2026-01-31T09:30")),
+            PropType::DateTime
+        );
+        assert_eq!(PropType::infer("title", &t("本")), PropType::Text);
+        assert_eq!(PropType::infer("title", &t("")), PropType::Text);
+        assert_eq!(PropType::infer("tags", &t("a")), PropType::List);
+        assert_eq!(PropType::infer("x", &Value::List(vec![])), PropType::List);
+        for ty in PropType::ALL {
+            assert_eq!(PropType::from_obsidian(ty.obsidian_name()), Some(ty));
+        }
+        // チェックボックスは引用符なしで書き、読み直すと文字列の true になる
+        let text = set_plain("---\ndone: false\n---\n本文", "done", "true");
+        assert_eq!(text, "---\ndone: true\n---\n本文");
+        assert_eq!(read(&text).unwrap()[0].value, t("true"));
     }
 }

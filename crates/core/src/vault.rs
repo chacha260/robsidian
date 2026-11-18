@@ -1183,6 +1183,70 @@ impl Vault {
         (!s.is_empty()).then(|| s.to_string())
     }
 
+    /// プロパティの型（`.obsidian/types.json`）。指定の無いプロパティは含まない
+    pub fn property_types(&self) -> BTreeMap<String, crate::props::PropType> {
+        let Ok(text) = fs::read_to_string(self.root.join(".obsidian").join("types.json")) else {
+            return BTreeMap::new();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return BTreeMap::new();
+        };
+        value
+            .get("types")
+            .and_then(|t| t.as_object())
+            .map(|types| {
+                types
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        Some((
+                            k.clone(),
+                            crate::props::PropType::from_obsidian(v.as_str()?)?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// プロパティの型を `.obsidian/types.json` に書く（ほかの項目はそのまま残す）
+    pub fn set_property_type(&self, key: &str, ty: crate::props::PropType) -> Result<()> {
+        let dir = self.root.join(".obsidian");
+        let path = dir.join("types.json");
+        let mut value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let types = value
+            .as_object_mut()
+            .expect("上でオブジェクトに限った")
+            .entry("types")
+            .or_insert_with(|| serde_json::json!({}));
+        if !types.is_object() {
+            *types = serde_json::json!({});
+        }
+        types
+            .as_object_mut()
+            .expect("上でオブジェクトにした")
+            .insert(key.to_string(), ty.obsidian_name().into());
+        fs::create_dir_all(&dir)?;
+        let json = serde_json::to_string_pretty(&value)?;
+        atomic_write(&path, json.as_bytes()).context("failed to save .obsidian/types.json")
+    }
+
+    /// vault のノートで使われているプロパティの名前（多い順）
+    pub fn property_keys(&self) -> Vec<String> {
+        let mut count: HashMap<String, usize> = HashMap::new();
+        for note in self.notes.values() {
+            for p in crate::props::read(&note.text).unwrap_or_default() {
+                *count.entry(p.key).or_default() += 1;
+            }
+        }
+        let mut keys: Vec<(String, usize)> = count.into_iter().collect();
+        keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        keys.into_iter().map(|(k, _)| k).collect()
+    }
+
     /// ノートに貼り付ける添付ファイルの保存先パス（vault相対）。Obsidianの設定
     /// （`.obsidian/app.json` の attachmentFolderPath）に従い、同名があれば番号を付ける。
     /// 設定が無ければvaultのルート。`./` で始まる設定はノートと同じフォルダからの相対。
@@ -1629,5 +1693,33 @@ mod tests {
         let rel = v.daily().unwrap();
         let title = rel.trim_start_matches("Daily/").trim_end_matches(".md");
         assert_eq!(v.note(&rel).unwrap().text, format!("# {title}\n- "));
+    }
+
+    #[test]
+    fn property_types_round_trip() {
+        use crate::props::PropType;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.md"),
+            "---\ndue: 2026-01-01\ndone: true\n---\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.md"), "---\ndue: 2026-02-01\n---\n").unwrap();
+        fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        fs::write(
+            dir.path().join(".obsidian/types.json"),
+            r#"{"types": {"done": "checkbox"}, "other": 1}"#,
+        )
+        .unwrap();
+        let v = Vault::open(dir.path()).unwrap();
+        assert_eq!(v.property_types().get("done"), Some(&PropType::Checkbox));
+        v.set_property_type("due", PropType::Date).unwrap();
+        let types = v.property_types();
+        assert_eq!(types.get("due"), Some(&PropType::Date));
+        assert_eq!(types.get("done"), Some(&PropType::Checkbox));
+        // ほかの項目は残る
+        let raw = fs::read_to_string(dir.path().join(".obsidian/types.json")).unwrap();
+        assert!(raw.contains("\"other\": 1"), "{raw}");
+        assert_eq!(v.property_keys(), ["due", "done"]);
     }
 }

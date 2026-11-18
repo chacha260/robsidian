@@ -4125,9 +4125,18 @@ impl App {
                                 // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
                                 if live && cfg.features.properties {
                                     if let Some(new) =
-                                        props_panel.show(ui, &note_path, text, &colors)
+                                        props_panel.show(ui, &note_path, text, &colors, vault)
                                     {
                                         props_changed = Some(new);
+                                    }
+                                    // 型を変えた: .obsidian/types.json に書く
+                                    if let Some((key, ty)) = props_panel.pending_type.take() {
+                                        if let Err(e) = vault.set_property_type(&key, ty) {
+                                            actions.push(Action::Toast(format!(
+                                                "型を保存できません: {e:#}"
+                                            )));
+                                        }
+                                        props_panel.forget_types();
                                     }
                                 }
                                 let background = ui.painter().add(egui::Shape::Noop);
