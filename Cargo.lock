@@ -867,8 +867,6 @@ dependencies = [
 [[package]]
 name = "egui_commonmark_backend"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7ea83d05053e960b4756c0d550ca9ad23632e3d2e811f7822eb9b6b76dcd02f"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2738,13 +2736,14 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "robsidian"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "chrono",
  "cpal",
  "dirs",
  "eframe",
+ "egui",
  "egui-file-dialog",
  "egui_commonmark",
  "egui_extras",
@@ -2765,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "robsidian-cli"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2779,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "robsidian-core"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "chrono",

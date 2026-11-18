@@ -17,6 +17,7 @@ mod hover;
 mod math_view;
 mod mermaid;
 mod player;
+mod plugins;
 mod preview;
 mod props_ui;
 mod recorder;

@@ -1,0 +1,27 @@
+# Robsidian のプラグインの例（Python 3。標準ライブラリだけを使う）
+# vault の .robsidian/plugins/sample/ にこのフォルダを写すと使えます。
+name = "サンプル"
+version = "0.1.0"
+description = "コマンド・コードブロック・パネル・イベントの書き方の例"
+# Windows で python3 が無ければ "python main.py" にしてください
+run = "python3 main.py"
+
+[[command]]
+id = "upper"
+name = "選択範囲を大文字に"
+input = "selection"
+key = "ctrl+alt+u"
+
+[[command]]
+id = "stamp"
+name = "今日の日付を挿入"
+
+[[codeblock]]
+lang = "csv"              # ```csv のブロックを表にする
+
+[[panel]]
+id = "stats"
+title = "ノートの統計"
+
+[[event]]
+on = "save"               # 保存したとき、frontmatter の updated を今日の日付にする

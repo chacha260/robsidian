@@ -10,6 +10,8 @@ pub struct Outcome {
     pub close: bool,
     /// フォントの指定を変えた（再読み込みが必要）
     pub font: bool,
+    /// このプラグインの許可を求める
+    pub trust_plugin: Option<String>,
 }
 
 pub struct SettingsView {
@@ -31,6 +33,7 @@ impl SettingsView {
         vault: Option<&Vault>,
         current_note: Option<&str>,
         font_in_use: Option<&str>,
+        plugins: &crate::plugins::Plugins,
     ) -> Outcome {
         let mut out = Outcome::default();
         let modal = egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
@@ -166,6 +169,10 @@ impl SettingsView {
                         }
                     });
 
+                    if let Some(vault) = vault {
+                        plugins_section(ui, cfg, vault.root(), plugins, &mut out);
+                    }
+
                     section(ui, "ローカル履歴");
                     ui.weak("保存で上書きされる直前の内容を .robsidian/history に残します");
                     egui::Grid::new("history")
@@ -237,4 +244,92 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(10.0);
     ui.label(RichText::new(title).strong().size(16.0));
     ui.separator();
+}
+
+/// 「プラグイン」の欄: 一覧・説明・使う / 使わない・許可・読めなかった理由
+fn plugins_section(
+    ui: &mut egui::Ui,
+    cfg: &mut Config,
+    root: &std::path::Path,
+    plugins: &crate::plugins::Plugins,
+    out: &mut Outcome,
+) {
+    use crate::plugins::{trust_key, usable, Usable};
+    section(ui, "プラグイン");
+    ui.weak(
+        "プラグインは .robsidian/plugins/<id>/plugin.toml に置きます（書き方は README の「プラグイン」）。\
+         実行の前に、中身を確かめて許可してください。",
+    );
+    if plugins.list.is_empty() && plugins.broken.is_empty() {
+        ui.weak("このvaultにプラグインはありません");
+    }
+    for p in &plugins.list {
+        let key = trust_key(root, &p.id);
+        let m = &p.manifest;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut on = !cfg.disabled_plugins.contains(&key);
+            if ui
+                .checkbox(&mut on, RichText::new(&m.name).strong())
+                .changed()
+            {
+                if on {
+                    cfg.disabled_plugins.remove(&key);
+                } else {
+                    cfg.disabled_plugins.insert(key.clone());
+                }
+            }
+            ui.weak(format!(
+                "{}{}",
+                p.id,
+                m.version
+                    .as_deref()
+                    .map(|v| format!(" ・ {v}"))
+                    .unwrap_or_default()
+            ));
+            match usable(cfg, root, p) {
+                Usable::Untrusted => {
+                    if ui.small_button("中身を見て許可する…").clicked() {
+                        out.trust_plugin = Some(p.id.clone());
+                    }
+                }
+                Usable::Yes | Usable::Disabled => {
+                    if cfg.trusted_commands.get(&key) == Some(&p.text) {
+                        ui.weak("許可済み");
+                        if ui.small_button("許可を取り消す").clicked() {
+                            cfg.trusted_commands.remove(&key);
+                        }
+                    } else if ui.small_button("中身を見て許可する…").clicked() {
+                        out.trust_plugin = Some(p.id.clone());
+                    }
+                }
+            }
+        });
+        if let Some(d) = &m.description {
+            ui.weak(d);
+        }
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(m.command.iter().map(|c| format!("コマンド「{}」", c.name)));
+        parts.extend(
+            m.codeblock
+                .iter()
+                .map(|c| format!("コードブロック ```{}", c.lang)),
+        );
+        parts.extend(m.panel.iter().map(|c| format!("パネル「{}」", c.title)));
+        parts.extend(m.event.iter().map(|e| {
+            format!(
+                "イベント（{}）",
+                match e.on {
+                    robsidian_core::plugin::EventKind::Save => "保存したとき",
+                    robsidian_core::plugin::EventKind::Open => "開いたとき",
+                }
+            )
+        }));
+        if !parts.is_empty() {
+            ui.label(RichText::new(parts.join(" ・ ")).small());
+        }
+    }
+    for (id, why) in &plugins.broken {
+        ui.colored_label(ui.visuals().error_fg_color, format!("{id}: {why}"));
+    }
 }

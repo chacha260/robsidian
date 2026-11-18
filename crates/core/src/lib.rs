@@ -9,6 +9,7 @@ pub mod git;
 pub mod history;
 pub mod math;
 pub mod parse;
+pub mod plugin;
 pub mod props;
 pub mod related;
 pub mod search;

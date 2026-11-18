@@ -315,15 +315,15 @@ pub fn toggle_from_preview(source: &str, before: &str, after: &str) -> Option<St
     let body = parse::parse(source).body_start;
     let marker = task_markers(&source[body..]).into_iter().nth(k)?;
     let (start, end) = (body + marker.start, body + marker.end);
-    // `[ ]` / `[x]` の中身（1文字）を、プレビュー側の新しい状態に合わせる
+    // プレビュー側の新しい状態と違えば、元のノートのタスクを切り替える
+    // （完了日や繰り返しの次の回も付ける。core::task::toggle）
     let checked = after[at..].starts_with('x') || after[at..].starts_with('X');
     let inner = &source[start + 1..end - 1];
-    let mut out = source.to_string();
-    out.replace_range(
-        start + 1..start + 1 + inner.len(),
-        if checked { "x" } else { " " },
-    );
-    Some(out)
+    if (inner != " ") == checked {
+        return Some(source.to_string());
+    }
+    let line = source[..start].matches('\n').count();
+    robsidian_core::task::toggle(source, line)
 }
 
 #[cfg(test)]

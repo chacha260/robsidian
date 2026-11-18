@@ -103,6 +103,8 @@ enum Sort {
     /// 更新が新しい順
     Mtime,
     Due,
+    /// 優先度の高い順（同じなら期日順）
+    Priority,
 }
 
 #[derive(Debug, Default)]
@@ -112,6 +114,8 @@ struct Query {
     paths: Vec<String>,
     task: Option<TaskFilter>,
     due: Vec<DueFilter>,
+    /// `priority:high` など（どれかに当てはまる。None は指定なし）
+    priority: Vec<Option<crate::task::Priority>>,
     /// `[キー:値]` / `[キー]`（frontmatterのプロパティ。値は部分一致、大文字小文字は区別しない）
     props: Vec<(String, Option<String>)>,
     sort: Option<Sort>,
@@ -127,12 +131,13 @@ impl Query {
             && self.paths.is_empty()
             && self.task.is_none()
             && self.due.is_empty()
+            && self.priority.is_empty()
             && self.props.is_empty()
             && self.sort.is_none()
     }
 
     fn tasks_mode(&self) -> bool {
-        self.task.is_some() || !self.due.is_empty()
+        self.task.is_some() || !self.due.is_empty() || !self.priority.is_empty()
     }
 }
 
@@ -165,7 +170,8 @@ fn parse_due(v: &str) -> Option<DueFilter> {
 
 /// 空白区切りのAND検索。`"フレーズ"`、`tag:名前`、`path:部分文字列` に加えて、
 /// `task:todo|done|any`、`due:overdue|today|week|none|any|<日付|<=日付|>日付|日付`、
-/// `sort:score|name|path|mtime|due`、`limit:件数` に対応。
+/// `priority:highest|high|medium|low|lowest|none`、
+/// `sort:score|name|path|mtime|due|priority`、`limit:件数` に対応。
 fn parse_query(query: &str) -> Query {
     let mut q = Query::default();
     let mut tokens: Vec<String> = Vec::new();
@@ -220,6 +226,21 @@ fn parse_query(query: &str) -> Query {
                 Some(d) => q.due.push(d),
                 None => q.errors.push(t.clone()),
             }
+        } else if let Some(v) = t.strip_prefix("priority:") {
+            use crate::task::Priority;
+            let p = match v {
+                "highest" | "最高" => Some(Some(Priority::Highest)),
+                "high" | "高" => Some(Some(Priority::High)),
+                "medium" | "中" => Some(Some(Priority::Medium)),
+                "low" | "低" => Some(Some(Priority::Low)),
+                "lowest" | "最低" => Some(Some(Priority::Lowest)),
+                "none" | "なし" => Some(None),
+                _ => None,
+            };
+            match p {
+                Some(p) => q.priority.push(p),
+                None => q.errors.push(t.clone()),
+            }
         } else if let Some(v) = t.strip_prefix("sort:") {
             q.sort = Some(match v {
                 "score" => Sort::Score,
@@ -227,6 +248,7 @@ fn parse_query(query: &str) -> Query {
                 "path" => Sort::Path,
                 "mtime" | "modified" | "updated" => Sort::Mtime,
                 "due" => Sort::Due,
+                "priority" => Sort::Priority,
                 _ => {
                     q.errors.push(t.clone());
                     continue;
@@ -340,6 +362,7 @@ pub fn run_query(vault: &Vault, query: &str, today: NaiveDate) -> QueryResult {
                     };
                     let ok = status_ok
                         && q.due.iter().all(|f| due_matches(*f, task, today))
+                        && (q.priority.is_empty() || q.priority.contains(&task.priority))
                         && q.terms.iter().all(|re| re.is_match(&task.text));
                     ok.then(|| {
                         let hit = TaskHit {
@@ -357,6 +380,18 @@ pub fn run_query(vault: &Vault, query: &str, today: NaiveDate) -> QueryResult {
             }
             Sort::Name | Sort::Path | Sort::Score => hits.sort_by(|a, b| {
                 (a.1.path.as_str(), a.1.task.line).cmp(&(b.1.path.as_str(), b.1.task.line))
+            }),
+            Sort::Priority => hits.sort_by(|a, b| {
+                let key = |h: &TaskHit| {
+                    (
+                        crate::task::Priority::rank(h.task.priority),
+                        h.task.due.is_none(),
+                        h.task.due,
+                        h.path.clone(),
+                        h.task.line,
+                    )
+                };
+                key(&a.1).cmp(&key(&b.1))
             }),
             Sort::Due => hits.sort_by(|a, b| {
                 // 期日の無いものは最後
@@ -413,7 +448,7 @@ pub fn run_query(vault: &Vault, query: &str, today: NaiveDate) -> QueryResult {
         })
         .collect();
     match q.sort.unwrap_or(Sort::Score) {
-        Sort::Score | Sort::Due => hits.sort_by(|a, b| {
+        Sort::Score | Sort::Due | Sort::Priority => hits.sort_by(|a, b| {
             b.2.score
                 .cmp(&a.2.score)
                 .then_with(|| a.2.path.cmp(&b.2.path))
@@ -498,7 +533,7 @@ mod tests {
             ),
             (
                 "b.md",
-                "- [ ] 電話 due:2026-01-05\n- [ ] 予算の相談 due:2026-01-20",
+                "- [ ] 電話 due:2026-01-05\n- [ ] 予算の相談 due:2026-01-20 ⏫",
             ),
         ];
         for (p, t) in files {
@@ -525,6 +560,10 @@ mod tests {
         assert_eq!(tasks("task:any due:2026-01-01"), ["済み"]);
         assert_eq!(tasks("task:todo 予算"), ["予算を出す", "予算の相談"]);
         assert_eq!(tasks("task:todo tag:project limit:1"), ["予算を出す"]);
+        // 優先度: 指定したものだけ、または優先度の高い順（指定なしは「中」と「低」の間）
+        assert_eq!(tasks("priority:high"), ["予算の相談"]);
+        assert_eq!(tasks("task:todo sort:priority")[0], "予算の相談");
+        assert_eq!(query_errors("priority:urgent"), ["priority:urgent"]);
         assert_eq!(
             query_errors("due:tomorow sort:x task:todo"),
             ["due:tomorow", "sort:x"]

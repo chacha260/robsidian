@@ -101,17 +101,44 @@ impl BaseView {
                                 ui.label(RichText::new(name).strong());
                             }
                             ui.end_row();
-                            for row in &t.rows {
-                                for (cell, (key, _)) in row.cells.iter().zip(&t.columns) {
-                                    if key == "file.name" {
-                                        if ui.link(cell).clicked() {
-                                            outcome = Some(Outcome::Open(row.path.clone()));
-                                        }
-                                    } else {
-                                        ui.label(cell);
-                                    }
+                            for group in &t.groups {
+                                // グループの見出し（グループ分けしているときだけ）
+                                if !group.label.is_empty() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}（{}件）",
+                                            group.label,
+                                            group.rows.len()
+                                        ))
+                                        .strong()
+                                        .color(ui.visuals().hyperlink_color),
+                                    );
+                                    ui.end_row();
                                 }
-                                ui.end_row();
+                                for row in &t.rows[group.rows.clone()] {
+                                    for (cell, (key, _)) in row.cells.iter().zip(&t.columns) {
+                                        if key == "file.name" {
+                                            if ui.link(cell).clicked() {
+                                                outcome = Some(Outcome::Open(row.path.clone()));
+                                            }
+                                        } else {
+                                            ui.label(cell);
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                                // 集計の行
+                                if t.has_summary {
+                                    for (i, cell) in group.summary.iter().enumerate() {
+                                        let text = if i == 0 && cell.is_empty() {
+                                            "集計"
+                                        } else {
+                                            cell.as_str()
+                                        };
+                                        ui.label(RichText::new(text).italics().weak());
+                                    }
+                                    ui.end_row();
+                                }
                             }
                         });
                     if t.rows.is_empty() {
@@ -136,90 +163,116 @@ fn cards(ui: &mut egui::Ui, vault: &Vault, t: &Table) -> Option<String> {
         // 1行に入る枚数ずつ並べ、行の中は上端をそろえる
         let gap = 12.0;
         let per_row = (((ui.available_width() + gap) / (width + gap)).floor() as usize).max(1);
-        for chunk in t.rows.chunks(per_row) {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-                for row in chunk {
-                    let frame = egui::Frame::group(ui.style())
-                        .corner_radius(6.0)
-                        .inner_margin(0.0);
-                    // 折り返しの中でも、カードの中身は縦に並べる
-                    let resp = ui
-                        .allocate_ui_with_layout(
-                            egui::vec2(width, 0.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                frame
-                                    .show(ui, |ui| {
-                                        ui.set_width(width);
-                                        ui.set_max_width(width);
-                                        if has_images {
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(width, image_h),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                egui::CornerRadius {
-                                                    nw: 6,
-                                                    ne: 6,
-                                                    sw: 0,
-                                                    se: 0,
-                                                },
-                                                ui.visuals().faint_bg_color,
-                                            );
-                                            if let Some(img) = &row.image {
-                                                let uri = if img.contains("://") {
-                                                    img.clone()
-                                                } else {
-                                                    crate::preview::file_uri(vault, img)
-                                                };
-                                                paint_image(ui, &uri, rect, contain);
+        for group in &t.groups {
+            if !group.label.is_empty() {
+                ui.label(
+                    RichText::new(format!("{}（{}件）", group.label, group.rows.len()))
+                        .strong()
+                        .color(ui.visuals().hyperlink_color),
+                );
+                ui.add_space(4.0);
+            }
+            for chunk in t.rows[group.rows.clone()].chunks(per_row) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                    for row in chunk {
+                        let frame = egui::Frame::group(ui.style())
+                            .corner_radius(6.0)
+                            .inner_margin(0.0);
+                        // 折り返しの中でも、カードの中身は縦に並べる
+                        let resp = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(width, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    frame
+                                        .show(ui, |ui| {
+                                            ui.set_width(width);
+                                            ui.set_max_width(width);
+                                            if has_images {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(width, image_h),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    egui::CornerRadius {
+                                                        nw: 6,
+                                                        ne: 6,
+                                                        sw: 0,
+                                                        se: 0,
+                                                    },
+                                                    ui.visuals().faint_bg_color,
+                                                );
+                                                if let Some(img) = &row.image {
+                                                    let uri = if img.contains("://") {
+                                                        img.clone()
+                                                    } else {
+                                                        crate::preview::file_uri(vault, img)
+                                                    };
+                                                    paint_image(ui, &uri, rect, contain);
+                                                }
                                             }
-                                        }
-                                        egui::Frame::new()
-                                            .inner_margin(egui::Margin::symmetric(10, 8))
-                                            .show(ui, |ui| {
-                                                ui.set_width(width - 20.0);
-                                                let title = name_col
-                                                    .and_then(|i| row.cells.get(i).cloned())
-                                                    .unwrap_or_else(|| {
-                                                        robsidian_core::vault::file_name(&row.path)
+                                            egui::Frame::new()
+                                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(width - 20.0);
+                                                    let title = name_col
+                                                        .and_then(|i| row.cells.get(i).cloned())
+                                                        .unwrap_or_else(|| {
+                                                            robsidian_core::vault::file_name(
+                                                                &row.path,
+                                                            )
                                                             .trim_end_matches(".md")
                                                             .to_string()
-                                                    });
-                                                ui.add(
-                                                    egui::Label::new(RichText::new(title).strong())
+                                                        });
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(title).strong(),
+                                                        )
                                                         .wrap(),
-                                                );
-                                                for (cell, (key, name)) in
-                                                    row.cells.iter().zip(&t.columns)
-                                                {
-                                                    if key == "file.name" || cell.is_empty() {
-                                                        continue;
+                                                    );
+                                                    for (cell, (key, name)) in
+                                                        row.cells.iter().zip(&t.columns)
+                                                    {
+                                                        if key == "file.name" || cell.is_empty() {
+                                                            continue;
+                                                        }
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                                            ui.weak(name);
+                                                            ui.label(cell);
+                                                        });
                                                     }
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                                        ui.weak(name);
-                                                        ui.label(cell);
-                                                    });
-                                                }
-                                            });
-                                    })
-                                    .response
-                            },
-                        )
-                        .inner;
-                    let resp = resp.interact(egui::Sense::click());
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                });
+                                        })
+                                        .response
+                                },
+                            )
+                            .inner;
+                        let resp = resp.interact(egui::Sense::click());
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            open = Some(row.path.clone());
+                        }
                     }
-                    if resp.clicked() {
-                        open = Some(row.path.clone());
+                });
+                ui.add_space(gap);
+            }
+            // 集計（列の名前と値）
+            if t.has_summary {
+                ui.horizontal_wrapped(|ui| {
+                    for (s, (_, name)) in group.summary.iter().zip(&t.columns) {
+                        if !s.is_empty() {
+                            ui.label(RichText::new(format!("{name}: {s}")).italics().weak());
+                            ui.add_space(8.0);
+                        }
                     }
-                }
-            });
-            ui.add_space(gap);
+                });
+                ui.add_space(gap);
+            }
         }
         if t.rows.is_empty() {
             ui.weak("当てはまるノートはありません");
