@@ -30,11 +30,13 @@ crates/
 
 ## ビルド
 
-Rust（stable）だけで足ります。Node.js・npm・WebView2は不要です。
+Rust（stable）だけで足ります（Linux は下記の ALSA も）。Node.js・npm・WebView2は不要です。
 
 ```bash
 cargo build --release
 ```
+
+Linux では、録音のために ALSA の開発用パッケージが要ります（Debian / Ubuntu なら `sudo apt-get install libasound2-dev`）。
 
 `target/release/robsidian`（GUI）と `target/release/rob`（CLI）ができます。
 
@@ -225,9 +227,11 @@ output = "insert"
 | ワークスペース | 開いているタブと分割の配置を名前を付けて保存し、コマンドパレットから開く・削除する（`.robsidian/workspace.json`） |
 | Bases | `.base` ファイルを開くと、プロパティの表を出す（ビューの切り替え、名前のクリックでノートを開く）。ノートの中の ` ```base ` ブロックと `![[ファイル.base#ビュー]]` は、プレビューで表にする。書き方は下記 |
 | スライド | コマンド「スライドとして表示」で、ノートを `---` だけの行で区切って全画面で表示する。→ / Space で次、← で前、Esc で終わる |
+| Canvas | `.canvas` ファイル（JSON Canvas）を開くと、カードと矢印を表示する。ドラッグで移動、ホイールで拡大縮小、カードのクリックでノート・ファイル・URLを開く。編集はまだできない（「ファイルを開く」で既定のアプリへ） |
+| 音声録音 | コマンド「録音を開始 / 停止」。録音中はステータスバーに「● 録音中」が出て、クリックで止まる。止めると添付の場所に `Recording 年月日時分秒.wav` を保存し、ノートに埋め込む |
 | ブックマーク・コマンドパレット・デイリーノート・ファイル一覧・グラフ・検索・タグ・テンプレート・クイックスイッチャー・ページプレビュー・プロパティ・ファイル復元 | それぞれ実装済み（上の各節） |
 
-これから作るもの（Canvas、音声録音）と、作らないものは [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズDにまとめています。
+Canvas の編集など、後回しにしたものと作らないものは [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズDにまとめています。
 
 #### Bases の書き方
 

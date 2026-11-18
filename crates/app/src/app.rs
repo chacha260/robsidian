@@ -81,6 +81,7 @@ enum Command {
     OpenLayout,
     DeleteLayout,
     Slides,
+    Record,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -135,6 +136,7 @@ impl Command {
             Command::OpenLayout => "open load workspace layout tabs",
             Command::DeleteLayout => "delete remove workspace layout",
             Command::Slides => "slides presentation present slideshow",
+            Command::Record => "audio recorder record voice microphone",
             Command::GitCommit => "git commit snapshot save version",
             Command::GitPull => "git pull fetch sync download remote",
             Command::GitPush => "git push sync upload remote",
@@ -258,6 +260,7 @@ const COMMANDS: &[CommandEntry] = &[
         "スライドとして表示（`---` で区切って全画面）",
         None,
     ),
+    (Command::Record, "録音を開始 / 停止", None),
     (Command::GitCommit, "gitにスナップショットをコミット", None),
     (
         Command::GitPull,
@@ -615,6 +618,10 @@ pub struct App {
     mermaid: crate::mermaid::Mermaid,
     /// 開いている `.base` の表
     base_view: Option<crate::base_view::BaseView>,
+    /// 開いている `.canvas`
+    canvas_view: Option<crate::canvas_view::CanvasView>,
+    /// 録音中
+    recorder: Option<crate::recorder::Recorder>,
     /// スライド表示中: (ノート, 何枚目)
     slideshow: Option<(String, usize)>,
     /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
@@ -688,6 +695,8 @@ impl App {
             mermaid: Default::default(),
             callout_folds: HashMap::new(),
             base_view: None,
+            canvas_view: None,
+            recorder: None,
             slideshow: None,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
@@ -1414,6 +1423,16 @@ impl App {
                 self.create_and_open(&name);
             }
             Command::ExtractNote => self.start_extract(ctx),
+            Command::Record => match self.recorder.take() {
+                Some(rec) => self.finish_recording(rec),
+                None => match current {
+                    Some(path) => match crate::recorder::Recorder::start(path) {
+                        Ok(rec) => self.recorder = Some(rec),
+                        Err(e) => self.toast(format!("{e:#}")),
+                    },
+                    None => self.toast("録音を埋め込むノートを開いてください"),
+                },
+            },
             Command::Slides => match current {
                 Some(path) => {
                     self.save_all();
@@ -1865,6 +1884,45 @@ impl App {
             rel.clone()
         };
         self.insert_at_cursor(&format!("![[{shown}]]"));
+    }
+
+    /// 録音を止めて添付フォルダに WAV で保存し、録音を始めたノートに埋め込む。
+    fn finish_recording(&mut self, rec: crate::recorder::Recorder) {
+        let note = rec.note.clone();
+        let bytes = match rec.finish() {
+            Ok(b) => b,
+            Err(e) => {
+                self.toast(format!("録音を保存できません: {e:#}"));
+                return;
+            }
+        };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let name = format!(
+            "Recording {}.wav",
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
+        let rel = vault.attachment_path(&note, &name);
+        if let Err(e) = vault.write_file(&rel, &bytes) {
+            self.toast(format!("録音を保存できません: {e:#}"));
+            return;
+        }
+        self.generation += 1;
+        let shown = if vault.resolve_file(file_name(&rel), &note) == Some(rel.as_str()) {
+            file_name(&rel).to_string()
+        } else {
+            rel.clone()
+        };
+        // 別のノートに移っていたら、録音を始めたノートに戻ってから埋め込む
+        if self.current().map(|t| t.path.as_str()) != Some(note.as_str()) {
+            self.open_note(&note, None);
+        }
+        if self.current().map(|t| t.path.as_str()) == Some(note.as_str()) {
+            self.insert_at_cursor(&format!("![[{shown}]]"));
+        } else {
+            self.toast(format!("録音を保存しました: {rel}"));
+        }
     }
 
     /// 未リンクの言及を `[[リンク]]` に書き換える。開いているタブはタブの本文を、
@@ -2407,6 +2465,12 @@ impl App {
             Action::Open(path, line) => self.open_note(&path, line),
             Action::OpenExternal(path) if path.ends_with(".base") => {
                 self.base_view = Some(crate::base_view::BaseView::new(path));
+                self.canvas_view = None;
+                self.show_graph = false;
+            }
+            Action::OpenExternal(path) if path.ends_with(".canvas") => {
+                self.canvas_view = Some(crate::canvas_view::CanvasView::new(path));
+                self.base_view = None;
                 self.show_graph = false;
             }
             Action::OpenExternal(path) => self.open_external(&path, ctx),
@@ -2581,6 +2645,24 @@ impl App {
             }
             for job in &self.jobs {
                 ui.weak(format!("「{}」を実行中…", job.name));
+            }
+            if let Some(err) = self.recorder.as_ref().and_then(|r| r.error()) {
+                // マイクが外されたなど。そこまでの録音を保存する
+                git_cmd = Some(Command::Record);
+                self.toast(format!("録音が中断されました: {err}"));
+            }
+            if let Some(rec) = &self.recorder {
+                let secs = rec.elapsed().as_secs();
+                let label = RichText::new(format!("● 録音中 {}:{:02}", secs / 60, secs % 60))
+                    .color(egui::Color32::from_rgb(0xe9, 0x3e, 0x3e));
+                if ui
+                    .add(egui::Button::new(label).frame(false))
+                    .on_hover_text("クリックで録音を止めて、ノートに埋め込む")
+                    .clicked()
+                {
+                    git_cmd = Some(Command::Record);
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(tab) = self.tabs.get(self.active) {
@@ -3167,6 +3249,24 @@ impl App {
         self.toolbar(ui, actions);
         ui.separator();
 
+        if let (Some(view), Some(vault)) = (self.canvas_view.as_mut(), self.vault.as_ref()) {
+            use crate::canvas_view::Outcome;
+            let colors = self.theme.colors(self.cfg.dark);
+            match view.show(ui, vault, &colors) {
+                Some(Outcome::Open(path)) => {
+                    self.canvas_view = None;
+                    actions.push(Action::Open(path, None));
+                }
+                Some(Outcome::OpenUrl(url)) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+                Some(Outcome::OpenExternal(path)) => {
+                    let ctx = ui.ctx().clone();
+                    self.open_external(&path, &ctx);
+                }
+                Some(Outcome::Close) => self.canvas_view = None,
+                None => {}
+            }
+            return;
+        }
         if let (Some(view), Some(vault)) = (self.base_view.as_mut(), self.vault.as_ref()) {
             use crate::base_view::Outcome;
             match view.show(ui, vault, self.generation) {

@@ -3,6 +3,7 @@
 
 mod app;
 mod base_view;
+mod canvas_view;
 mod config;
 mod edit;
 mod editor;
@@ -17,6 +18,7 @@ mod math_view;
 mod mermaid;
 mod preview;
 mod props_ui;
+mod recorder;
 mod settings;
 mod theme;
 mod vim;

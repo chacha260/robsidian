@@ -3,6 +3,7 @@
 //! GUI（`robsidian`）とCLI（`rob`）の両方がこのクレートだけに依存する。
 
 pub mod bases;
+pub mod canvas;
 pub mod git;
 pub mod history;
 pub mod math;
