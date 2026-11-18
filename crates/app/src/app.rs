@@ -2,13 +2,14 @@
 
 use crate::config::{Config, ViewMode};
 use crate::edit;
-use crate::editor::{self, Colors};
+use crate::editor;
 use crate::external::{self, GitEvent, TrustOutcome};
 use crate::find;
 use crate::fonts;
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
 use crate::hover;
+use crate::math_view;
 use crate::preview;
 use crate::props_ui::PropsPanel;
 use crate::settings::SettingsView;
@@ -73,6 +74,8 @@ enum Command {
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
+/// 同じノートを開いている間、関連ノートを計算し直すまでの間隔
+const RELATED_REFRESH: Duration = Duration::from_secs(5);
 const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 
 /// (コマンド, 表示名, ショートカット)。Shift付きを先に並べること（先に一致した方が勝つ）。
@@ -495,7 +498,8 @@ pub struct App {
     watcher: Option<(notify::RecommendedWatcher, mpsc::Receiver<Vec<PathBuf>>)>,
     rescan_at: Option<Instant>,
     toast: Option<(String, Instant)>,
-    applied_style: Option<(bool, f32)>,
+    /// 最後に当てたスタイル: (ダーク, 文字サイズ, テーマの世代)
+    applied_style: Option<(bool, f32, u64)>,
     /// 最後に設定ファイルへ書いたタブ構成（変化したら書き直す）
     saved_session: (Vec<String>, usize, Option<String>),
     props_panel: PropsPanel,
@@ -513,6 +517,10 @@ pub struct App {
     git: external::GitState,
     /// コミットメッセージの入力中
     commit_message: Option<String>,
+    theme: crate::theme::ThemeFile,
+    mermaid: crate::mermaid::Mermaid,
+    /// 関連ノート: (索引の世代, ノートのパス, 計算した時刻, 結果)
+    related: Option<(u64, String, Instant, Vec<robsidian_core::related::Related>)>,
 }
 
 impl App {
@@ -575,6 +583,9 @@ impl App {
             trust_prompt: None,
             git: Default::default(),
             commit_message: None,
+            theme: Default::default(),
+            related: None,
+            mermaid: Default::default(),
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -645,6 +656,8 @@ impl App {
                 self.trust_prompt = None;
                 self.git = external::GitState::detect(vault.root());
                 self.commit_message = None;
+                self.theme.reset();
+                self.related = None;
                 self.vault = Some(vault);
                 self.generation += 1;
                 self.cfg.save();
@@ -687,7 +700,14 @@ impl App {
         if let Some((_, rx)) = &self.watcher {
             for paths in rx.try_iter() {
                 for abs in paths {
-                    let Some(rel) = vault.rel(&abs) else { continue };
+                    let Some(rel) = vault.rel(&abs) else {
+                        // 設定ファイル（.robsidian/commands.toml や theme.toml）は待たずに読み直す
+                        if abs.starts_with(vault.root().join(".robsidian")) {
+                            self.user_cmds.recheck();
+                            self.theme.recheck();
+                        }
+                        continue;
+                    };
                     self.git.mark_stale();
                     if is_note_path(&rel) {
                         changed |= vault.reload(&rel);
@@ -1242,6 +1262,10 @@ impl App {
                 }
                 self.user_cmds.recheck();
                 self.git.mark_stale();
+                self.mermaid.forget_failures();
+                for tab in &mut self.tabs {
+                    tab.preview = None;
+                }
             }
             Command::GitCommit => {
                 if !self.git.repo {
@@ -1271,6 +1295,15 @@ impl App {
         };
         if let Some(err) = self.user_cmds.refresh(&root) {
             self.toast(err);
+        }
+        if let Some(err) = self.theme.refresh(&root) {
+            self.toast(err);
+        }
+        // Mermaid図ができたら、プレビューを作り直す
+        if self.mermaid.poll() {
+            for tab in &mut self.tabs {
+                tab.preview = None;
+            }
         }
         let mut i = 0;
         while i < self.jobs.len() {
@@ -1498,7 +1531,7 @@ impl App {
                 .and_then(|v| v.note(&view.path))
                 .map_or_else(String::new, |n| n.text.clone()),
         };
-        let colors = Colors::new(self.cfg.dark);
+        let colors = self.theme.colors(self.cfg.dark);
         let Some(outcome) = view.show(ctx, &current, &colors) else {
             return;
         };
@@ -1524,7 +1557,7 @@ impl App {
         let Some(disk) = tab.conflict.clone() else {
             return;
         };
-        let colors = Colors::new(self.cfg.dark);
+        let colors = self.theme.colors(self.cfg.dark);
         let mut choice = None;
         egui::Frame::NONE
             .fill(colors.warn_bg)
@@ -2247,7 +2280,7 @@ impl App {
     }
 
     fn apply_style(&mut self, ctx: &egui::Context) {
-        let key = (self.cfg.dark, self.cfg.font_size);
+        let key = (self.cfg.dark, self.cfg.font_size, self.theme.generation);
         if self.applied_style == Some(key) {
             return;
         }
@@ -2256,6 +2289,11 @@ impl App {
             egui::Theme::Dark
         } else {
             egui::Theme::Light
+        });
+        // テーマ設定ファイルの色（既定の色から作り直すので、指定を消せば元に戻る）
+        ctx.style_mut_of(egui::Theme::Dark, |s| s.visuals = self.theme.visuals(true));
+        ctx.style_mut_of(egui::Theme::Light, |s| {
+            s.visuals = self.theme.visuals(false)
         });
         let size = self.cfg.font_size;
         ctx.all_styles_mut(|style| {
@@ -2573,6 +2611,7 @@ impl App {
         };
         let cache = &mut self.hover_cache;
         let mentions_cache = &mut self.mentions;
+        let related_cache = &mut self.related;
         let generation = self.generation;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -2660,6 +2699,61 @@ impl App {
             // 閉じている間は結果を捨てる（大きなvaultで無駄に走査しないよう、開いているときだけ計算する）
             if header.body_returned.is_none() {
                 *mentions_cache = None;
+            }
+
+            ui.add_space(6.0);
+            let header = egui::CollapsingHeader::new(RichText::new("関連ノート").strong())
+                .id_salt("related-notes")
+                .default_open(true)
+                .show(ui, |ui| {
+                    // 別のノートに移ったら計算し直す。同じノートの編集中は、索引が変わっても数秒は使い回す
+                    // （密な大きいvaultでは1回に数十ミリ秒かかるため、保存のたびには計算しない）
+                    let stale = related_cache.as_ref().is_none_or(|(g, p, at, _)| {
+                        *p != tab.path || (*g != generation && at.elapsed() > RELATED_REFRESH)
+                    });
+                    if stale {
+                        let found = robsidian_core::related::related(vault, &tab.path, 8);
+                        *related_cache = Some((generation, tab.path.clone(), Instant::now(), found));
+                    }
+                    let Some((_, _, _, found)) = related_cache.as_ref() else {
+                        return;
+                    };
+                    if found.is_empty() {
+                        ui.weak("リンク先・リンク元・タグが共通するノートはありません");
+                        return;
+                    }
+                    for r in found {
+                        let title = file_name(&r.path).trim_end_matches(".md");
+                        let mut why = Vec::new();
+                        if !r.links.is_empty() {
+                            let names: Vec<&str> = r
+                                .links
+                                .iter()
+                                .take(5)
+                                .map(|l| file_name(l).trim_end_matches(".md"))
+                                .collect();
+                            let more = if r.links.len() > 5 { " ほか" } else { "" };
+                            why.push(format!("共通のつながり: {}{more}", names.join("、")));
+                        }
+                        if !r.tags.is_empty() {
+                            let tags: Vec<String> = r.tags.iter().map(|t| format!("#{t}")).collect();
+                            why.push(format!("共通のタグ: {}", tags.join(" ")));
+                        }
+                        let row = ui
+                            .selectable_label(false, title)
+                            .on_hover_ui(|ui| {
+                                ui.weak(why.join("\n"));
+                                ui.separator();
+                                hover::note_preview(ui, vault, cache, &r.path, None);
+                            });
+                        if row.clicked() {
+                            actions.push(Action::Open(r.path.clone(), None));
+                        }
+                        ui.label(RichText::new(why.join(" ・ ")).small().weak());
+                    }
+                });
+            if header.body_returned.is_none() {
+                *related_cache = None;
             }
 
             ui.add_space(10.0);
@@ -2864,6 +2958,7 @@ impl App {
             embed_heights,
             find: find_bar,
             vim: vim_state,
+            theme,
             props_panel,
             ..
         } = self;
@@ -2873,7 +2968,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let id = editor_id(&tab.path);
         let size = cfg.font_size;
-        let colors = Colors::new(cfg.dark);
+        let colors = theme.colors(cfg.dark);
 
         // 補完ポップアップが開いている間は、決定/移動キーをエディタより先に受け取る
         let mut accept = false;
@@ -3175,7 +3270,8 @@ impl App {
         let marks_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (marks, current_mark).hash(&mut h);
+            // テーマの色が変わったら組版をやり直す
+            (marks, current_mark, theme.generation).hash(&mut h);
             h.finish()
         };
         let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32, marks_key);
@@ -3186,6 +3282,16 @@ impl App {
         let Tab { text, layout, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
+                let math_size = |tex: &str, display: bool| {
+                    let b = math_view::layout(
+                        &ctx,
+                        tex,
+                        math_font(size, display),
+                        display,
+                        colors.text,
+                    );
+                    Some(b.size())
+                };
                 let options = editor::Options {
                     size,
                     colors: &colors,
@@ -3193,6 +3299,7 @@ impl App {
                     cursor,
                     image: &image_size,
                     note_embed: &note_embed,
+                    math: &math_size,
                     hide_frontmatter: live,
                     marks,
                     current_mark,
@@ -3482,6 +3589,27 @@ impl App {
                         ctx.request_repaint();
                     }
                 }
+                editor::DecoKind::Math { tex, display } => {
+                    let m = math_view::layout(
+                        &ctx,
+                        tex,
+                        math_font(size, *display),
+                        *display,
+                        colors.text,
+                    );
+                    let (x, center) = if *display {
+                        (
+                            (left + right) / 2.0 - m.w / 2.0,
+                            (a.top() + b.bottom()) / 2.0,
+                        )
+                    } else {
+                        // 確保した字間の右端から数式の幅だけ戻る（字間が文字の前後どちらに付いても合う）
+                        (b.left() - m.w, a.center().y)
+                    };
+                    // 上下の中心を、確保した場所の中心にそろえる
+                    let baseline = center + (m.asc - m.desc) / 2.0;
+                    m.paint(&painter, egui::pos2(x, baseline), colors.text);
+                }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;
@@ -3762,6 +3890,7 @@ impl App {
             generation,
             active,
             cfg,
+            mermaid,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -3773,6 +3902,7 @@ impl App {
             .is_none_or(|(v, g, _)| (*v, *g) != (tab.version, *generation))
         {
             let src = preview::to_preview(&tab.text, &tab.path, vault);
+            let src = mermaid_images(&src, vault.root(), mermaid, cfg, ui.ctx());
             tab.preview = Some((tab.version, *generation, src));
         }
         let Some((_, _, src)) = &tab.preview else {
@@ -3793,6 +3923,7 @@ impl App {
                         let width = ui.available_width().max(100.0) as usize;
                         CommonMarkViewer::new()
                             .alerts(preview::alerts())
+                            .render_math_fn(Some(&crate::math_view::show))
                             .max_image_width(Some(width))
                             .show_mut(ui, md_cache, &mut rendered);
                     });
@@ -4172,6 +4303,63 @@ fn side_margin(available: f32, cfg: &Config) -> f32 {
     }
 }
 
+/// プレビューの ```mermaid ブロックを、画像ができていれば画像に置き換える。
+/// 作成中・失敗のときは、コードのまま見せて一言添える。
+fn mermaid_images(
+    src: &str,
+    root: &std::path::Path,
+    mermaid: &mut crate::mermaid::Mermaid,
+    cfg: &Config,
+    ctx: &egui::Context,
+) -> String {
+    use crate::mermaid::State;
+    let blocks = crate::mermaid::blocks(src);
+    if blocks.is_empty() {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut at = 0;
+    for (range, body) in blocks {
+        out.push_str(&src[at..range.start]);
+        let block = &src[range.clone()];
+        match mermaid.image(root, &body, cfg.dark, &cfg.mermaid_command, ctx) {
+            Some(State::Ready(png)) => {
+                let uri = png.display().to_string().replace('\\', "/");
+                let uri = if uri.starts_with('/') {
+                    format!("file://{uri}")
+                } else {
+                    format!("file:///{uri}")
+                };
+                // 空白を含むパスでも切れないよう <…> で囲む（エンコードはしない。読み込み側が解かないため）
+                out.push_str(&format!("![Mermaid](<{uri}>)\n"));
+            }
+            Some(State::Pending) => {
+                out.push_str("*Mermaid図を作成中…*\n\n");
+                out.push_str(block);
+            }
+            Some(State::Failed(e)) => {
+                out.push_str(&format!(
+                    "*Mermaid図を作れませんでした: {e}（コマンドは設定で変えられます）*\n\n"
+                ));
+                out.push_str(block);
+            }
+            None => out.push_str(block),
+        }
+        at = range.end;
+    }
+    out.push_str(&src[at..]);
+    out
+}
+
+/// 数式の文字の大きさ（表示数式は少し大きくする）
+fn math_font(size: f32, display: bool) -> f32 {
+    if display {
+        size * 1.1
+    } else {
+        size
+    }
+}
+
 /// エディタの選択範囲（バイト位置）。選択が無ければカーソル位置の空の範囲。
 fn selection_bytes(ctx: &egui::Context, tab: &Tab) -> std::ops::Range<usize> {
     let state = TextEdit::load_state(ctx, editor_id(&tab.path));
@@ -4468,10 +4656,10 @@ fn tree_ui(
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.apply_style(&ctx);
         self.poll_watcher(&ctx);
         self.autosave(&ctx);
         self.poll_external(&ctx);
+        self.apply_style(&ctx);
         // ウィンドウからフォーカスが外れたら即保存する
         if ctx.input(|i| {
             i.events

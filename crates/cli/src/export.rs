@@ -12,6 +12,8 @@ use std::path::Path;
 const STYLE: &str = r#":root { color-scheme: light dark; --fg: #222; --bg: #fff; --dim: #777; --accent: #1a6fd6; --code: #f2f3f5; }
 @media (prefers-color-scheme: dark) { :root { --fg: #ddd; --bg: #1b1c1f; --dim: #888; --accent: #6cb6ff; --code: #26292f; } }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.7 system-ui, "Hiragino Sans", "Yu Gothic", "Noto Sans CJK JP", sans-serif; }
+.math { font-family: "Cambria Math", "STIX Two Math", "Times New Roman", serif; font-style: italic; }
+div.math { text-align: center; margin: 1em 0; font-size: 1.1em; }
 nav { padding: 12px 24px; border-bottom: 1px solid color-mix(in srgb, var(--dim) 30%, transparent); }
 main { max-width: 760px; margin: 0 auto; padding: 24px; }
 a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
@@ -136,10 +138,31 @@ fn render(md: &str) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH;
     let mut events: Vec<Event> = Vec::new();
     let mut heading: Option<(HeadingLevel, Vec<Event>)> = None;
     for e in Parser::new_ext(md, options) {
+        // 数式は1行の文字に直す（元のTeXは title に残す）
+        let e = match e {
+            Event::InlineMath(tex) => Event::InlineHtml(
+                format!(
+                    "<span class=\"math\" title=\"{}\">{}</span>",
+                    html_escape(&tex),
+                    html_escape(&robsidian_core::math::to_unicode(&tex))
+                )
+                .into(),
+            ),
+            Event::DisplayMath(tex) => Event::Html(
+                format!(
+                    "<div class=\"math\" title=\"{}\">{}</div>\n",
+                    html_escape(&tex),
+                    html_escape(&robsidian_core::math::to_unicode(&tex))
+                )
+                .into(),
+            ),
+            e => e,
+        };
         match e {
             Event::Start(Tag::Heading { level, .. }) => heading = Some((level, Vec::new())),
             Event::End(TagEnd::Heading(_)) => {
@@ -291,7 +314,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = [
             ("Home.md", "---\ntags: [x]\n---\n# Home\nSee [[notes/Deep Note#Part 2|deep]] and [[missing]] ![[img/pic.png]]"),
-            ("notes/Deep Note.md", "## Part 2\nback to [home](../Home.md) #tag"),
+            ("notes/Deep Note.md", "## Part 2\nback to [home](../Home.md) #tag $x^2$\n\n$$\\frac{a}{b}$$"),
             ("img/pic.png", "png"),
         ];
         for (p, t) in files {
@@ -311,6 +334,14 @@ mod tests {
         let deep = std::fs::read_to_string(out.path().join("notes/Deep Note.html")).unwrap();
         assert!(deep.contains("<h2 id=\"part-2\">Part 2</h2>"));
         assert!(deep.contains("href=\"../Home.html\""));
+        assert!(
+            deep.contains("<span class=\"math\" title=\"x^2\">x²</span>"),
+            "{deep}"
+        );
+        assert!(
+            deep.contains("<div class=\"math\" title=\"\\frac{a}{b}\">a/b</div>"),
+            "{deep}"
+        );
         assert!(deep.contains("<section class=\"backlinks\">") || !deep.contains("バックリンク"));
         assert!(out.path().join("img/pic.png").exists());
         assert!(out.path().join("index.html").exists());

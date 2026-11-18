@@ -4,11 +4,14 @@
 
 pub mod git;
 pub mod history;
+pub mod math;
 pub mod parse;
 pub mod props;
+pub mod related;
 pub mod search;
 pub mod task;
 pub mod template;
+pub mod theme;
 pub mod usercmd;
 pub mod vault;
 

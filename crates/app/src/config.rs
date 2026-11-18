@@ -70,6 +70,8 @@ pub struct Config {
     /// 実行を許可したユーザーコマンドの設定ファイル（vaultのパス → 許可したときの内容）。
     /// vaultの外に置くことで、vaultを受け取っただけでは許可されない
     pub trusted_commands: std::collections::BTreeMap<String, String>,
+    /// Mermaid図を画像にするコマンド（空なら使わない）。`-i 入力 -o 出力 -b transparent -t テーマ` を後ろに付けて実行する
+    pub mermaid_command: String,
 }
 
 impl Default for Config {
@@ -96,6 +98,7 @@ impl Default for Config {
             split: None,
             split_focus_right: false,
             trusted_commands: Default::default(),
+            mermaid_command: "mmdc".into(),
         }
     }
 }

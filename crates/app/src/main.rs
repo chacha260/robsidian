@@ -12,9 +12,12 @@ mod graph;
 mod highlight;
 mod history_view;
 mod hover;
+mod math_view;
+mod mermaid;
 mod preview;
 mod props_ui;
 mod settings;
+mod theme;
 mod vim;
 mod workspace;
 

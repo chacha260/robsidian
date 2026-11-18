@@ -113,6 +113,8 @@ pub enum DecoKind {
     },
     /// 表（範囲は表全体。先頭の行が見出し）
     Table(Vec<TableRow>),
+    /// 数式。表示数式（`$$…$$`）は範囲がブロック全体、行内数式は幅を確保した1文字
+    Math { tex: String, display: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +135,8 @@ pub struct Options<'a> {
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
     /// 埋め込んだノート（`ノート#見出し`）を描く高さ。ノートでなければ None
     pub note_embed: &'a dyn Fn(&str) -> Option<f32>,
+    /// 数式（TeX, 表示数式か）を描いたときの大きさ。描けなければ None
+    pub math: &'a dyn Fn(&str, bool) -> Option<Vec2>,
     /// frontmatterを畳む（プロパティ欄を出しているとき）
     pub hide_frontmatter: bool,
     /// 検索で一致した範囲（バイト位置）と、そのうち選択中のものの番号
@@ -155,6 +159,7 @@ struct Painter<'a> {
     c: &'a Colors,
     live: bool,
     cursor: Option<(usize, usize)>,
+    math: &'a dyn Fn(&str, bool) -> Option<Vec2>,
 }
 
 impl Painter<'_> {
@@ -237,9 +242,21 @@ impl Painter<'_> {
         let b = line.as_bytes();
         let mut plain_from = 0;
         let mut i = 0;
+        let maths = if line.contains('$') {
+            robsidian_core::math::inline_spans(line)
+        } else {
+            Vec::new()
+        };
         // (記法の開始, 中身の開始, 中身の終了, 記法の終了, 中身の書式)
         type Token = (usize, usize, usize, usize, TextFormat);
         while i < b.len() {
+            if let Some(span) = maths.iter().find(|r| r.start == i) {
+                self.push(&line[plain_from..i], self.fmt(base));
+                self.inline_math(&line[span.clone()]);
+                plain_from = span.end;
+                i = span.end;
+                continue;
+            }
             let token: Option<Token> = match b[i] {
                 b'\\' => {
                     i += 2;
@@ -354,6 +371,44 @@ impl Painter<'_> {
         self.push(&line[plain_from..], self.fmt(base));
     }
 
+    /// 行内数式 `$…$`。ライブ表示でカーソルが触れていなければ、記法を畳んで描いた数式の幅を確保する
+    /// （上に数式を描く）。行の高さは、記法を見せるときも同じにする（カーソルの出入りで動かないように）。
+    fn inline_math(&mut self, src: &str) {
+        let tex = &src[1..src.len() - 1];
+        let drawn = if self.live {
+            (self.math)(tex, false)
+        } else {
+            None
+        };
+        let Some(sz) = drawn else {
+            self.push(src, self.fmt(self.c.code));
+            return;
+        };
+        let row = Some((self.size * LINE_HEIGHT).max(sz.y + 4.0));
+        let hide = self.hidden(self.ahead(src));
+        if hide {
+            // 先頭の `$` を極小・透明にして、数式の幅だけ字間を空ける
+            let mut slot = self.mark(true);
+            slot.extra_letter_spacing = sz.x;
+            slot.line_height = row;
+            let at = self.push(&src[..1], slot);
+            let mut rest = self.mark(true);
+            rest.line_height = row;
+            self.push(&src[1..], rest);
+            self.deco(
+                DecoKind::Math {
+                    tex: tex.to_string(),
+                    display: false,
+                },
+                at,
+            );
+        } else {
+            let mut f = self.fmt(self.c.code);
+            f.line_height = row;
+            self.push(src, f);
+        }
+    }
+
     /// 行頭の記号（リスト・タスク・引用）を積み、残りの本文の開始位置と文字色を返す。
     /// 行頭の記号（リスト・タスク・引用）を積み、残りの本文の開始位置と文字色、
     /// 引用の縦線を描くかどうかを返す。記号は、カーソルが触れている間だけそのまま見せる。
@@ -419,6 +474,30 @@ fn image_only(line: &str) -> Option<String> {
     Some(parse::percent_decode(url))
 }
 
+/// `n` 行目から始まる表示数式 `$$…$$`。（最後の行, 中身のTeX）
+fn display_math(lines: &[&str], n: usize) -> Option<(usize, String)> {
+    let first = lines[n].trim_end_matches(['\n', '\r']).trim();
+    let after = first.strip_prefix("$$")?;
+    if let Some(tex) = after.strip_suffix("$$") {
+        // 1行の `$$…$$`（`$$` だけの行は開きとみなす）
+        if !after.is_empty() {
+            return (!tex.trim().is_empty()).then(|| (n, tex.to_string()));
+        }
+    }
+    let mut tex = after.to_string();
+    for (k, raw) in lines.iter().enumerate().skip(n + 1).take(200) {
+        let l = raw.trim_end_matches(['\n', '\r']).trim_end();
+        if let Some(last) = l.strip_suffix("$$") {
+            tex.push('\n');
+            tex.push_str(last);
+            return (!tex.trim().is_empty()).then_some((k, tex));
+        }
+        tex.push('\n');
+        tex.push_str(l);
+    }
+    None
+}
+
 /// `| a | b |` をセルに分ける（`\|` は区切りとして扱わない）。
 fn table_cells(line: &str) -> Vec<String> {
     let t = line.trim();
@@ -460,6 +539,8 @@ pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> Lay
         c: colors,
         live: true,
         cursor: None,
+        // 表のセルの数式は、記法を見せたまま色だけ付ける（上に描く仕組みが無いため）
+        math: &|_: &str, _: bool| None,
     };
     p.inline(text, color);
     p.job
@@ -538,6 +619,7 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         c: opt.colors,
         live: opt.live,
         cursor: opt.cursor,
+        math: opt.math,
     };
     let size = opt.size;
     let mut in_frontmatter = text.starts_with("---\n") || text.starts_with("---\r\n");
@@ -547,6 +629,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
     let mut first_line = 0;
     // 処理中のコールアウト: (種類, 最初の行)
     let mut callout: Option<(String, usize)> = None;
+    // 処理中の表示数式: (最後の行, 整形表示するか, 開始文字位置, 行の高さ, TeX)
+    let mut math_block: Option<(usize, bool, usize, f32, String)> = None;
     // 処理中のコードブロックの色分け結果: (本文の最初の行, 行ごとの (色, バイト数))
     let mut code: Option<(usize, highlight::Lines)> = None;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -687,6 +771,38 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             format.valign = Align::TOP;
             let range = p.push(line, format);
             p.deco(DecoKind::NoteEmbed(target), range);
+        } else if math_block.is_some()
+            || (opt.live && trimmed.starts_with("$$")) && {
+                // 表示数式の開始: 閉じの `$$` があり、描けるときだけ扱う
+                let found = display_math(&lines, n)
+                    .and_then(|(end, tex)| (opt.math)(&tex, true).map(|sz| (end, tex, sz)));
+                if let Some((end, tex, sz)) = &found {
+                    let count = (end - n + 1) as f32;
+                    let block: usize = lines[n..=*end].iter().map(|l| l.chars().count()).sum();
+                    let pretty = p.hidden(p.chars..p.chars + block);
+                    // ブロックの高さを数式に合わせる（ソース表示でも同じ高さにする）
+                    let row = line_height(size).max((sz.y + size * 1.2) / count);
+                    math_block = Some((*end, pretty, p.chars, row, tex.clone()));
+                }
+                found.is_some()
+            }
+        {
+            let (end, pretty, start, row, tex) = math_block.take().expect("set above");
+            let mut format = if pretty {
+                p.mark(true)
+            } else {
+                p.fmt(p.c.code)
+            };
+            format.line_height = Some(row);
+            p.push(line, format.clone());
+            if n < end {
+                math_block = Some((end, pretty, start, row, tex));
+            } else if pretty {
+                p.deco(DecoKind::Math { tex, display: true }, start..p.chars);
+            }
+            // 改行も同じ高さにする（ブロックの各行の高さをそろえる）
+            p.push(eol, format);
+            continue;
         } else if table.is_some() || trimmed.starts_with('|') {
             if table.is_none() {
                 // 表の開始: 2行目が区切り行なら、連続する `|` 行を1つの表として扱う
@@ -930,6 +1046,12 @@ mod tests {
                 cursor,
                 image: &image,
                 note_embed: &|_: &str| None,
+                math: &|tex: &str, display: bool| {
+                    Some(Vec2::new(
+                        tex.len() as f32 * 7.0,
+                        if display { 40.0 } else { 18.0 },
+                    ))
+                },
                 hide_frontmatter: false,
             },
         )
@@ -1048,6 +1170,12 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &|_: &str| None,
+                math: &|tex: &str, display: bool| {
+                    Some(Vec2::new(
+                        tex.len() as f32 * 7.0,
+                        if display { 40.0 } else { 18.0 },
+                    ))
+                },
                 hide_frontmatter: false,
             },
         );
@@ -1090,6 +1218,12 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &|_: &str| None,
+                math: &|tex: &str, display: bool| {
+                    Some(Vec2::new(
+                        tex.len() as f32 * 7.0,
+                        if display { 40.0 } else { 18.0 },
+                    ))
+                },
                 hide_frontmatter: true,
             },
         );
@@ -1120,6 +1254,7 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &embed,
+                math: &|_: &str, _: bool| None,
                 hide_frontmatter: false,
             },
         );
@@ -1158,7 +1293,7 @@ mod tests {
     #[test]
     fn row_heights_do_not_depend_on_the_cursor() {
         // カーソルの出入りで行の高さが変わると表示が上下に動くので、どの要素でも一定に保つ
-        let text = "# H\n**b** [[l|a]]\n- [ ] t\n> q\n```rust\nfn f() {}\n```\n![[pic.png]]\n| a | b |\n|---|---|\n| 1 | 2 |\n> [!note]\n> c\nend";
+        let text = "# H\n**b** [[l|a]]\n- [ ] t\n> q\n```rust\nfn f() {}\n```\n![[pic.png]]\n| a | b |\n|---|---|\n| 1 | 2 |\n> [!note]\n> c\n式 $x^2$ と $5 $10\n$$\n\\frac{a}{b}\n$$\n$$y$$\nend";
         let heights = |cursor| -> Vec<Option<u32>> {
             let out = run(text, true, cursor);
             let mut rows = vec![None; text.lines().count()];
@@ -1181,6 +1316,46 @@ mod tests {
                 "cursor at {cursor}"
             );
         }
+    }
+
+    #[test]
+    fn math_is_drawn_over_reserved_space() {
+        let text = "a $x^2$ b\n$$\n\\frac{1}{2}\n$$\n価格 $5 と $10\n$$ 閉じない";
+        let out = run(text, true, None);
+        assert_eq!(out.job.text, text);
+        let maths: Vec<(String, bool)> = out
+            .decos
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DecoKind::Math { tex, display } => Some((tex.clone(), *display)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            maths,
+            [
+                ("x^2".to_string(), false),
+                ("\n\\frac{1}{2}\n".to_string(), true)
+            ]
+        );
+        // 行内数式の場所には、描いた幅（テストでは 文字数×7）だけ字間を空ける
+        let slot = out
+            .job
+            .sections
+            .iter()
+            .find(|s| s.format.extra_letter_spacing > 0.0)
+            .unwrap();
+        assert_eq!(slot.format.extra_letter_spacing, 21.0);
+        // カーソルが数式に入ると、記法をそのまま見せる
+        let on = run(text, true, Some((3, 3)));
+        assert!(!on
+            .decos
+            .iter()
+            .any(|d| matches!(&d.kind, DecoKind::Math { display: false, .. })));
+        // ソース表示では何もしない
+        assert!(run(text, false, None).decos.is_empty());
+        assert_eq!(display_math(&["$$x$$"], 0), Some((0, "x".into())));
+        assert_eq!(display_math(&["$$\n", "y\n"], 0), None);
     }
 
     #[test]

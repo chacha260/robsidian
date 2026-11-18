@@ -98,7 +98,26 @@ cargo run --release -p robsidian -- /path/to/vault
 
 プレビュー表示でも、ノートの埋め込みは引用ブロックとして展開し、コールアウトは同じ種類で描きます。
 
-まだ対応していないもの: 数式、Mermaid、文中の画像、コールアウトの折りたたみ。
+まだ対応していないもの: 文中の画像、コールアウトの折りたたみ。
+
+### 数式とMermaid
+
+- **数式**：`$…$`（行内）と `$$…$$`（表示数式）を、ライブ表示とプレビューの両方で組んで表示します。
+  - 対応しているもの
+    - 分数・根号・上付き/下付き・総和や積分の上下の添字
+    - ギリシャ文字・演算子・矢印
+    - `\left( … \right)` の伸びる括弧
+    - `pmatrix` / `bmatrix` / `cases` / `aligned`
+    - `\text` / `\mathbb` / アクセント（`\hat` `\vec` `\bar` …）
+  - 知らない命令は `\命令` のまま表示します。
+  - ライブ表示では、カーソルが数式に入るとTeXが見えます。行の高さは変わりません。
+  - `$5 と $10` のような金額は、数式として扱いません。
+  - TeXのよく使う部分を自前で組んでいるので、KaTeX / MathJax と同じ見た目にはなりません。
+- **Mermaid**：` ```mermaid ` のブロックは、[mermaid-cli](https://github.com/mermaid-js/mermaid-cli)（`mmdc`）が入っていれば、プレビューで図として表示します。
+  - 図は `.robsidian/cache/mermaid` にキャッシュし、同じ図は作り直しません。
+  - コマンドは設定（Ctrl+,）の「Mermaid図のコマンド」で変えられ、空にすると使いません。
+  - ライブ表示ではコードのままです。
+- `rob export` のHTMLでは、数式を1行の文字（`x²`、`(a+b)/c` など）に直して書き出します。
 
 ### Vimキーバインド（モーダル編集）
 
@@ -174,6 +193,40 @@ output = "insert"
   許可はvaultの外（アプリの設定）に記録します。ファイルが書き換わったら、もう一度確認します。
 - `rob run <名前>` でシェルからも実行できます（標準入力が入力になります）。
 
+### 関連ノート
+
+右サイドバーの「関連ノート」に、直接はリンクしていないが関係の深いノートが出ます。
+- 共通のリンク先・リンク元（同じノートからリンクされている、同じノートにリンクしている）と、共通のタグの重なり（Jaccard係数）で順位を付けます。
+- 各ノートの下に「共通のつながり」「共通のタグ」を表示し、なぜ関係があるのかがわかるようにしています。
+- 本文の意味までは見ません。
+- シェルからは `rob related <ノート>` で同じ結果を得られます。
+
+### テーマ設定ファイル
+
+`.robsidian/theme.toml` で配色を上書きできます。ダークとライトで別々に指定し、書いた色だけが変わります。
+ファイルを保存するとすぐ反映され、消せば元の色に戻ります。
+
+```toml
+[dark]
+background = "#1a1b26"   # パネルとウィンドウの背景
+input_bg   = "#16161e"   # 入力欄の背景
+selection  = "#33467c"   # 選択範囲・選択中のボタン
+text       = "#c0caf5"
+heading    = "#bb9af7"
+accent     = "#7aa2f7"   # リンク（link で別に指定も可）
+tag        = "#9ece6a"
+
+[light]
+accent = "#2a5bd7"
+```
+
+色は `#rgb` / `#rrggbb` / `#rrggbbaa` で書きます。指定できるキーは次のとおりです。
+- エディタ：`text` `dim` `heading` `accent` `tag` `strong` `code` `code_bg` `quote` `mark_bg` `diff_add` `diff_del` `find_bg` `find_current` `warn_bg`
+- 画面全体：`background` `input_bg` `selection` `ui_text` `link`
+
+知らないキーや色の誤りは通知で知らせます。フォントは設定画面（Ctrl+,）で変えます。
+CSSではないので、Obsidianのテーマはそのままでは使えません。
+
 ### git連携
 
 vaultがgitのリポジトリの中にあると、ステータスバーにコミットされていない変更の件数が出ます。
@@ -242,6 +295,7 @@ rob daily --append "- 14:00 打ち合わせ"
 | `rob search <query>` | 全文検索（`path:line:text` 形式、grep互換） |
 | `rob cat <note>` | 本文を出力（パスでも名前でも指定可） |
 | `rob backlinks <note>` / `rob links <note>` | 被リンク / 発リンク |
+| `rob related <note> [-n 件数]` | 関連ノート（`スコア\tパス`） |
 | `rob mentions <note> [--link]` | 未リンクの言及（`--link` ですべてリンクに書き換える） |
 | `rob tags [tag]` | タグ一覧 / そのタグを持つノート |
 | `rob tasks [条件] [--all \| --done]` | タスクの一覧（`path:行: [ ] 本文  📅 期日`） |
@@ -269,7 +323,7 @@ rob lint --orphans --strict
 `rob serve` は `{"id":1,"method":"search","params":{"query":"rust"}}` のような1行を受け取り、
 `{"id":1,"result":...}`（失敗時は `{"id":1,"error":"..."}`）を1行で返します。
 索引を持ち続け、リクエストのたびに変更のあったファイルだけ読み直します。
-メソッドは `stats` `list` `find` `search` `query` `tasks` `cat` `backlinks` `links` `resolve` `mentions` `write` `daily` です。
+メソッドは `stats` `list` `find` `search` `query` `tasks` `cat` `backlinks` `links` `resolve` `mentions` `related` `write` `daily` です。
 
 ## 性能の目安
 
@@ -290,8 +344,8 @@ rob lint --orphans --strict
 正直なところ、まだ次のものはありません。
 
 - **Helix風のモーダル編集** — Vimキーバインドのみです
-- **プラグイン / テーマ機構** — 旧Tauri版にあったJSプラグインAPIは廃止しました。拡張はユーザーコマンド（シェルコマンド）で行います。テーマはダーク/ライト切替のみです
-- Mermaid・数式の描画、内蔵ターミナル
+- **プラグイン / テーマ機構** — 旧Tauri版にあったJSプラグインAPIは廃止しました。拡張はユーザーコマンド（シェルコマンド）で、配色はテーマ設定ファイルで変えます
+- 内蔵ターミナル。Mermaidの図は外部コマンド（mmdc）が無いと表示できません
 - 動作確認はLinux（X11）のみです。Windows / macOS はCIでビルドとテストを回す設定を入れてありますが、
   実機での確認（特に日本語IME入力）はこれからです
 
