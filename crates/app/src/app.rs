@@ -3669,22 +3669,61 @@ impl App {
                     let stroke = egui::Stroke::new(1.0, colors.dim.gamma_multiply(0.7));
                     painter.line_segment([egui::pos2(left, y), egui::pos2(right, y)], stroke);
                 }
-                editor::DecoKind::Checkbox(checked) => {
+                editor::DecoKind::Checkbox(status) => {
                     let side = size * 0.95;
                     let rect = egui::Rect::from_center_size(span.center(), egui::vec2(side, side));
-                    if *checked {
-                        painter.rect_filled(rect, 3.0, colors.accent);
-                        let (c, u) = (rect.center(), side * 0.5);
-                        let points = vec![
-                            c + egui::vec2(-0.5 * u, 0.0),
-                            c + egui::vec2(-0.12 * u, 0.4 * u),
-                            c + egui::vec2(0.55 * u, -0.4 * u),
-                        ];
-                        let stroke = egui::Stroke::new(1.8, colors.code_bg);
-                        painter.add(egui::Shape::line(points, stroke));
-                    } else {
-                        let stroke = egui::Stroke::new(1.3, colors.dim);
-                        painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                    let (c, u) = (rect.center(), side * 0.5);
+                    let mark = egui::Stroke::new(1.8, colors.code_bg);
+                    match status {
+                        ' ' => {
+                            let stroke = egui::Stroke::new(1.3, colors.dim);
+                            painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                        }
+                        'x' | 'X' => {
+                            painter.rect_filled(rect, 3.0, colors.accent);
+                            let points = vec![
+                                c + egui::vec2(-0.5 * u, 0.0),
+                                c + egui::vec2(-0.12 * u, 0.4 * u),
+                                c + egui::vec2(0.55 * u, -0.4 * u),
+                            ];
+                            painter.add(egui::Shape::line(points, mark));
+                        }
+                        // 進行中: 左半分を塗る
+                        '/' => {
+                            let stroke = egui::Stroke::new(1.3, colors.accent);
+                            painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                            let half =
+                                egui::Rect::from_min_max(rect.min, egui::pos2(c.x, rect.max.y));
+                            painter.rect_filled(
+                                half,
+                                egui::CornerRadius {
+                                    nw: 3,
+                                    sw: 3,
+                                    ne: 0,
+                                    se: 0,
+                                },
+                                colors.accent,
+                            );
+                        }
+                        // 取り消し: 横線
+                        '-' => {
+                            painter.rect_filled(rect, 3.0, colors.dim);
+                            painter.line_segment(
+                                [c + egui::vec2(-0.5 * u, 0.0), c + egui::vec2(0.5 * u, 0.0)],
+                                mark,
+                            );
+                        }
+                        // そのほか（`>` `!` `?` など）は、その文字を描く
+                        other => {
+                            painter.rect_filled(rect, 3.0, colors.accent.gamma_multiply(0.75));
+                            painter.text(
+                                c,
+                                Align2::CENTER_CENTER,
+                                other.to_string(),
+                                egui::FontId::new(size * 0.75, fonts::bold()),
+                                colors.code_bg,
+                            );
+                        }
                     }
                     // クリックで切り替える（カーソルは動かさない）
                     if clip.contains_rect(rect) {
@@ -3696,8 +3735,14 @@ impl App {
                         if hit.hovered() {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        if hit.clicked() {
-                            toggle = Some((deco.chars.start + 1, !*checked));
+                        let label = match status {
+                            ' ' => "クリックで完了にする",
+                            _ => "クリックで未完了に戻す",
+                        };
+                        if hit.on_hover_text(label).clicked() {
+                            // Obsidian と同じく、未完了なら完了に、それ以外の状態なら未完了に戻す
+                            let next = if *status == ' ' { 'x' } else { ' ' };
+                            toggle = Some((deco.chars.start + 1, next));
                         }
                     }
                 }
@@ -3983,9 +4028,13 @@ impl App {
             let rect = egui::Rect::from_min_size(here.left_top(), egui::vec2(width, here.height()));
             painter.rect_filled(rect, 1.0, colors.accent.gamma_multiply(0.45));
         }
-        if let Some((ch, checked)) = toggle {
+        if let Some((ch, next)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
-            if tab.text.is_char_boundary(byte) && tab.text.is_char_boundary(byte + 1) {
+            let end = tab.text[byte..]
+                .chars()
+                .next()
+                .map_or(byte, |c| byte + c.len_utf8());
+            if end > byte {
                 // Ctrl+Zで戻せるよう、変更前の状態をTextEditの履歴に積む
                 let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
                 let range = state.cursor.char_range().unwrap_or_default();
@@ -3993,8 +4042,7 @@ impl App {
                 undoer.add_undo(&(range, tab.text.clone()));
                 state.set_undoer(undoer);
                 state.store(&ctx, id);
-                tab.text
-                    .replace_range(byte..byte + 1, if checked { "x" } else { " " });
+                tab.text.replace_range(byte..end, &next.to_string());
                 // チェックボックスのクリックでエディタのフォーカスが外れないようにする
                 ctx.memory_mut(|m| m.request_focus(id));
                 tab.dirty = true;

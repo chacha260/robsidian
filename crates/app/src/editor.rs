@@ -93,8 +93,8 @@ pub struct Deco {
 pub enum DecoKind {
     /// 箇条書きの「・」
     Bullet,
-    /// タスクのチェックボックス（範囲は `[ ]` の3文字）
-    Checkbox(bool),
+    /// タスクのチェックボックス（範囲は `[ ]` の3文字。中身は状態の文字: ' ' 未完了、'x' 完了、'/' '-' など）
+    Checkbox(char),
     /// 引用の縦線（範囲は行全体）
     Quote,
     /// 水平線（範囲は行全体）
@@ -457,6 +457,39 @@ impl Painter<'_> {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         let text = self.c.text;
+        // タスク（箇条書き・番号付き・引用の中も）。判定は一覧（core::task）と同じものを使う
+        if let Some((status_at, status, _)) = robsidian_core::task::task_in_line(line) {
+            let open = status_at - 1;
+            let close = status_at + status.len_utf8() + 1;
+            let quoted = line[..open].trim_start().starts_with('>');
+            let numbered = line[..open].trim_end().ends_with(['.', ')']);
+            let hide = self.hidden(self.ahead(&line[..close]));
+            if numbered {
+                // 番号は畳まずに薄く見せる（Obsidian と同じ）
+                self.push(&line[..open], self.fmt(self.c.dim));
+            } else {
+                let bullet = open - 2;
+                let lead = &line[..bullet];
+                if quoted {
+                    self.push(lead, self.ghost(hide));
+                } else {
+                    self.push(lead, self.indent_fmt(lead));
+                }
+                self.push(&line[bullet..open], self.mark(hide));
+            }
+            let range = self.push(&line[open..close], self.ghost(hide));
+            if hide {
+                self.deco(DecoKind::Checkbox(status), range);
+            }
+            let body = if line[close..].starts_with(' ') {
+                self.push(" ", self.fmt(text));
+                close + 1
+            } else {
+                close
+            };
+            let color = if status == ' ' { text } else { self.c.dim };
+            return (body, color, quoted);
+        }
         if trimmed.starts_with("> ") || trimmed == ">" {
             let end = (indent + 2).min(line.len());
             let hide = self.hidden(self.ahead(&line[..end]));
@@ -466,20 +499,6 @@ impl Painter<'_> {
         }
         let bullet = ["- ", "* ", "+ "].iter().any(|m| trimmed.starts_with(m));
         if bullet {
-            let rest = &trimmed[2..];
-            let checked = rest.starts_with("[x] ") || rest.starts_with("[X] ");
-            if checked || rest.starts_with("[ ] ") {
-                // `- [ ] ` → 先頭の `- ` を畳み、`[ ]` の位置にチェックボックスを描く
-                let hide = self.hidden(self.ahead(&line[..indent + 5]));
-                self.push(&line[..indent], self.indent_fmt(&line[..indent]));
-                self.push(&line[indent..indent + 2], self.mark(hide));
-                let range = self.push(&line[indent + 2..indent + 5], self.ghost(hide));
-                if hide {
-                    self.deco(DecoKind::Checkbox(checked), range);
-                }
-                self.push(" ", self.fmt(text));
-                return (indent + 6, if checked { self.c.dim } else { text }, false);
-            }
             let hide = self.hidden(self.ahead(&line[..indent + 1]));
             self.push(&line[..indent], self.indent_fmt(&line[..indent]));
             let range = self.push(&line[indent..indent + 1], self.ghost(hide));
@@ -982,7 +1001,9 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                             label = Some((callout_label(&kind), marker.start));
                         }
                     } else {
-                        p.inline(&line[body..], p.c.text);
+                        // 完了したタスクは薄く、それ以外は本文の色（引用の色にはしない）
+                        let color = if color == p.c.dim { color } else { p.c.text };
+                        p.inline(&line[body..], color);
                     }
                     let fold = (first == n)
                         .then_some(open)
@@ -1210,7 +1231,7 @@ mod tests {
         assert_eq!(
             kinds[..8],
             [
-                DecoKind::Checkbox(false),
+                DecoKind::Checkbox(' '),
                 DecoKind::Bullet,
                 DecoKind::Quote,
                 DecoKind::Rule,
@@ -1570,6 +1591,38 @@ mod tests {
         assert_eq!(callout_fold("> [!tip]- x"), Some(false));
         assert_eq!(callout_fold("> [!TIP]+"), Some(true));
         assert_eq!(callout_fold("> [!tip] x"), None);
+    }
+
+    #[test]
+    fn tasks_in_all_forms_get_checkboxes() {
+        let text =
+            "- [ ] a\n- [x] b\n1. [ ] c\n2) [/] d\n> - [-] e\n- [ ]\n  * [>] f\n- [ab] no\n-[ ] no";
+        let out = run(text, true, None);
+        assert_eq!(out.job.text, text);
+        let boxes: Vec<char> = out
+            .decos
+            .iter()
+            .filter_map(|d| match d.kind {
+                DecoKind::Checkbox(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes, [' ', 'x', ' ', '/', '-', ' ', '>']);
+        // チェックボックスは `[ ]` の3文字の上に描く
+        for d in out
+            .decos
+            .iter()
+            .filter(|d| matches!(d.kind, DecoKind::Checkbox(_)))
+        {
+            let chars: String = text
+                .chars()
+                .skip(d.chars.start)
+                .take(d.chars.len())
+                .collect();
+            assert!(chars.starts_with('[') && chars.ends_with(']'), "{chars}");
+        }
+        // 引用の中のタスクは引用の縦線も描く
+        assert!(out.decos.iter().any(|d| d.kind == DecoKind::Quote));
     }
 
     #[test]
