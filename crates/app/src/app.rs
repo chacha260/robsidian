@@ -71,6 +71,8 @@ enum Command {
     ToggleTheme,
     Rescan,
     GitCommit,
+    GitPull,
+    GitPush,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -118,6 +120,8 @@ impl Command {
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
             Command::GitCommit => "git commit snapshot save version",
+            Command::GitPull => "git pull fetch sync download remote",
+            Command::GitPush => "git push sync upload remote",
         }
     }
 }
@@ -215,6 +219,12 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
     (Command::GitCommit, "gitにスナップショットをコミット", None),
+    (
+        Command::GitPull,
+        "gitでリモートの変更を取り込む（pull）",
+        None,
+    ),
+    (Command::GitPush, "gitでリモートへ送る（push）", None),
 ];
 
 enum Action {
@@ -1267,14 +1277,20 @@ impl App {
                     tab.preview = None;
                 }
             }
-            Command::GitCommit => {
+            Command::GitCommit | Command::GitPull | Command::GitPush => {
+                let root = self.vault.as_ref().map(|v| v.root().to_path_buf());
                 if !self.git.repo {
                     self.toast("このvaultはgitのリポジトリの中にありません");
-                } else if self.git.committing() {
-                    self.toast("コミット中です");
-                } else {
+                } else if let Some(busy) = self.git.busy() {
+                    self.toast(format!("git: {busy}"));
+                } else if let Some(root) = root {
+                    // 取り込む・送る前に、編集中の内容を保存しておく
                     self.save_all();
-                    self.commit_message = Some(external::snapshot_message());
+                    match cmd {
+                        Command::GitPull => self.git.pull(&root, ctx),
+                        Command::GitPush => self.git.push(&root, ctx),
+                        _ => self.commit_message = Some(external::snapshot_message()),
+                    }
                 }
             }
         }
@@ -1316,9 +1332,8 @@ impl App {
             }
         }
         match self.git.poll(&root, ctx) {
-            Some(GitEvent::Committed(hash)) => self.toast(format!("コミットしました: {hash}")),
-            Some(GitEvent::NothingToCommit) => self.toast("コミットする変更はありません"),
-            Some(GitEvent::Failed(e)) => self.toast(format!("コミットできません: {e}")),
+            Some(GitEvent::Done(msg)) => self.toast(msg),
+            Some(GitEvent::Failed(e)) => self.toast(format!("git: {e}")),
             None => {}
         }
     }
@@ -2318,7 +2333,7 @@ impl App {
     // ---- 画面 ----
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let mut commit = false;
+        let mut git_cmd = None;
         ui.horizontal(|ui| {
             if let Some(vault) = &self.vault {
                 let name = vault
@@ -2340,7 +2355,9 @@ impl App {
             }
             if self.git.repo {
                 let label = match self.git.changes {
-                    _ if self.git.committing() => "git: コミット中…".to_string(),
+                    _ if self.git.busy().is_some() => {
+                        format!("git: {}", self.git.busy().unwrap_or_default())
+                    }
                     Some(0) => "git: 変更なし".to_string(),
                     Some(n) => format!("git: {n}件の変更"),
                     None => "git".to_string(),
@@ -2351,7 +2368,28 @@ impl App {
                     .on_hover_text("クリックでスナップショットをコミット")
                     .clicked()
                 {
-                    commit = true;
+                    git_cmd = Some(Command::GitCommit);
+                }
+                // リモートとの差。クリックで送る / 取り込む
+                if let Some(up) = self.git.upstream {
+                    let ahead = egui::Button::new(RichText::new(format!("↑{}", up.ahead)).weak())
+                        .frame(false);
+                    if ui
+                        .add(ahead)
+                        .on_hover_text("リモートに無いコミットの数。クリックで送る（push）")
+                        .clicked()
+                    {
+                        git_cmd = Some(Command::GitPush);
+                    }
+                    let behind = egui::Button::new(RichText::new(format!("↓{}", up.behind)).weak())
+                        .frame(false);
+                    if ui
+                        .add(behind)
+                        .on_hover_text("リモートにあって手元に無いコミットの数（最後に取り込んだ時点）。クリックで取り込む（pull）")
+                        .clicked()
+                    {
+                        git_cmd = Some(Command::GitPull);
+                    }
                 }
             }
             for job in &self.jobs {
@@ -2372,9 +2410,9 @@ impl App {
                 }
             });
         });
-        if commit {
+        if let Some(cmd) = git_cmd {
             let ctx = ui.ctx().clone();
-            self.run(Command::GitCommit, &ctx);
+            self.run(cmd, &ctx);
         }
     }
 

@@ -134,6 +134,10 @@ enum Cmd {
         #[arg(short, long)]
         note: Option<String>,
     },
+    /// リモートの変更を取り込む（git pull --rebase。競合したら取り消して元に戻す）
+    Pull,
+    /// こちらのコミットをリモートへ送る（git push）
+    Push,
     /// vault以下の変更をgitにコミットする（スナップショット）
     Snapshot {
         /// コミットメッセージ（省略時は日時）
@@ -542,6 +546,17 @@ fn run(cli: Cli) -> Result<()> {
                 out.w.flush()?;
                 std::process::exit(1);
             }
+        }
+        Cmd::Pull | Cmd::Push => {
+            if !git::is_repo(vault.root()) {
+                bail!("vaultはgitのリポジトリの中にありません");
+            }
+            let msg = if matches!(cli.cmd, Cmd::Pull) {
+                git::pull(vault.root())?
+            } else {
+                git::push(vault.root())?
+            };
+            eprintln!("{msg}");
         }
         Cmd::Snapshot { message } => {
             if !git::is_repo(vault.root()) {
