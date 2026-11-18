@@ -3648,6 +3648,18 @@ impl App {
                     let baseline = center + (m.asc - m.desc) / 2.0;
                     m.paint(&painter, egui::pos2(x, baseline), colors.text);
                 }
+                editor::DecoKind::InlineImage(target, shown) => {
+                    if let Some((texture, _)) = load_image(target) {
+                        // 確保した字間の右端から幅だけ戻り、行の下端にそろえる
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(b.left() - shown.x - 2.0, a.bottom() - shown.y - 2.0),
+                            *shown,
+                        );
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        painter.image(texture, rect, uv, egui::Color32::WHITE);
+                    }
+                }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;

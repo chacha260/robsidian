@@ -115,6 +115,8 @@ pub enum DecoKind {
     Table(Vec<TableRow>),
     /// 数式。表示数式（`$$…$$`）は範囲がブロック全体、行内数式は幅を確保した1文字
     Math { tex: String, display: bool },
+    /// 文中の画像（範囲は幅を確保した1文字。中身はリンク先と描く大きさ）
+    InlineImage(String, Vec2),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,6 +162,7 @@ struct Painter<'a> {
     live: bool,
     cursor: Option<(usize, usize)>,
     math: &'a dyn Fn(&str, bool) -> Option<Vec2>,
+    image: &'a dyn Fn(&str) -> Option<Vec2>,
 }
 
 impl Painter<'_> {
@@ -250,6 +253,17 @@ impl Painter<'_> {
         // (記法の開始, 中身の開始, 中身の終了, 記法の終了, 中身の書式)
         type Token = (usize, usize, usize, usize, TextFormat);
         while i < b.len() {
+            if b[i] == b'!' && self.live {
+                if let Some((len, target, size)) = inline_image(&line[i..])
+                    .and_then(|(len, t)| (self.image)(&t).map(|s| (len, t, s)))
+                {
+                    self.push(&line[plain_from..i], self.fmt(base));
+                    self.inline_image(&line[i..i + len], target, size);
+                    plain_from = i + len;
+                    i += len;
+                    continue;
+                }
+            }
             if let Some(span) = maths.iter().find(|r| r.start == i) {
                 self.push(&line[plain_from..i], self.fmt(base));
                 self.inline_math(&line[span.clone()]);
@@ -371,6 +385,29 @@ impl Painter<'_> {
         self.push(&line[plain_from..], self.fmt(base));
     }
 
+    /// 文中の画像。カーソルが触れていなければ、記法を畳んで画像の幅を確保し、上に画像を描く。
+    /// 行の高さは画像に合わせ、記法を見せるときも同じにする。
+    fn inline_image(&mut self, src: &str, target: String, size: Vec2) {
+        // 大きな画像は、行が高くなりすぎないよう縮める
+        let scale = (INLINE_IMAGE_MAX / size.y).min(1.0);
+        let size = size * scale;
+        let row = Some((self.size * LINE_HEIGHT).max(size.y + 4.0));
+        if self.hidden(self.ahead(src)) {
+            let mut slot = self.mark(true);
+            slot.extra_letter_spacing = size.x + 2.0;
+            slot.line_height = row;
+            let at = self.push(&src[..1], slot);
+            let mut rest = self.mark(true);
+            rest.line_height = row;
+            self.push(&src[1..], rest);
+            self.deco(DecoKind::InlineImage(target, size), at);
+        } else {
+            let mut f = self.fmt(self.c.accent);
+            f.line_height = row;
+            self.push(src, f);
+        }
+    }
+
     /// 行内数式 `$…$`。ライブ表示でカーソルが触れていなければ、記法を畳んで描いた数式の幅を確保する
     /// （上に数式を描く）。行の高さは、記法を見せるときも同じにする（カーソルの出入りで動かないように）。
     fn inline_math(&mut self, src: &str) {
@@ -458,6 +495,34 @@ impl Painter<'_> {
     }
 }
 
+/// 文中の画像の高さの上限
+const INLINE_IMAGE_MAX: f32 = 200.0;
+
+/// `![[画像]]` / `![代替](画像)` で始まっていれば、その長さ（バイト）とリンク先。
+fn inline_image(s: &str) -> Option<(usize, String)> {
+    if let Some(rest) = s.strip_prefix("![[") {
+        let close = rest.find("]]")?;
+        let inner = &rest[..close];
+        let target = inner.split(['|', '#']).next()?.trim();
+        if target.is_empty() || inner.contains('[') {
+            return None;
+        }
+        return Some((3 + close + 2, target.to_string()));
+    }
+    let rest = s.strip_prefix("![")?;
+    let mid = rest.find("](")?;
+    if rest[..mid].contains(['[', ']']) {
+        return None;
+    }
+    let close = rest[mid + 2..].find(')')?;
+    let url = &rest[mid + 2..mid + 2 + close];
+    if url.contains("://") || url.trim().is_empty() {
+        return None;
+    }
+    let url = url.trim().trim_start_matches('<').trim_end_matches('>');
+    Some((2 + mid + 2 + close + 1, parse::percent_decode(url)))
+}
+
 /// 行が画像の埋め込みだけで出来ていれば、そのリンク先を返す。
 fn image_only(line: &str) -> Option<String> {
     let t = line.trim();
@@ -539,8 +604,9 @@ pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> Lay
         c: colors,
         live: true,
         cursor: None,
-        // 表のセルの数式は、記法を見せたまま色だけ付ける（上に描く仕組みが無いため）
+        // 表のセルの数式・画像は、記法を見せたまま色だけ付ける（上に描く仕組みが無いため）
         math: &|_: &str, _: bool| None,
+        image: &|_: &str| None,
     };
     p.inline(text, color);
     p.job
@@ -620,6 +686,7 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         live: opt.live,
         cursor: opt.cursor,
         math: opt.math,
+        image: opt.image,
     };
     let size = opt.size;
     let mut in_frontmatter = text.starts_with("---\n") || text.starts_with("---\r\n");
@@ -1356,6 +1423,41 @@ mod tests {
         assert!(run(text, false, None).decos.is_empty());
         assert_eq!(display_math(&["$$x$$"], 0), Some((0, "x".into())));
         assert_eq!(display_math(&["$$\n", "y\n"], 0), None);
+    }
+
+    #[test]
+    fn inline_images_reserve_space() {
+        let text = "前 ![[pic.png]] 後 ![[nope.png]] ![a](pic.png)";
+        let out = run(text, true, None);
+        assert_eq!(out.job.text, text);
+        let images: Vec<_> = out
+            .decos
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DecoKind::InlineImage(t, size) => Some((t.clone(), *size)),
+                _ => None,
+            })
+            .collect();
+        // 読めない画像（nope.png）は記法のまま
+        assert_eq!(
+            images,
+            [
+                ("pic.png".to_string(), Vec2::new(100.0, 50.0)),
+                ("pic.png".to_string(), Vec2::new(100.0, 50.0))
+            ]
+        );
+        // カーソルが触れている画像は記法を見せる
+        assert_eq!(run(text, true, Some((3, 3))).decos.len(), 1);
+        assert_eq!(
+            inline_image("![[a b.png|200]] x"),
+            Some((16, "a b.png".into()))
+        );
+        assert_eq!(
+            inline_image("![x](img/a%20b.png) y"),
+            Some((19, "img/a b.png".into()))
+        );
+        assert_eq!(inline_image("![x](https://e/x.png)"), None);
+        assert_eq!(inline_image("![[]]"), None);
     }
 
     #[test]
