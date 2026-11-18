@@ -417,10 +417,11 @@ fn bracket_object(
 fn quote_object(t: &str, p: usize, q: char, inner: bool) -> Option<(usize, usize)> {
     let (ls, le) = (line_start(t, p), line_end(t, p));
     let quotes: Vec<usize> = t[ls..le].match_indices(q).map(|(i, _)| ls + i).collect();
-    let pair = quotes
-        .chunks_exact(2)
+    let (pairs, _) = quotes.as_chunks::<2>();
+    let pair = pairs
+        .iter()
         .find(|w| w[0] <= p && p <= w[1])
-        .or_else(|| quotes.chunks_exact(2).find(|w| w[0] > p))?;
+        .or_else(|| pairs.iter().find(|w| w[0] > p))?;
     let (a, b) = (pair[0], pair[1]);
     Some(if inner {
         (a + q.len_utf8(), b)
