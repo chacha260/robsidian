@@ -296,6 +296,8 @@ enum Action {
     RunUser(usize),
     /// スラッシュコマンド: (ノート, 入力した `/` のバイト位置)
     Slash(String, usize),
+    /// 音声を再生する / 止める（vault内のパス）
+    PlayAudio(String),
 }
 
 enum Dialog {
@@ -622,6 +624,8 @@ pub struct App {
     canvas_view: Option<crate::canvas_view::CanvasView>,
     /// 録音中
     recorder: Option<crate::recorder::Recorder>,
+    /// 再生中の音声
+    player: Option<crate::player::Player>,
     /// スライド表示中: (ノート, 何枚目)
     slideshow: Option<(String, usize)>,
     /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
@@ -697,6 +701,7 @@ impl App {
             base_view: None,
             canvas_view: None,
             recorder: None,
+            player: None,
             slideshow: None,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
@@ -1084,11 +1089,30 @@ impl App {
                 self.jump_to_heading(&path, heading);
             }
         } else if let Some(file) = vault.resolve_file(target, from).map(str::to_string) {
-            self.open_external(&file, ctx);
+            if crate::player::is_audio(&file) {
+                // 録音などの音声は、その場で鳴らす（もう一度で止める）
+                self.toggle_audio(&file);
+            } else {
+                self.open_external(&file, ctx);
+            }
         } else if !target.is_empty() {
             // Obsidianと同じく、存在しないリンクを開くとノートを作る
             self.create_and_open(target);
         }
+    }
+
+    /// 音声を鳴らす。同じファイルを鳴らしていれば止める。
+    fn toggle_audio(&mut self, path: &str) {
+        let same = self.player.as_ref().is_some_and(|p| p.path == path);
+        self.player = None;
+        if same {
+            return;
+        }
+        let Some(vault) = &self.vault else { return };
+        self.player = Some(crate::player::Player::start(
+            vault.abs(path),
+            path.to_string(),
+        ));
     }
 
     /// 開いているノートの見出しへ移動する。`a#b` のような入れ子の指定は最後の見出しで探す。
@@ -2475,6 +2499,7 @@ impl App {
             }
             Action::OpenExternal(path) => self.open_external(&path, ctx),
             Action::FollowLink { target, from } => self.follow_link(&target, &from, ctx),
+            Action::PlayAudio(path) => self.toggle_audio(&path),
             Action::Activate(i) => {
                 self.active = i;
                 self.show_graph = false;
@@ -2585,6 +2610,12 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let mut git_cmd = None;
+        if let Some(p) = self.player.take_if(|p| p.finished()) {
+            if let Some(e) = p.error() {
+                self.toast(format!("再生できません: {e}"));
+            }
+        }
+        let mut stop_audio = false;
         ui.horizontal(|ui| {
             if let Some(vault) = &self.vault {
                 let name = vault
@@ -2646,6 +2677,18 @@ impl App {
             for job in &self.jobs {
                 ui.weak(format!("「{}」を実行中…", job.name));
             }
+            if let Some(p) = &self.player {
+                let label = format!("▶ {}  {}", file_name(&p.path), p.progress_label());
+                if ui
+                    .add(egui::Button::new(RichText::new(label).weak()).frame(false))
+                    .on_hover_text("クリックで止める")
+                    .clicked()
+                {
+                    stop_audio = true;
+                }
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            }
             if let Some(err) = self.recorder.as_ref().and_then(|r| r.error()) {
                 // マイクが外されたなど。そこまでの録音を保存する
                 git_cmd = Some(Command::Record);
@@ -2686,6 +2729,9 @@ impl App {
                 }
             });
         });
+        if stop_audio {
+            self.player = None;
+        }
         if let Some(cmd) = git_cmd {
             let ctx = ui.ctx().clone();
             self.run(cmd, &ctx);
@@ -3384,6 +3430,7 @@ impl App {
             theme,
             callout_folds,
             props_panel,
+            player,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -4097,6 +4144,89 @@ impl App {
                             {
                                 fold_toggle = Some((*line, !*open));
                             }
+                        }
+                    }
+                }
+                editor::DecoKind::Audio(target) => {
+                    let top = a.top() + editor::line_height(size) + 4.0;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, top),
+                        egui::vec2((right - left).clamp(80.0, 460.0), editor::AUDIO_HEIGHT),
+                    );
+                    behind.push(egui::Shape::rect_filled(rect, 16.0, colors.code_bg));
+                    let file = vault.resolve_file(target, &tab.path).map(str::to_string);
+                    let playing = player
+                        .as_ref()
+                        .filter(|p| Some(&p.path) == file.as_ref() && !p.finished());
+                    // 再生 / 停止のボタン（文字ではなく図形で描く）
+                    let c = egui::pos2(rect.left() + 16.0, rect.center().y);
+                    let r = 6.0;
+                    let mark = if file.is_none() {
+                        colors.dim
+                    } else {
+                        colors.accent
+                    };
+                    if playing.is_some() {
+                        painter.rect_filled(
+                            egui::Rect::from_center_size(c, egui::vec2(r * 1.6, r * 1.6)),
+                            1.0,
+                            mark,
+                        );
+                    } else {
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                c + egui::vec2(-r * 0.7, -r),
+                                c + egui::vec2(-r * 0.7, r),
+                                c + egui::vec2(r, 0.0),
+                            ],
+                            mark,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                    let name = file_name(file.as_deref().unwrap_or(target)).to_string();
+                    let label = match (&file, playing) {
+                        (None, _) => format!("{name}（見つかりません）"),
+                        (_, Some(p)) => format!("{name}   {}", p.progress_label()),
+                        _ => name,
+                    };
+                    painter.with_clip_rect(rect.intersect(clip)).text(
+                        egui::pos2(rect.left() + 32.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(size * 0.9),
+                        colors.text,
+                    );
+                    if let Some(p) = playing {
+                        // 進み具合の細い線
+                        let frac = p.fraction();
+                        let track = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 32.0, rect.bottom() - 5.0),
+                            egui::pos2(rect.right() - 16.0, rect.bottom() - 3.0),
+                        );
+                        painter.rect_filled(track, 1.0, colors.dim.gamma_multiply(0.4));
+                        let mut done = track;
+                        done.set_right(track.left() + track.width() * frac);
+                        painter.rect_filled(done, 1.0, colors.accent);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    if let Some(file) = file.filter(|_| clip.intersects(rect)) {
+                        let hit = ui.interact(
+                            rect,
+                            id.with(("audio", deco.chars.start)),
+                            egui::Sense::click(),
+                        );
+                        if hit.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if hit
+                            .on_hover_text(if playing.is_some() {
+                                "止める"
+                            } else {
+                                "再生する"
+                            })
+                            .clicked()
+                        {
+                            actions.push(Action::PlayAudio(file));
                         }
                     }
                 }

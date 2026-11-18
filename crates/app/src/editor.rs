@@ -105,6 +105,8 @@ pub enum DecoKind {
     Image(String),
     /// 埋め込んだノート（範囲は行全体、中身は `ノート#見出し`）
     NoteEmbed(String),
+    /// 埋め込んだ音声（範囲は行全体、中身はリンク先）。行の下に再生ボタンを描く
+    Audio(String),
     /// コールアウトの1行（範囲は行全体）。タイトルが無い最初の行には、種類名を描く位置（文字位置）が付く
     Callout {
         color: Color32,
@@ -635,6 +637,9 @@ pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> Lay
     p.job
 }
 
+/// 埋め込んだ音声の再生ボタンの行の高さ
+pub const AUDIO_HEIGHT: f32 = 32.0;
+
 /// 行が `![[ノート]]`（別名は除く）だけで出来ていれば、`ノート#見出し` を返す。
 pub fn embed_only(line: &str) -> Option<String> {
     let inner = line.trim().strip_prefix("![[")?.strip_suffix("]]")?;
@@ -863,6 +868,15 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             format.valign = Align::TOP;
             let range = p.push(line, format);
             p.deco(DecoKind::Image(target), range);
+        } else if let Some(target) =
+            embed_only(line).filter(|t| opt.live && crate::player::is_audio(t))
+        {
+            // 記法の行の下に、再生ボタンの場所を確保する
+            let mut format = if hide { p.mark(true) } else { p.fmt(p.c.dim) };
+            format.line_height = Some(line_height(size) + AUDIO_HEIGHT + 8.0);
+            format.valign = Align::TOP;
+            let range = p.push(line, format);
+            p.deco(DecoKind::Audio(target), range);
         } else if let Some((target, height)) = embed_only(line)
             .filter(|_| opt.live)
             .and_then(|t| (opt.note_embed)(&t).map(|h| (t, h)))
@@ -1377,7 +1391,8 @@ mod tests {
     #[test]
     fn callouts_and_note_embeds() {
         let colors = Colors::new(true);
-        let text = "> [!tip]- Title\n> body\nafter\n> [!note]\n> b\n![[Other#h]]\nend";
+        let text =
+            "> [!tip]- Title\n> body\nafter\n> [!note]\n> b\n![[Other#h]]\n![[rec.wav]]\nend";
         let image = |_: &str| None;
         let embed = |t: &str| (t == "Other#h").then_some(80.0);
         let out = layout(
@@ -1407,6 +1422,7 @@ mod tests {
                     )
                 }
                 DecoKind::NoteEmbed(t) => format!("embed:{t}"),
+                DecoKind::Audio(t) => format!("audio:{t}"),
                 other => format!("{other:?}"),
             })
             .collect();
@@ -1417,7 +1433,8 @@ mod tests {
                 "callout:true:-",
                 "callout:true:Note",
                 "callout:false:-",
-                "embed:Other#h"
+                "embed:Other#h",
+                "audio:rec.wav"
             ]
         );
         assert_eq!(callout_kind("> [!TIP]+ x"), Some(("tip".into(), 7)));

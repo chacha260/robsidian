@@ -68,11 +68,15 @@ pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
                 let replacement = if let Some(img) = image {
                     format!("![{}](<{}>)", link.target, file_uri(vault, img))
                 } else {
-                    let label = match (&link.alias, &link.heading) {
+                    let mut label = match (&link.alias, &link.heading) {
                         (Some(a), _) if !a.is_empty() => a.clone(),
                         (_, Some(h)) => format!("{} › {h}", link.target),
                         _ => link.target.clone(),
                     };
+                    // 埋め込んだ音声は、クリックでその場で鳴らす
+                    if link.embed && crate::player::is_audio(&link.target) {
+                        label = format!("▶ {label}");
+                    }
                     let target = match &link.heading {
                         Some(h) => format!("{}#{h}", link.target),
                         None => link.target.clone(),
