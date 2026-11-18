@@ -2352,7 +2352,7 @@ impl App {
             if self.cfg.vim {
                 let label = match &self.vim.cmdline {
                     Some(line) => format!(":{line}"),
-                    None => format!("-- {} -- {}", self.vim.mode.label(), self.vim.pending()),
+                    None => format!("-- {} -- {}", self.vim.mode_label(), self.vim.pending()),
                 };
                 ui.label(RichText::new(label).monospace().strong());
             }
@@ -3033,6 +3033,11 @@ impl App {
         let mut scroll_to_cursor: Option<CCursor> = None;
         // ---- Vimキーバインド ----
         let vim_on = cfg.vim;
+        if vim_state.helix != cfg.helix {
+            // 流派を切り替えたら、途中のキーや選択を捨てる
+            *vim_state = Vim::default();
+            vim_state.helix = cfg.helix;
+        }
         if vim_on && ctx.memory(|m| m.has_focus(id)) {
             let normal = vim_state.mode != vim::Mode::Insert;
             let mut keys = Vec::new();
@@ -3059,9 +3064,21 @@ impl App {
             });
             if !keys.is_empty() {
                 let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
-                let primary = state.cursor.char_range().map_or(0, |r| r.primary.index.0);
-                let mut cursor = editor::byte_of_char(&tab.text, primary);
-                if vim_state.mode == vim::Mode::Normal {
+                let range = state.cursor.char_range().unwrap_or_default();
+                let (primary, secondary) = (
+                    editor::byte_of_char(&tab.text, range.primary.index.0),
+                    editor::byte_of_char(&tab.text, range.secondary.index.0),
+                );
+                // エンジンが置いた選択のままなら、エンジンの頭の位置を使う（選択の表示では、
+                // 主の端が頭の次の文字になっているため、そのまま読むと1文字ずつずれる）
+                let mut cursor = match vim_state.synced {
+                    Some((p, s, head)) if (p, s) == (primary, secondary) => {
+                        head.min(tab.text.len())
+                    }
+                    _ => primary,
+                };
+                // Vim のノーマルモードではカーソルを改行の上に置かない（Helix は行末の改行も選べる）
+                if vim_state.mode == vim::Mode::Normal && !vim_state.helix {
                     cursor = vim::clamp_normal(&tab.text, cursor);
                 }
                 let mut undoer = state.undoer();
@@ -3101,6 +3118,7 @@ impl App {
                                     &tab.text,
                                     editor::byte_of_char(&tab.text, range.primary.index.0),
                                 );
+                                vim_state.anchor = cursor;
                                 changed = true;
                             }
                         }
@@ -3119,6 +3137,11 @@ impl App {
                 };
                 state.cursor.set_char_range(Some(range));
                 state.store(&ctx, id);
+                vim_state.synced = Some((
+                    editor::byte_of_char(&tab.text, range.primary.index.0),
+                    editor::byte_of_char(&tab.text, range.secondary.index.0),
+                    cursor,
+                ));
                 scroll_to_cursor = Some(to_char(cursor));
                 tab.cursor = cursor;
                 if changed {
@@ -3738,7 +3761,30 @@ impl App {
                     editor::byte_of_char(&tab.text, p),
                     editor::byte_of_char(&tab.text, s),
                 );
-                if vim_state.mode == vim::Mode::Normal && p != s {
+                if vim_state.helix {
+                    // Helix風: エンジンが置いた選択から変わったとき（マウスで選んだ / クリックした）だけ取り込む
+                    let unchanged = vim_state.synced.filter(|&(p, s, _)| (p, s) == (pb, sb));
+                    if let Some((_, _, head)) = unchanged {
+                        // ブロックカーソルは選択の頭に描く
+                        tab.cursor = head;
+                    } else if vim_state.mode != vim::Mode::Insert {
+                        let (anchor, head) = if p == s {
+                            let c = vim::clamp_normal(&tab.text, pb);
+                            (c, c)
+                        } else if pb > sb {
+                            let head =
+                                pb - tab.text[..pb].chars().next_back().map_or(0, char::len_utf8);
+                            (sb, head)
+                        } else {
+                            let anchor =
+                                sb - tab.text[..sb].chars().next_back().map_or(0, char::len_utf8);
+                            (anchor, pb)
+                        };
+                        vim_state.anchor = anchor;
+                        tab.cursor = head;
+                        vim_state.synced = Some((pb, sb, head));
+                    }
+                } else if vim_state.mode == vim::Mode::Normal && p != s {
                     // マウスで範囲を選んだらビジュアルモードにする
                     vim_state.mode = vim::Mode::Visual;
                     vim_state.anchor = sb;

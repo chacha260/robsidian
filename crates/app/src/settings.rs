@@ -102,8 +102,21 @@ impl SettingsView {
                     }
 
                     section(ui, "エディタ");
-                    ui.checkbox(&mut cfg.vim, "Vimキーバインド（モーダル編集）")
-                    .on_hover_text("Escでノーマルモード、i / a などで挿入モード。ノーマルモード中はIMEを止めます");
+                    ui.horizontal(|ui| {
+                        ui.label("キー操作");
+                        let mut style = match (cfg.vim, cfg.helix) {
+                            (false, _) => 0,
+                            (true, false) => 1,
+                            (true, true) => 2,
+                        };
+                        ui.radio_value(&mut style, 0, "標準");
+                        ui.radio_value(&mut style, 1, "Vim")
+                            .on_hover_text("Escでノーマルモード、i / a などで挿入モード。ノーマルモード中はIMEを止めます");
+                        ui.radio_value(&mut style, 2, "Helix")
+                            .on_hover_text("w / x / % などで選んでから d / c / y で操作します。v で選択を広げるモード");
+                        cfg.vim = style > 0;
+                        cfg.helix = style == 2;
+                    });
                 ui.checkbox(&mut cfg.smart_lists, "Enterでリストを続け、Tabで字下げする");
                     ui.checkbox(&mut cfg.auto_pair, "括弧を自動で閉じ、選択範囲を記号で囲む");
                     ui.horizontal(|ui| {

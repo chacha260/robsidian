@@ -62,8 +62,10 @@ pub struct Config {
     /// ローカル履歴に残す件数（0で残さない）と日数
     pub history_versions: usize,
     pub history_days: u64,
-    /// Vimキーバインド（モーダル編集）
+    /// モーダル編集（Vim / Helix のキー操作）
     pub vim: bool,
+    /// モーダル編集を Helix風（選択してから操作する）にする
+    pub helix: bool,
     /// 分割したもう一方のペインのノート
     pub split: Option<String>,
     pub split_focus_right: bool,
@@ -95,6 +97,7 @@ impl Default for Config {
             history_versions: 50,
             history_days: 30,
             vim: false,
+            helix: false,
             split: None,
             split_focus_right: false,
             trusted_commands: Default::default(),
