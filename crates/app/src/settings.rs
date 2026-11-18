@@ -66,6 +66,10 @@ impl SettingsView {
                                 );
                             });
                             ui.end_row();
+                            ui.label("スクロール");
+                            ui.checkbox(&mut cfg.smooth_scroll, "マウスホイールでなめらかにスクロールする")
+                                .on_hover_text("オンにすると、ホイールを回してから少し遅れて、なめらかに動きます");
+                            ui.end_row();
                             ui.label("表示モード");
                             ui.horizontal(|ui| {
                                 for mode in ViewMode::ALL {

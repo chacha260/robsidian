@@ -11,6 +11,7 @@ pub mod related;
 pub mod search;
 pub mod task;
 pub mod template;
+pub mod text;
 pub mod theme;
 pub mod usercmd;
 pub mod vault;

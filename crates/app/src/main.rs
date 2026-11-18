@@ -19,6 +19,7 @@ mod props_ui;
 mod settings;
 mod theme;
 mod vim;
+mod wheel;
 mod workspace;
 
 use eframe::egui;
