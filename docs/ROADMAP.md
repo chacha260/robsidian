@@ -211,7 +211,8 @@ Robsidianの現状: 拡張の仕組みはなし。エコシステムの量で追
   ファイル一覧は眺めるときに邪魔なので、Ctrlを押しているときだけ。
 - 本文はfrontmatterを除いた冒頭40行まで。コードブロックの途中で切れたら閉じる。描画は本文のプレビューと同じ `preview::to_preview` + `CommonMarkViewer`
   （キャッシュは本文のプレビューと分けている）。
-- プレビュー表示（`egui_commonmark` が描くリンク）へのホバーは未対応。
+- プレビュー表示（`egui_commonmark` が描くリンク）へのホバー（D4 の後に追加）: egui_commonmark にはホバーを知らせる口が無いので、
+  `egui_commonmark_backend` を `vendor/` に取り込み、マウスが乗っているリンクの宛先を `CommonMarkCache::take_hovered_link` で返すようにした（`[patch.crates-io]`。変更は数行、`vendor/README.md`）。
 
 以下は着手前の設計メモ。
 

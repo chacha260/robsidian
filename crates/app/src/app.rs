@@ -4927,6 +4927,7 @@ impl App {
             active,
             cfg,
             mermaid,
+            hover_cache,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -4966,6 +4967,30 @@ impl App {
                 });
                 ui.add_space(12.0);
             });
+        // ページプレビュー: マウスが乗っているノートへのリンクの中身を見せる
+        let hovered = md_cache.take_hovered_link();
+        if let Some(target) = hovered
+            .as_deref()
+            .and_then(preview::decode_link)
+            .filter(|_| cfg.features.page_preview)
+        {
+            let (note, heading) = hover::split_target(&target);
+            let path = if note.is_empty() {
+                Some(tab.path.clone())
+            } else {
+                vault.resolve(note, &tab.path).map(str::to_string)
+            };
+            if let (Some(path), Some(pointer)) = (path, ui.ctx().pointer_hover_pos()) {
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
+                    ui.layer_id(),
+                    egui::Id::unique(("preview-hover", &tab.path)),
+                    pointer,
+                )
+                .width(hover::WIDTH)
+                .show(|ui| hover::note_preview(ui, vault, hover_cache, &path, heading));
+            }
+        }
         if rendered != *src {
             match preview::toggle_from_preview(&tab.text, src, &rendered) {
                 Some(text) => {
