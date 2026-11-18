@@ -289,6 +289,8 @@ mod tests {
         sh(dir.path(), &["config", "user.name", "t"]);
         sh(dir.path(), &["config", "user.email", "t@example.com"]);
         sh(dir.path(), &["config", "commit.gpgsign", "false"]);
+        // Windows の git は改行を CRLF に変えるので、テストでは変換しない
+        sh(dir.path(), &["config", "core.autocrlf", "false"]);
         dir
     }
 
@@ -306,12 +308,21 @@ mod tests {
         let clone = |name: &str| {
             sh(
                 base.path(),
-                &["clone", "-q", remote.to_str().unwrap(), name],
+                &[
+                    "clone",
+                    "-q",
+                    "-c",
+                    "core.autocrlf=false",
+                    remote.to_str().unwrap(),
+                    name,
+                ],
             );
             let d = base.path().join(name);
             sh(&d, &["config", "user.name", "t"]);
             sh(&d, &["config", "user.email", "t@example.com"]);
             sh(&d, &["config", "commit.gpgsign", "false"]);
+            // Windows の git は改行を CRLF に変えるので、テストでは変換しない
+            sh(&d, &["config", "core.autocrlf", "false"]);
             sh(&d, &["checkout", "-q", "-B", "main"]);
             d
         };
