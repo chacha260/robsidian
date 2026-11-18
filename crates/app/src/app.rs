@@ -73,6 +73,8 @@ enum Command {
     GitCommit,
     GitPull,
     GitPush,
+    RandomNote,
+    UniqueNote,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -119,6 +121,8 @@ impl Command {
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
+            Command::RandomNote => "random note open shuffle",
+            Command::UniqueNote => "unique note zettelkasten timestamp new create",
             Command::GitCommit => "git commit snapshot save version",
             Command::GitPull => "git pull fetch sync download remote",
             Command::GitPush => "git push sync upload remote",
@@ -218,6 +222,12 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
+    (Command::RandomNote, "ランダムなノートを開く", None),
+    (
+        Command::UniqueNote,
+        "ユニークノートを作成（日時の名前）",
+        None,
+    ),
     (Command::GitCommit, "gitにスナップショットをコミット", None),
     (
         Command::GitPull,
@@ -251,6 +261,8 @@ enum Action {
     ToggleBookmark(String),
     /// ユーザーコマンドを実行する（`UserCommands::list` の番号）
     RunUser(usize),
+    /// スラッシュコマンド: (ノート, 入力した `/` のバイト位置)
+    Slash(String, usize),
 }
 
 enum Dialog {
@@ -302,6 +314,8 @@ struct Tab {
     layout_stale: bool,
     preview: Option<(u64, u64, String)>,
     outline: Option<(u64, Vec<Heading>)>,
+    /// 文字数・単語数（本文の版ごとに数え直す）
+    counts: std::cell::Cell<Option<(u64, robsidian_core::text::Counts)>>,
 }
 
 impl Tab {
@@ -324,12 +338,24 @@ impl Tab {
             layout_stale: false,
             preview: None,
             outline: None,
+            counts: std::cell::Cell::new(None),
         }
     }
 
     fn title(&self) -> &str {
         let name = file_name(&self.path);
         name.strip_suffix(".md").unwrap_or(name)
+    }
+
+    fn counts(&self) -> robsidian_core::text::Counts {
+        match self.counts.get() {
+            Some((v, c)) if v == self.version => c,
+            _ => {
+                let c = robsidian_core::text::count(&self.text);
+                self.counts.set(Some((self.version, c)));
+                c
+            }
+        }
     }
 
     fn set_text(&mut self, text: String) {
@@ -372,6 +398,8 @@ struct Palette {
     computed_for: Option<String>,
     items: Vec<PaletteItem>,
     selected: usize,
+    /// スラッシュコマンドで開いた: (ノート, 入力した `/` のバイト位置)。コマンドを選んだら `/` を消す
+    slash: Option<(String, usize)>,
 }
 
 /// ノート内の検索バー。
@@ -1105,6 +1133,7 @@ impl App {
                     computed_for: None,
                     items: Vec::new(),
                     selected: 0,
+                    slash: None,
                 });
             }
             Command::SearchAll => {
@@ -1263,6 +1292,7 @@ impl App {
                     computed_for: None,
                     items: Vec::new(),
                     selected: 0,
+                    slash: None,
                 });
             }
             Command::OpenVault => self.file_dialog.pick_directory(),
@@ -1279,6 +1309,47 @@ impl App {
                 for tab in &mut self.tabs {
                     tab.preview = None;
                 }
+            }
+            Command::RandomNote => {
+                let Some(vault) = &self.vault else { return };
+                let paths: Vec<&str> = vault
+                    .notes()
+                    .map(|n| n.path.as_str())
+                    .filter(|p| Some(*p) != current.as_deref())
+                    .collect();
+                if paths.is_empty() {
+                    self.toast("ほかのノートがありません");
+                    return;
+                }
+                // 乱数の代わりに時刻のナノ秒を使う（毎回違うノートが出れば十分）
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.subsec_nanos() as usize ^ d.as_secs() as usize);
+                let path = paths[nanos % paths.len()].to_string();
+                self.open_note(&path, None);
+            }
+            Command::UniqueNote => {
+                // Obsidian と同じく「年月日時分」の名前で作る。同じ名前があれば秒を足す
+                let Some(vault) = &self.vault else { return };
+                let dir = current.as_deref().map(parent_dir).unwrap_or("").to_string();
+                let now = chrono::Local::now();
+                let join = |name: String| {
+                    if dir.is_empty() {
+                        name
+                    } else {
+                        format!("{dir}/{name}")
+                    }
+                };
+                let mut name = join(now.format("%Y%m%d%H%M").to_string());
+                if vault.note(&format!("{name}.md")).is_some() {
+                    name = join(now.format("%Y%m%d%H%M%S").to_string());
+                    let mut n = 2;
+                    while vault.note(&format!("{name}.md")).is_some() {
+                        name = join(format!("{}-{n}", now.format("%Y%m%d%H%M%S")));
+                        n += 1;
+                    }
+                }
+                self.create_and_open(&name);
             }
             Command::GitCommit | Command::GitPull | Command::GitPush => {
                 let root = self.vault.as_ref().map(|v| v.root().to_path_buf());
@@ -2259,6 +2330,16 @@ impl App {
             Action::LinkMentions(mentions, target) => self.link_mentions(&mentions, &target),
             Action::ToggleBookmark(path) => self.toggle_bookmark(&path),
             Action::RunUser(i) => self.run_user(i, ctx),
+            Action::Slash(path, pos) => {
+                self.palette = Some(Palette {
+                    mode: PaletteMode::Commands,
+                    query: String::new(),
+                    computed_for: None,
+                    items: Vec::new(),
+                    selected: 0,
+                    slash: Some((path, pos)),
+                });
+            }
         }
     }
 
@@ -2405,7 +2486,14 @@ impl App {
                     } else {
                         "保存済み"
                     });
-                    ui.weak(format!("{}文字", tab.text.chars().count()));
+                    let counts = tab.counts();
+                    ui.weak(format!("{}文字 ・ {}語", counts.chars, counts.words))
+                        .on_hover_text("文字数は空白を除く。単語数は、欧文は語、日本語などは1文字を1語と数える");
+                    let sel = selection_bytes(ui.ctx(), tab);
+                    if !sel.is_empty() {
+                        let c = robsidian_core::text::count(&tab.text[sel]);
+                        ui.weak(format!("選択 {}文字 ・ {}語", c.chars, c.words));
+                    }
                     if let Some(vault) = &self.vault {
                         ui.weak(format!("被リンク {}", vault.backlinks(&tab.path).len()));
                     }
@@ -2795,6 +2883,80 @@ impl App {
                 });
             if header.body_returned.is_none() {
                 *related_cache = None;
+            }
+
+            // 発リンク（このノートから出ているリンク。存在しないリンク先は薄く表示し、クリックで作る）
+            ui.add_space(6.0);
+            let outgoing = vault.outgoing(&tab.path);
+            let mut seen = std::collections::HashSet::new();
+            let targets: Vec<(String, Option<&str>)> = outgoing
+                .iter()
+                .filter(|(l, _)| !l.target.is_empty())
+                .filter_map(|(l, dst)| {
+                    let key = dst.map_or_else(|| l.target.to_lowercase(), str::to_string);
+                    seen.insert(key).then(|| (l.target.clone(), *dst))
+                })
+                .collect();
+            egui::CollapsingHeader::new(RichText::new(format!("発リンク ({})", targets.len())).strong())
+                .id_salt("outgoing-links")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if targets.is_empty() {
+                        ui.weak("このノートからのリンクはありません");
+                    }
+                    for (target, dst) in &targets {
+                        match dst {
+                            Some(path) => {
+                                let title = file_name(path).trim_end_matches(".md");
+                                let row = ui
+                                    .selectable_label(false, title)
+                                    .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, path, None));
+                                if row.clicked() {
+                                    actions.push(Action::Open(path.to_string(), None));
+                                }
+                            }
+                            None => {
+                                let label = RichText::new(format!("{target}（未作成）")).weak();
+                                if ui
+                                    .selectable_label(false, label)
+                                    .on_hover_text("クリックでノートを作ります")
+                                    .clicked()
+                                {
+                                    actions.push(Action::FollowLink {
+                                        target: target.clone(),
+                                        from: tab.path.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+
+            // 脚注（あるときだけ）。定義の行へ移動する
+            let notes = robsidian_core::text::footnotes(&tab.text);
+            if !notes.is_empty() {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(RichText::new(format!("脚注 ({})", notes.len())).strong())
+                    .id_salt("footnotes")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for note in &notes {
+                            let text = if note.text.is_empty() {
+                                "（定義がありません）".to_string()
+                            } else {
+                                note.text.clone()
+                            };
+                            let label = format!("[^{}] {text}", note.id);
+                            let row = ui.selectable_label(false, label).on_hover_text(format!(
+                                "本文から{}か所で参照",
+                                note.refs.len()
+                            ));
+                            if row.clicked() {
+                                let line = note.line.or_else(|| note.refs.first().copied());
+                                actions.push(Action::Open(tab.path.clone(), line));
+                            }
+                        }
+                    });
             }
 
             ui.add_space(10.0);
@@ -3846,6 +4008,23 @@ impl App {
             tab.dirty = true;
             tab.edited_at = Some(Instant::now());
             tab.version += 1;
+            // 行頭か空白の直後に `/` を入力したら、コマンドパレットを開く（スラッシュコマンド）
+            let typed_slash = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
+            });
+            if typed_slash && !(vim_on && vim_state.mode != vim::Mode::Insert) {
+                if let Some(c) = output.cursor_range.map(|r| r.primary.index.0) {
+                    let at = editor::byte_of_char(&tab.text, c);
+                    if at > 0 && tab.text[..at].ends_with('/') {
+                        let before = tab.text[..at - 1].chars().next_back();
+                        if before.is_none_or(char::is_whitespace) {
+                            actions.push(Action::Slash(tab.path.clone(), at - 1));
+                        }
+                    }
+                }
+            }
         }
         let cursor_char = output.cursor_range.map(|r| r.primary.index.0);
         if let Some(c) = cursor_char {
@@ -4316,11 +4495,33 @@ impl App {
                     });
                 }
                 PaletteItem::Create(name) => self.create_and_open(name),
-                PaletteItem::Cmd(ci) => actions.push(Action::Run(COMMANDS[*ci].0)),
-                PaletteItem::User(i) => actions.push(Action::RunUser(*i)),
+                PaletteItem::Cmd(ci) => {
+                    self.remove_slash(p.slash.as_ref());
+                    actions.push(Action::Run(COMMANDS[*ci].0));
+                }
+                PaletteItem::User(i) => {
+                    self.remove_slash(p.slash.as_ref());
+                    actions.push(Action::RunUser(*i));
+                }
             }
         } else if close {
             self.palette = None;
+        }
+    }
+
+    /// スラッシュコマンドで入力した `/` を消す（コマンドを選んだとき）。
+    fn remove_slash(&mut self, slash: Option<&(String, usize)>) {
+        let Some((path, pos)) = slash else { return };
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == *path) {
+            if tab.text.get(*pos..pos + 1) == Some("/") {
+                let mut text = tab.text.clone();
+                text.replace_range(*pos..pos + 1, "");
+                tab.set_text(text);
+                tab.place_cursor = Some(*pos);
+                tab.focus = true;
+                tab.dirty = true;
+                tab.edited_at = Some(Instant::now());
+            }
         }
     }
 
