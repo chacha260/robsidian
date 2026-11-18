@@ -10,6 +10,19 @@ const MAX_RECENT: usize = 30;
 pub struct Workspace {
     pub bookmarks: Vec<String>,
     pub recent: Vec<String>,
+    /// 名前を付けて保存した配置（Obsidian のワークスペース）
+    pub layouts: std::collections::BTreeMap<String, Layout>,
+}
+
+/// タブと分割の配置
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layout {
+    pub tabs: Vec<String>,
+    pub active: usize,
+    /// 分割したもう一方のペインのノート
+    pub split: Option<String>,
+    pub focus_right: bool,
 }
 
 fn file(root: &Path) -> PathBuf {
@@ -57,7 +70,16 @@ impl Workspace {
 
     /// ノート（またはフォルダ）の移動に合わせてパスを書き換える。
     pub fn renamed(&mut self, old: &str, new: &str) {
-        for path in self.bookmarks.iter_mut().chain(self.recent.iter_mut()) {
+        let in_layouts = self
+            .layouts
+            .values_mut()
+            .flat_map(|l| l.tabs.iter_mut().chain(l.split.iter_mut()));
+        for path in self
+            .bookmarks
+            .iter_mut()
+            .chain(self.recent.iter_mut())
+            .chain(in_layouts)
+        {
             if let Some(moved) = moved_path(path, old, new) {
                 *path = moved;
             }
