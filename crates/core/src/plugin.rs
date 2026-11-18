@@ -68,11 +68,24 @@ pub struct PanelDef {
     pub title: String,
 }
 
+/// 起動のしかた
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// 呼ぶたびに起動する（段階1）
+    #[default]
+    Once,
+    /// 起動したままにして、JSON-RPC で話す（段階2）
+    Server,
+}
+
 /// `plugin.toml` の中身
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub name: String,
+    #[serde(default)]
+    pub mode: Mode,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -386,6 +399,362 @@ pub fn execute(plugin: &Plugin, req: &Request) -> Result<Response> {
         .with_context(|| format!("プラグイン「{}」", plugin.manifest.name))
 }
 
+// ---------------------------------------------------------------- 常駐するプラグイン（段階2）
+
+/// プラグインから Robsidian への問い合わせ・通知
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostCall {
+    /// 問い合わせなら返事に使う id、通知なら None
+    pub id: Option<serde_json::Value>,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+type Pending = std::collections::HashMap<u64, std::sync::mpsc::Sender<Result<Response>>>;
+
+/// 起動したままのプラグイン。行区切りの JSON-RPC 2.0 で話す。
+/// 落とすと止める
+pub struct Server {
+    child: std::process::Child,
+    stdin: std::sync::Arc<std::sync::Mutex<std::process::ChildStdin>>,
+    pending: std::sync::Arc<std::sync::Mutex<Pending>>,
+    next_id: std::sync::atomic::AtomicU64,
+    calls: std::sync::mpsc::Receiver<HostCall>,
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Server {
+    /// 起動して `initialize` を送る
+    pub fn start(plugin: &Plugin, vault: &Path) -> Result<Self> {
+        use std::io::BufRead;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{mpsc, Arc, Mutex};
+        let mut c = crate::usercmd::shell(&plugin.manifest.run);
+        c.current_dir(&plugin.dir)
+            .env("ROB_VAULT", vault)
+            .env("ROB_PLUGIN_DIR", &plugin.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c
+            .spawn()
+            .with_context(|| format!("プラグイン「{}」を起動できません", plugin.manifest.name))?;
+        let stdin = Arc::new(Mutex::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("標準入力がありません"))?,
+        ));
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("標準出力がありません"))?;
+        let stderr = child.stderr.take();
+        let pending: Arc<Mutex<Pending>> = Arc::default();
+        let dead = Arc::new(AtomicBool::new(false));
+        let tail = Arc::new(Mutex::new(String::new()));
+        // 標準エラーは最後の数行だけ覚えておく（落ちたときに見せる）
+        if let Some(err) = stderr {
+            let tail = tail.clone();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                    if let Ok(mut t) = tail.lock() {
+                        if !line.trim().is_empty() {
+                            *t = line;
+                        }
+                    }
+                }
+            });
+        }
+        let (tx, calls) = mpsc::channel();
+        {
+            let (pending, dead, name) =
+                (pending.clone(), dead.clone(), plugin.manifest.name.clone());
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        let _ = tx.send(HostCall {
+                            id: msg.get("id").cloned(),
+                            method: method.to_string(),
+                            params: msg
+                                .get("params")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        });
+                        continue;
+                    }
+                    let Some(id) = msg.get("id").and_then(|i| i.as_u64()) else {
+                        continue;
+                    };
+                    let Some(reply) = pending.lock().ok().and_then(|mut p| p.remove(&id)) else {
+                        continue;
+                    };
+                    let result = match (msg.get("result"), msg.get("error")) {
+                        (_, Some(e)) => Err(anyhow!(
+                            "プラグイン「{name}」: {}",
+                            e.get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("失敗しました")
+                        )),
+                        (Some(r), None) => serde_json::from_value::<Response>(r.clone())
+                            .with_context(|| {
+                                format!("プラグイン「{name}」の返事の形が正しくありません")
+                            }),
+                        (None, None) => Ok(Response::default()),
+                    };
+                    let _ = reply.send(result);
+                }
+                // 終わった（落ちた）: 待っている依頼はすべて失敗にする
+                dead.store(true, Ordering::Relaxed);
+                let why = tail.lock().map(|t| t.clone()).unwrap_or_default();
+                if let Ok(mut p) = pending.lock() {
+                    for (_, reply) in p.drain() {
+                        let _ =
+                            reply.send(Err(anyhow!("プラグイン「{name}」が終了しました。{why}")));
+                    }
+                }
+            });
+        }
+        let server = Self {
+            child,
+            stdin,
+            pending,
+            next_id: AtomicU64::new(1),
+            calls,
+            dead,
+        };
+        server.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "api": API,
+                "vault": vault.display().to_string(),
+                "plugin_dir": plugin.dir.display().to_string(),
+            }
+        }))?;
+        Ok(server)
+    }
+
+    fn send(&self, msg: &serde_json::Value) -> Result<()> {
+        let mut line = serde_json::to_string(msg)?;
+        line.push('\n');
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| anyhow!("プラグインに書けません"))?;
+        stdin.write_all(line.as_bytes())?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    /// 依頼を送る。返事は戻り値の受け口に届く
+    pub fn request(&self, req: &Request) -> std::sync::mpsc::Receiver<Result<Response>> {
+        use std::sync::atomic::Ordering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut p) = self.pending.lock() {
+            p.insert(id, tx.clone());
+        }
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "plugin/request",
+            "params": req,
+        });
+        if let Err(e) = self.send(&msg) {
+            if let Ok(mut p) = self.pending.lock() {
+                p.remove(&id);
+            }
+            let _ = tx.send(Err(e));
+        }
+        rx
+    }
+
+    /// プラグインからの問い合わせ・通知（届いた分）
+    pub fn calls(&self) -> Vec<HostCall> {
+        self.calls.try_iter().collect()
+    }
+
+    /// 問い合わせに返事をする
+    pub fn reply(&self, id: serde_json::Value, result: Result<serde_json::Value>) {
+        let msg = match result {
+            Ok(r) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": r}),
+            Err(e) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32000, "message": format!("{e:#}")},
+            }),
+        };
+        let _ = self.send(&msg);
+    }
+
+    pub fn alive(&self) -> bool {
+        !self.dead.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.send(&serde_json::json!({"jsonrpc": "2.0", "method": "shutdown"}));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 常駐するプラグインに依頼して、返事が来るまで待つ（CLI とテスト用）。
+/// 待つあいだに来た問い合わせには `host_call` で答え、`ui/notice` の通知は返事の actions に足す
+pub fn request_blocking(
+    server: &Server,
+    req: &Request,
+    vault: &mut crate::Vault,
+) -> Result<Response> {
+    let rx = server.request(req);
+    let started = Instant::now();
+    let mut notices = Vec::new();
+    let handle = |vault: &mut crate::Vault, notices: &mut Vec<Action>| {
+        for call in server.calls() {
+            match call.id {
+                Some(id) => {
+                    let r = host_call(vault, &call.method, &call.params);
+                    server.reply(id, r);
+                }
+                None if call.method == "ui/notice" => {
+                    if let Some(t) = call.params.get("text").and_then(|t| t.as_str()) {
+                        notices.push(Action::Notice {
+                            text: t.to_string(),
+                        });
+                    }
+                }
+                None => {}
+            }
+        }
+    };
+    loop {
+        handle(vault, &mut notices);
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(r) => {
+                // 返事より前に送られた通知を拾う（読み取りのスレッドは届いた順に渡すので、
+                // 返事を受け取った時点で、それより前の通知はもう届いている）
+                handle(vault, &mut notices);
+                let mut r = r?;
+                notices.append(&mut r.actions);
+                r.actions = notices;
+                return Ok(r);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() > TIMEOUT => {
+                bail!("プラグインが{}秒で返事をしませんでした", TIMEOUT.as_secs())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("プラグインが終了しました")
+            }
+        }
+    }
+}
+
+/// プラグインからの問い合わせに答える（GUI と CLI で共有する）。
+///
+/// - `vault/read` `{path}` → `{path, text}`（名前だけでも、リンクと同じ規則で探す）
+/// - `vault/list` `{folder?}` → `[path]`（ノートだけ）
+/// - `vault/search` `{query, limit?}` → 検索条件（`rob query` と同じ）でノートかタスク
+/// - `vault/backlinks` `{path}` → `[{source, line}]`
+/// - `vault/write` `{path, text}` → `{}`（`Vault::write_note` を通す）
+pub fn host_call(
+    vault: &mut crate::Vault,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let text_param = |key: &str| -> Result<String> {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{method}: {key} がありません"))
+    };
+    let note_path = |vault: &crate::Vault, p: &str| -> Option<String> {
+        vault
+            .note(p)
+            .map(|n| n.path.clone())
+            .or_else(|| vault.resolve(p, "").map(str::to_string))
+    };
+    Ok(match method {
+        "vault/read" => {
+            let p = text_param("path")?;
+            let path =
+                note_path(vault, &p).ok_or_else(|| anyhow!("ノートが見つかりません: {p}"))?;
+            let text = vault
+                .note(&path)
+                .map(|n| n.text.clone())
+                .unwrap_or_default();
+            json!({"path": path, "text": text})
+        }
+        "vault/list" => {
+            let folder = params.get("folder").and_then(|v| v.as_str()).unwrap_or("");
+            let prefix = if folder.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", folder.trim_matches('/'))
+            };
+            let mut paths: Vec<&str> = vault
+                .notes()
+                .map(|n| n.path.as_str())
+                .filter(|p| p.starts_with(&prefix))
+                .collect();
+            paths.sort_unstable();
+            json!(paths)
+        }
+        "vault/search" => {
+            let q = text_param("query")?;
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let today = chrono::Local::now().date_naive();
+            match crate::search::run_query(vault, &q, today) {
+                crate::search::QueryResult::Notes(hits) => json!({
+                    "notes": hits.iter().take(limit).map(|h| json!({"path": h.path})).collect::<Vec<_>>()
+                }),
+                crate::search::QueryResult::Tasks(hits) => json!({
+                    "tasks": hits.iter().take(limit).map(|h| json!({
+                        "path": h.path,
+                        "line": h.task.line + 1,
+                        "status": h.task.status.to_string(),
+                        "text": h.task.text,
+                        "due": h.task.due.map(|d| d.to_string()),
+                    })).collect::<Vec<_>>()
+                }),
+            }
+        }
+        "vault/backlinks" => {
+            let p = text_param("path")?;
+            let path =
+                note_path(vault, &p).ok_or_else(|| anyhow!("ノートが見つかりません: {p}"))?;
+            json!(vault
+                .backlinks(&path)
+                .iter()
+                .map(|b| json!({"source": &*b.source, "line": b.line + 1}))
+                .collect::<Vec<_>>())
+        }
+        "vault/write" => {
+            let p = text_param("path")?;
+            let text = text_param("text")?;
+            let path = if p.ends_with(".md") {
+                p
+            } else {
+                format!("{p}.md")
+            };
+            vault.write_note(&path, &text)?;
+            json!({"path": path})
+        }
+        other => bail!("未対応の問い合わせです: {other}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +878,89 @@ title = "要約"
         };
         let e = execute(&failing, &req).unwrap_err();
         assert!(format!("{e:#}").contains("oops"), "{e:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_plugins_can_ask_the_vault() {
+        // python3 が無い環境では確かめない
+        if std::process::Command::new("python3")
+            .arg("-c")
+            .arg("1")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A\n[[b]]").unwrap();
+        fs::write(dir.path().join("b.md"), "# B").unwrap();
+        let pdir = dir.path().join(".robsidian/plugins/srv");
+        fs::create_dir_all(&pdir).unwrap();
+        // 依頼が来たら、vault/backlinks で問い合わせてから返事をする。呼ばれた回数を覚えている（常駐の確かめ）
+        fs::write(
+            pdir.join("main.py"),
+            r#"
+import json, sys
+count = 0
+def send(m):
+    sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
+def recv():
+    return json.loads(sys.stdin.readline())
+while True:
+    m = recv()
+    if m.get("method") == "plugin/request":
+        count += 1
+        path = m["params"]["note"]["path"]
+        send({"jsonrpc": "2.0", "id": "q", "method": "vault/backlinks", "params": {"path": path}})
+        links = recv()["result"]
+        send({"jsonrpc": "2.0", "method": "ui/notice", "params": {"text": "呼ばれました"}})
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"markdown": f"{count}:{len(links)}"}})
+    elif m.get("method") == "shutdown":
+        break
+"#,
+        )
+        .unwrap();
+        fs::write(
+            pdir.join("plugin.toml"),
+            "name = \"常駐\"\nmode = \"server\"\nrun = \"python3 main.py\"\n[[panel]]\nid = \"p\"\ntitle = \"p\"\n",
+        )
+        .unwrap();
+        let mut vault = crate::Vault::open(dir.path()).unwrap();
+        let (plugins, bad) = discover(dir.path());
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(plugins[0].manifest.mode, Mode::Server);
+        let server = Server::start(&plugins[0], dir.path()).unwrap();
+        let mut req = Request::new(Kind::Panel, "p", dir.path());
+        req.note = Some(NoteInfo {
+            path: "b.md".into(),
+            ..NoteInfo::default()
+        });
+        let r = request_blocking(&server, &req, &mut vault).unwrap();
+        assert_eq!(r.markdown.as_deref(), Some("1:1"));
+        assert_eq!(
+            r.actions,
+            [Action::Notice {
+                text: "呼ばれました".into()
+            }]
+        );
+        // 2回目は同じプロセスが答える
+        let r = request_blocking(&server, &req, &mut vault).unwrap();
+        assert_eq!(r.markdown.as_deref(), Some("2:1"));
+        assert!(server.alive());
+
+        // 問い合わせ
+        let read = host_call(&mut vault, "vault/read", &serde_json::json!({"path": "a"})).unwrap();
+        assert_eq!(read["text"], "# A\n[[b]]");
+        let list = host_call(&mut vault, "vault/list", &serde_json::json!({})).unwrap();
+        assert_eq!(list, serde_json::json!(["a.md", "b.md"]));
+        host_call(
+            &mut vault,
+            "vault/write",
+            &serde_json::json!({"path": "c", "text": "x"}),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("c.md")).unwrap(), "x");
+        assert!(host_call(&mut vault, "vault/explode", &serde_json::json!({})).is_err());
     }
 }

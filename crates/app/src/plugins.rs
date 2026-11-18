@@ -56,6 +56,8 @@ pub struct Job {
     pub name: String,
     pub origin: Origin,
     rx: mpsc::Receiver<anyhow::Result<Response>>,
+    /// 常駐するプラグインは返事が来ないこともあるので、頼んだ時刻を覚えて打ち切る
+    started: Instant,
 }
 
 #[derive(Default)]
@@ -72,6 +74,8 @@ pub struct Plugins {
     blocks: HashMap<u64, Output>,
     /// パネルの中身（(プラグイン, パネル) → 中身）
     pub panels: HashMap<(String, String), Panel>,
+    /// 起動したままのプラグイン（段階2。id → プロセス）
+    servers: HashMap<String, plugin::Server>,
 }
 
 /// 許可を覚えておくキー（vault とプラグインごと）
@@ -145,9 +149,10 @@ impl Plugins {
             .collect();
         self.list = list;
         self.broken = broken;
-        // 定義が変わったので、結果は作り直す
+        // 定義が変わったので、結果は作り直す（起動したままのプラグインも止めて、次に使うときに起動し直す）
         self.blocks.clear();
         self.panels.clear();
+        self.servers.clear();
         true
     }
 
@@ -157,18 +162,81 @@ impl Plugins {
 
     /// プラグインを別スレッドで呼ぶ
     pub fn spawn(&mut self, plugin: &Plugin, req: Request, origin: Origin, ctx: &egui::Context) {
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        let p = plugin.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(plugin::execute(&p, &req));
-            ctx.request_repaint();
-        });
+        let rx = match plugin.manifest.mode {
+            plugin::Mode::Once => {
+                let (tx, rx) = mpsc::channel();
+                let ctx = ctx.clone();
+                let p = plugin.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(plugin::execute(&p, &req));
+                    ctx.request_repaint();
+                });
+                rx
+            }
+            // 常駐するプラグイン: 起動していなければ起動し、依頼を送る（返事は poll で受け取る）
+            plugin::Mode::Server => match self.server(plugin, Path::new(&req.vault)) {
+                Ok(server) => server.request(&req),
+                Err(e) => {
+                    let (tx, rx) = mpsc::channel();
+                    let _ = tx.send(Err(e));
+                    rx
+                }
+            },
+        };
         self.jobs.push(Job {
             name: plugin.manifest.name.clone(),
             origin,
             rx,
+            started: Instant::now(),
         });
+    }
+
+    /// 起動したままのプラグイン（落ちていたら起動し直す）
+    fn server(&mut self, plugin: &Plugin, vault: &Path) -> anyhow::Result<&plugin::Server> {
+        if self.servers.get(&plugin.id).is_some_and(|s| !s.alive()) {
+            self.servers.remove(&plugin.id);
+        }
+        if !self.servers.contains_key(&plugin.id) {
+            let server = plugin::Server::start(plugin, vault)?;
+            self.servers.insert(plugin.id.clone(), server);
+        }
+        Ok(&self.servers[&plugin.id])
+    }
+
+    /// 起動したままのプラグインを止める（オフにした・許可を取り消したとき）
+    pub fn stop(&mut self, id: &str) {
+        self.servers.remove(id);
+    }
+
+    /// 起動しているプラグインの id
+    pub fn server_ids(&self) -> Vec<String> {
+        self.servers.keys().cloned().collect()
+    }
+
+    /// 起動したままのプラグインからの問い合わせ・通知（プラグインの id ごと）
+    pub fn host_calls(&mut self) -> Vec<(String, plugin::HostCall)> {
+        self.servers
+            .iter()
+            .flat_map(|(id, s)| s.calls().into_iter().map(move |c| (id.clone(), c)))
+            .collect()
+    }
+
+    /// 問い合わせに返事をする
+    pub fn reply(
+        &self,
+        plugin: &str,
+        id: serde_json::Value,
+        result: anyhow::Result<serde_json::Value>,
+    ) {
+        if let Some(s) = self.servers.get(plugin) {
+            s.reply(id, result);
+        }
+    }
+
+    /// プラグインがパネルの作り直しを頼んだ（`panel/refresh`。id が無ければそのプラグインのパネルすべて）
+    pub fn invalidate_panels(&mut self, plugin: &str, panel: Option<&str>) {
+        self.panels
+            .retain(|(p, id), _| p != plugin || panel.is_some_and(|x| x != id));
     }
 
     /// 終わった実行を取り出す。コードブロックとパネルの結果はここで覚える
@@ -178,6 +246,15 @@ impl Plugins {
         while i < self.jobs.len() {
             let r = match self.jobs[i].rx.try_recv() {
                 Ok(r) => r,
+                Err(mpsc::TryRecvError::Empty)
+                    if self.jobs[i].started.elapsed() > plugin::TIMEOUT =>
+                {
+                    Err(anyhow::anyhow!(
+                        "プラグイン「{}」が{}秒で返事をしませんでした",
+                        self.jobs[i].name,
+                        plugin::TIMEOUT.as_secs()
+                    ))
+                }
                 Err(mpsc::TryRecvError::Empty) => {
                     i += 1;
                     continue;

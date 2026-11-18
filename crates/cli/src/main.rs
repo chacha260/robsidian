@@ -668,7 +668,14 @@ fn run(cli: Cli) -> Result<()> {
                     if kind == plugin::Kind::Codeblock {
                         req.code = text;
                     }
-                    let res = plugin::execute(p, &req)?;
+                    let res = match p.manifest.mode {
+                        plugin::Mode::Once => plugin::execute(p, &req)?,
+                        // 常駐するプラグイン: 起動して1回だけ頼む（待つあいだの問い合わせにも答える）
+                        plugin::Mode::Server => {
+                            let server = plugin::Server::start(p, vault.root())?;
+                            plugin::request_blocking(&server, &req, &mut vault)?
+                        }
+                    };
                     out.value(&serde_json::to_value(&res)?)?;
                 }
             }
