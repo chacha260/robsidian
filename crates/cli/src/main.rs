@@ -5,6 +5,7 @@
 
 mod export;
 mod lint;
+mod mcp;
 mod serve;
 
 use anyhow::{bail, Context, Result};
@@ -127,6 +128,8 @@ enum Cmd {
     TagRename { old: String, new: String },
     /// 標準入出力で、1行1リクエストのJSONに答え続ける（エディタ連携用）
     Serve,
+    /// MCPサーバーとして動く（AIアシスタントから vault を検索・読み書きできるようにする）
+    Mcp,
     /// ユーザーコマンド（.robsidian/commands.toml）を実行する。名前を省くと一覧
     Run {
         name: Option<String>,
@@ -509,6 +512,10 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Serve => {
             out.w.flush()?;
             return serve::run(vault);
+        }
+        Cmd::Mcp => {
+            out.w.flush()?;
+            return mcp::run(vault);
         }
         Cmd::Run { name, note } => {
             let list = usercmd::load(vault.root())?
