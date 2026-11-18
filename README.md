@@ -223,9 +223,38 @@ output = "insert"
 | スラッシュコマンド | 行頭か空白の直後で `/` を入力すると、コマンドパレットが開く。選んだら `/` を消して実行し、Esc なら `/` を残す |
 | ノートコンポーザー | 「選択範囲（または見出しの節）を新しいノートに切り出す」：名前を確かめて同じフォルダに作り、元の場所はリンクにする（Ctrl+Zで戻せる）。「このノートを別のノートに結合」：結合先の末尾に足し、このノートへのリンクを結合先に付け替え、このノートはゴミ箱へ |
 | ワークスペース | 開いているタブと分割の配置を名前を付けて保存し、コマンドパレットから開く・削除する（`.robsidian/workspace.json`） |
+| Bases | `.base` ファイルを開くと、プロパティの表を出す（ビューの切り替え、名前のクリックでノートを開く）。ノートの中の ` ```base ` ブロックと `![[ファイル.base#ビュー]]` は、プレビューで表にする。書き方は下記 |
+| スライド | コマンド「スライドとして表示」で、ノートを `---` だけの行で区切って全画面で表示する。→ / Space で次、← で前、Esc で終わる |
 | ブックマーク・コマンドパレット・デイリーノート・ファイル一覧・グラフ・検索・タグ・テンプレート・クイックスイッチャー・ページプレビュー・プロパティ・ファイル復元 | それぞれ実装済み（上の各節） |
 
-これから作るもの（Bases、スライド、Canvas、音声録音）と、作らないものは [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズDにまとめています。
+これから作るもの（Canvas、音声録音）と、作らないものは [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズDにまとめています。
+
+#### Bases の書き方
+
+Obsidian の `.base` のうち、よく使う部分に対応しています（Obsidian の仕様との突き合わせはまだで、互換は一部です）。
+
+```yaml
+filters:            # すべてのビューに効く条件。and / or / not を入れ子にできる
+  and:
+    - file.hasTag("book")
+    - 'status != "読了"'
+properties:
+  author:
+    displayName: 著者
+views:
+  - type: table
+    name: 読書中
+    order: [file.name, author, status]   # 列
+    sort:
+      - property: rating
+        direction: DESC
+    limit: 20
+    filters: 'rating >= 4'               # このビューだけの条件
+```
+
+- 条件式：比較（`==` `!=` `>` `<` `>=` `<=`）、`file.hasTag()` `file.inFolder()` `file.hasLink()` `file.hasProperty()`、`プロパティ.contains()`、先頭の `!` による否定
+- プロパティ：frontmatter のキー（`note.` は省略可）と、`file.name` `file.path` `file.folder` `file.mtime` `file.tags` `file.links` など
+- 未対応：`formulas`（計算式）、表以外のビュー（カードなど）、グループ分け。未対応の式は、黙って無視せずエラーとして表示します
 
 ### 関連ノート
 
@@ -354,6 +383,7 @@ rob daily --append "- 14:00 打ち合わせ"
 | `rob snapshot [-m メッセージ]` | vault以下の変更をgitにコミット |
 | `rob pull` / `rob push` | リモートの変更を取り込む（競合したら取り消す）/ リモートへ送る |
 | `rob mcp` | MCPサーバーとして動く（下記） |
+| `rob base <ファイル> [--view 名前]` | Bases の表を出力（タブ区切り、`--json` でJSON） |
 
 `rob lint` はノートのリポジトリのCIにそのまま組み込めます。
 

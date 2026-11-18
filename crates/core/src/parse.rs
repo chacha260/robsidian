@@ -294,7 +294,11 @@ fn push_wikilink(
     out: &mut Parsed,
 ) {
     let (target_part, alias) = match inner.split_once('|') {
-        Some((t, a)) => (t, Some(a.trim().to_string())),
+        // 表の中では `|` を区切りと読まれないよう `[[先\|別名]]` と書く（Obsidian と同じ）
+        Some((t, a)) => (
+            t.strip_suffix('\\').unwrap_or(t),
+            Some(a.trim().to_string()),
+        ),
         None => (inner, None),
     };
     let (name, heading) = match target_part.split_once('#') {
@@ -404,6 +408,9 @@ mod tests {
         assert_eq!(p.links.len(), 3);
         assert_eq!(p.links[0].target, "Note A");
         assert_eq!(p.links[0].alias.as_deref(), Some("alias"));
+        let t = parse("| [[dir/a\\|名前]] |");
+        assert_eq!(t.links[0].target, "dir/a");
+        assert_eq!(t.links[0].alias.as_deref(), Some("名前"));
         assert_eq!(&src[p.links[0].span.clone()], "Note A");
         assert_eq!(&src[p.links[0].full.clone()], "[[Note A|alias]]");
         assert!(p.links[1].embed);

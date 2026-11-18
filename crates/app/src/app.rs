@@ -80,6 +80,7 @@ enum Command {
     SaveLayout,
     OpenLayout,
     DeleteLayout,
+    Slides,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -133,6 +134,7 @@ impl Command {
             Command::SaveLayout => "save workspace layout tabs",
             Command::OpenLayout => "open load workspace layout tabs",
             Command::DeleteLayout => "delete remove workspace layout",
+            Command::Slides => "slides presentation present slideshow",
             Command::GitCommit => "git commit snapshot save version",
             Command::GitPull => "git pull fetch sync download remote",
             Command::GitPush => "git push sync upload remote",
@@ -251,6 +253,11 @@ const COMMANDS: &[CommandEntry] = &[
     ),
     (Command::OpenLayout, "ワークスペースを開く", None),
     (Command::DeleteLayout, "ワークスペースを削除", None),
+    (
+        Command::Slides,
+        "スライドとして表示（`---` で区切って全画面）",
+        None,
+    ),
     (Command::GitCommit, "gitにスナップショットをコミット", None),
     (
         Command::GitPull,
@@ -606,6 +613,10 @@ pub struct App {
     commit_message: Option<String>,
     theme: crate::theme::ThemeFile,
     mermaid: crate::mermaid::Mermaid,
+    /// 開いている `.base` の表
+    base_view: Option<crate::base_view::BaseView>,
+    /// スライド表示中: (ノート, 何枚目)
+    slideshow: Option<(String, usize)>,
     /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
     callout_folds: HashMap<(String, usize), bool>,
     /// 関連ノート: (索引の世代, ノートのパス, 計算した時刻, 結果)
@@ -676,6 +687,8 @@ impl App {
             related: None,
             mermaid: Default::default(),
             callout_folds: HashMap::new(),
+            base_view: None,
+            slideshow: None,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -1401,6 +1414,14 @@ impl App {
                 self.create_and_open(&name);
             }
             Command::ExtractNote => self.start_extract(ctx),
+            Command::Slides => match current {
+                Some(path) => {
+                    self.save_all();
+                    self.slideshow = Some((path, 0));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+                None => self.toast("スライドにするノートを開いてください"),
+            },
             Command::MergeNote | Command::OpenLayout | Command::DeleteLayout => {
                 let mode = match cmd {
                     Command::MergeNote if current.is_none() => {
@@ -2384,6 +2405,10 @@ impl App {
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Open(path, line) => self.open_note(&path, line),
+            Action::OpenExternal(path) if path.ends_with(".base") => {
+                self.base_view = Some(crate::base_view::BaseView::new(path));
+                self.show_graph = false;
+            }
             Action::OpenExternal(path) => self.open_external(&path, ctx),
             Action::FollowLink { target, from } => self.follow_link(&target, &from, ctx),
             Action::Activate(i) => {
@@ -3141,6 +3166,23 @@ impl App {
         }
         self.toolbar(ui, actions);
         ui.separator();
+
+        if let (Some(view), Some(vault)) = (self.base_view.as_mut(), self.vault.as_ref()) {
+            use crate::base_view::Outcome;
+            match view.show(ui, vault, self.generation) {
+                Some(Outcome::Open(path)) => {
+                    self.base_view = None;
+                    actions.push(Action::Open(path, None));
+                }
+                Some(Outcome::OpenExternal(path)) => {
+                    let ctx = ui.ctx().clone();
+                    self.open_external(&path, &ctx);
+                }
+                Some(Outcome::Close) => self.base_view = None,
+                None => {}
+            }
+            return;
+        }
 
         if self.show_graph {
             ui.horizontal(|ui| {
@@ -4691,6 +4733,120 @@ impl App {
         }
     }
 
+    /// スライド表示（全画面）。→ / Space / PageDown で次、← / PageUp で前、Home / End、Esc で終わる。
+    fn slides_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some((path, index)) = self.slideshow.clone() else {
+            return;
+        };
+        let text = match self.tabs.iter().find(|t| t.path == path) {
+            Some(tab) => tab.text.clone(),
+            None => self
+                .vault
+                .as_ref()
+                .and_then(|v| v.note(&path))
+                .map_or_else(String::new, |n| n.text.clone()),
+        };
+        let slides = robsidian_core::text::slides(&text);
+        let mut exit = slides.is_empty();
+        let last = slides.len().saturating_sub(1);
+        let mut index = index.min(last);
+        ctx.input_mut(|i| {
+            let mut pressed = |k| i.consume_key(Modifiers::NONE, k);
+            if pressed(Key::Escape) {
+                exit = true;
+            }
+            if pressed(Key::ArrowRight)
+                || pressed(Key::Space)
+                || pressed(Key::PageDown)
+                || pressed(Key::ArrowDown)
+                || pressed(Key::Enter)
+            {
+                index = (index + 1).min(last);
+            }
+            if pressed(Key::ArrowLeft)
+                || pressed(Key::PageUp)
+                || pressed(Key::ArrowUp)
+                || pressed(Key::Backspace)
+            {
+                index = index.saturating_sub(1);
+            }
+            if pressed(Key::Home) {
+                index = 0;
+            }
+            if pressed(Key::End) {
+                index = last;
+            }
+        });
+        if exit {
+            if slides.is_empty() {
+                self.toast("スライドにする本文がありません");
+            }
+            self.slideshow = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
+        self.slideshow = Some((path.clone(), index));
+        let Some(vault) = self.vault.as_ref() else {
+            return;
+        };
+        let md = preview::to_preview(&slides[index], &path, vault);
+        let md_cache = &mut self.md_cache;
+        let base = self.cfg.font_size;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(48.0))
+            .show(ui, |ui| {
+                // 文字を大きくする
+                ui.style_mut()
+                    .text_styles
+                    .iter_mut()
+                    .for_each(|(style, font)| {
+                        font.size = match style {
+                            egui::TextStyle::Heading => base * 2.6,
+                            egui::TextStyle::Small => base * 1.2,
+                            _ => base * 1.7,
+                        };
+                    });
+                let footer = 40.0;
+                let height = (ui.available_height() - footer).max(100.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                    ScrollArea::vertical()
+                        .id_salt(("slide", &path, index))
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            let side = ((ui.available_width() - 1100.0) / 2.0).max(0.0);
+                            ui.horizontal_top(|ui| {
+                                ui.add_space(side);
+                                ui.vertical(|ui| {
+                                    ui.set_width(ui.available_width() - side);
+                                    let width = ui.available_width().max(100.0) as usize;
+                                    CommonMarkViewer::new()
+                                        .alerts(preview::alerts())
+                                        .render_math_fn(Some(&crate::math_view::show))
+                                        .max_image_width(Some(width))
+                                        .show(ui, md_cache, &md);
+                                });
+                            });
+                        });
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("◀").clicked() {
+                        index = index.saturating_sub(1);
+                    }
+                    if ui.button("▶").clicked() {
+                        index = (index + 1).min(last);
+                    }
+                    ui.weak(format!(
+                        "{} / {}　←→ で移動・Esc で終了",
+                        index + 1,
+                        last + 1
+                    ));
+                });
+            });
+        if let Some(show) = self.slideshow.as_mut() {
+            show.1 = index;
+        }
+    }
+
     /// 切り出しの準備: 選択範囲か、カーソルのある見出しの節を決めて、名前を聞くダイアログを出す。
     fn start_extract(&mut self, ctx: &egui::Context) {
         let Some(tab) = self.tabs.get(self.active) else {
@@ -5431,6 +5587,11 @@ impl eframe::App for App {
         self.autosave(&ctx);
         self.poll_external(&ctx);
         self.apply_style(&ctx);
+        if self.slideshow.is_some() {
+            self.slides_ui(ui, &ctx);
+            self.toast_ui(&ctx);
+            return;
+        }
         // ウィンドウからフォーカスが外れたら即保存する
         if ctx.input(|i| {
             i.events
