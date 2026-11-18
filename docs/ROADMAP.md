@@ -95,7 +95,7 @@ Robsidianの現状: 拡張の仕組みはなし。エコシステムの量で追
 | D3 | Bases（プロパティの表）とスライド（実装済み。Basesは計算列・カード・グループ分け・集計も） | 1-5 | M〜L | ★★ |
 | D4 | Canvas と音声録音（実装済み。Canvasの編集、録音の再生も） | 1-3 | L | ★ |
 | E1 | プラグイン（段階1）: 外部プロセスのプラグイン（コマンド・コードブロック・イベント・サイドパネル）（実装済み） | 1-5 | M | ★★ |
-| E2 | プラグイン（段階2）: 常駐するプラグイン（JSON-RPC）と、Robsidian に問い合わせる口 | 1-5 | M〜L | ★ |
+| E2 | プラグイン（段階2）: 常駐するプラグイン（JSON-RPC）と、Robsidian に問い合わせる口（実装済み。補完は未対応） | 1-5 | M〜L | ★ |
 | E3 | プラグイン（段階3）: WASM のプラグインと権限、プラグインの一覧からの導入 | 1-5 | L | ★ |
 
 ---
@@ -955,13 +955,43 @@ title = "要約"
 **段階1でしないこと**: プラグインからの問い合わせ（ほかのノートを読む・検索する）は段階2。プラグインの画面（入力欄・ボタン）は持たない
 （入力が要るときは、選択範囲やコードブロックで渡す）。
 
-### E2（段階2）: 常駐するプラグインと、Robsidian に問い合わせる口
+### E2（段階2）: 常駐するプラグインと、Robsidian に問い合わせる口（実装済み）
 
-- `plugin.toml` に `mode = "server"` と書いたプラグインは、起動したままにして JSON-RPC 2.0（行区切りの JSON。LSP と同じ考え方）で話す。
-  起動は1回で済み、状態も持てる。リクエストの形は段階1と同じものを `method` で呼び分ける
-- プラグインから Robsidian への問い合わせ：`vault/read` `vault/search` `vault/backlinks` `vault/write`（書き換えは `Vault` を通す）。
-  中身は MCP サーバー（`crates/cli/src/mcp.rs`）の道具とほぼ同じなので、処理を core に寄せて共有する
-- 入力のたびの補完（`completion`）や、パネルの随時更新（プラグインからの通知）もここで足す
+`plugin.toml` に `mode = "server"` と書いたプラグインは、最初に使うときに起動し、起動したままにして
+行区切りの JSON-RPC 2.0（標準入出力。LSP と同じ考え方）で話す。起動は1回で済み、状態も持てる。
+
+```jsonc
+// Robsidian → プラグイン
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"api":1,"vault":"…","plugin_dir":"…"}}  // 起動直後に1回（返事は読まない）
+{"jsonrpc":"2.0","id":1,"method":"plugin/request","params":{…段階1のリクエストと同じ…}}           // 返事の result は段階1のレスポンス
+{"jsonrpc":"2.0","method":"shutdown"}                                                           // 止める前に（標準入力も閉じる）
+
+// プラグイン → Robsidian（問い合わせ。返事が来る）
+{"jsonrpc":"2.0","id":"q1","method":"vault/read","params":{"path":"a"}}           // → {"path","text"}（開いているノートは保存前の内容）
+{"jsonrpc":"2.0","id":"q2","method":"vault/list","params":{"folder":"日記"}}      // → ["日記/a.md", …]
+{"jsonrpc":"2.0","id":"q3","method":"vault/search","params":{"query":"task:todo due:week","limit":50}}
+                                                                                   // → {"notes":[{"path"}]} か {"tasks":[{"path","line","status","text","due"}]}
+{"jsonrpc":"2.0","id":"q4","method":"vault/backlinks","params":{"path":"a"}}      // → [{"source","line"}]
+{"jsonrpc":"2.0","id":"q5","method":"vault/write","params":{"path":"b","text":"…"}} // → {"path"}（開いていればタブに反映。Ctrl+Z で戻せる）
+
+// プラグイン → Robsidian（通知。返事は無い）
+{"jsonrpc":"2.0","method":"ui/notice","params":{"text":"…"}}
+{"jsonrpc":"2.0","method":"panel/refresh","params":{"id":"links"}}   // id を省くと、そのプラグインのパネルすべて
+```
+
+**実現の方法**
+
+- `core::plugin::Server`：起動して、標準出力を読むスレッドで返事（id で待っている依頼に渡す）と、問い合わせ・通知（受け口に積む）に振り分ける。
+  落ちたら、待っている依頼をすべて失敗にする（標準エラーの最後の行を添える）。落とすと `shutdown` を送ってから止める
+- `core::plugin::host_call`：問い合わせの答え。GUI と CLI で共有する。書き換えは `Vault::write_note` を通す
+- `core::plugin::request_blocking`：依頼して、待つあいだの問い合わせに答えながら返事を待つ（CLI の `rob plugin run` とテスト用）
+- アプリ（`plugins.rs`）：プラグインごとに `Server` を1つ持ち、落ちていたら次に使うときに起動し直す。
+  オフにした・許可を取り消した・`plugin.toml` が変わったら止める。返事は30秒待って打ち切る。
+  問い合わせは描画のたびに受け取り、開いているノートの読み書きはタブに対して行う
+- プラグインは標準入力が閉じたら終わること（アプリを終了したときに残らないように）。
+  `examples/plugins/weekly/robsidian.py` は、このやりとりをまとめた Python の助け（そのまま写して使える）
+
+**未対応**: 入力のたびの補完（`completion`）。問い合わせの `vault/read` で読めるのはノートだけ（画像などは読まない）。
 
 ### E3（段階3）: WASM のプラグインと配布
 
@@ -992,6 +1022,6 @@ title = "要約"
    B6（数式・Mermaid）、Helix風の操作、MCPサーバー、git の pull/push、文中の画像、コールアウトの折りたたみも実装済み。
    ロードマップの項目はすべて実装した。Windows での動作は確認できた。
 9. ~~**D1 → D2 → D3 → D4**~~ — 実装済み。Obsidianのコアプラグインに相当する機能を、小さいものから順に。
-10. **E1 → E2 → E3** — ユーザーが作れるプラグイン。外部プロセスから始め、常駐・問い合わせ、WASM と配布へ。
+10. **E1 → E2 → E3** — ユーザーが作れるプラグイン。外部プロセスから始め、常駐・問い合わせ、WASM と配布へ。E1・E2 は実装済み。
 
 判断基準は一貫して「これが入ると、Obsidianを開かずに1日過ごせる日が増えるか」です。

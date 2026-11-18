@@ -271,7 +271,24 @@ on = "save"
 - プラグインが書き換えた内容を保存したときは、保存のイベントをもう一度は呼びません（無限に続かないように）
 - 環境変数 `ROB_VAULT` `ROB_NOTE` `ROB_PLUGIN_DIR` も渡します
 - 画面なしで試すには `rob plugin list` と `rob plugin run <id> <command|codeblock|panel|event> <名前> [--note ノート] [--text 中身]`
-- 設計と今後（常駐するプラグイン、WASM）は [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズE
+- 設計と今後（WASM と配布）は [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズE
+
+#### 常駐するプラグイン（`mode = "server"`）
+
+`plugin.toml` に `mode = "server"` と書くと、最初に使うときに起動し、そのまま起動しておきます。毎回起動しないので速く、状態も持てます。
+やりとりは行区切りの JSON-RPC 2.0 で、依頼（`plugin/request`）の中身は上と同じです。加えて、プラグインから Robsidian に問い合わせられます。
+
+| 問い合わせ | 返事 |
+|---|---|
+| `vault/read` `{path}` | `{path, text}`（開いているノートは保存前の内容） |
+| `vault/list` `{folder?}` | ノートのパスの一覧 |
+| `vault/search` `{query, limit?}` | 検索条件（`rob query` と同じ書き方）に合うノートかタスク |
+| `vault/backlinks` `{path}` | このノートへのリンクの一覧 `[{source, line}]` |
+| `vault/write` `{path, text}` | ノートを書く・作る（開いていればタブに反映。Ctrl+Z で戻せる） |
+
+通知（返事なし）は `ui/notice` `{text}` と `panel/refresh` `{id?}`（パネルを作り直させる）です。
+プラグインは、標準入力が閉じたら終わるようにしてください（アプリを終了したときに残らないように）。
+Python なら [`examples/plugins/weekly/robsidian.py`](examples/plugins/weekly/robsidian.py) を写すと、関数を1つ書くだけで作れます。
 
 ### Obsidian のコアプラグインに相当する機能
 

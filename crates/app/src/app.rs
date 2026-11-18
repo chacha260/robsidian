@@ -1868,6 +1868,24 @@ impl App {
                 tab.preview = None;
             }
         }
+        // 起動したままのプラグインのうち、オフにした・許可を取り消したものは止める
+        for id in self.plugins.server_ids() {
+            let ok = self
+                .plugins
+                .find(&id)
+                .is_some_and(|p| crate::plugins::usable(&self.cfg, root, p) == Usable::Yes);
+            if !ok {
+                self.plugins.stop(&id);
+            }
+        }
+        // 起動したままのプラグインからの問い合わせ・通知
+        for (id, call) in self.plugins.host_calls() {
+            self.answer_plugin(&id, call, ctx);
+        }
+        // 常駐するプラグインの返事は別スレッドから知らせが来ないので、待っているあいだは描き直して確かめる
+        if self.plugins.running().next().is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // イベント（保存・開いたとき）
         for (path, kind) in std::mem::take(&mut self.plugin_events) {
             let Some(tab) = self.tabs.iter().find(|t| t.path == path) else {
@@ -1948,6 +1966,79 @@ impl App {
                 tab.preview = None;
             }
         }
+    }
+
+    /// 起動したままのプラグインからの問い合わせに答え、通知を反映する。
+    /// 開いているノートは、保存前の内容を読ませ、書き換えもタブに反映する
+    fn answer_plugin(
+        &mut self,
+        plugin_id: &str,
+        call: robsidian_core::plugin::HostCall,
+        ctx: &egui::Context,
+    ) {
+        let Some(id) = call.id else {
+            // 通知
+            match call.method.as_str() {
+                "ui/notice" => {
+                    if let Some(t) = call.params.get("text").and_then(|t| t.as_str()) {
+                        self.toast(t.to_string());
+                    }
+                }
+                "panel/refresh" => {
+                    let panel = call.params.get("id").and_then(|v| v.as_str());
+                    self.plugins.invalidate_panels(plugin_id, panel);
+                }
+                _ => {}
+            }
+            return;
+        };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let path_param = call
+            .params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // 開いているタブのノート（名前だけでも探す）
+        let open_tab = path_param.as_deref().and_then(|p| {
+            let path = vault
+                .note(p)
+                .map(|n| n.path.clone())
+                .or_else(|| vault.resolve(p, "").map(str::to_string))
+                .unwrap_or_else(|| p.to_string());
+            self.tabs.iter().position(|t| t.path == path)
+        });
+        let result = match (call.method.as_str(), open_tab) {
+            ("vault/read", Some(i)) => Ok(serde_json::json!({
+                "path": self.tabs[i].path,
+                "text": self.tabs[i].text,
+            })),
+            ("vault/write", Some(i)) => match call.params.get("text").and_then(|v| v.as_str()) {
+                Some(text) => {
+                    let tab = &mut self.tabs[i];
+                    let text = text.to_string();
+                    let cursor = tab.cursor.min(text.len());
+                    let cursor = (0..=cursor)
+                        .rev()
+                        .find(|&c| text.is_char_boundary(c))
+                        .unwrap_or(0);
+                    replace_text_undoable(ctx, tab, text, cursor..cursor);
+                    tab.plugin_edit = Some(tab.version);
+                    Ok(serde_json::json!({"path": tab.path}))
+                }
+                None => Err(anyhow::anyhow!("vault/write: text がありません")),
+            },
+            (method, _) => {
+                let r = robsidian_core::plugin::host_call(vault, method, &call.params);
+                if r.is_ok() && method == "vault/write" {
+                    self.generation += 1;
+                }
+                r
+            }
+        };
+        // 失敗はプラグインに返す（続けて失敗するプラグインで通知が溢れないよう、通知はしない）
+        self.plugins.reply(plugin_id, id, result);
     }
 
     /// プラグインのコマンド・イベントの結果（してほしいこと）を反映する
@@ -5506,7 +5597,10 @@ impl App {
                 p.items.extend(user.map(|(i, _)| PaletteItem::User(i)));
                 for (pi, plugin) in self.plugins.list.iter().enumerate() {
                     for (ci, c) in plugin.manifest.command.iter().enumerate() {
-                        let label = format!("{} {}", plugin.manifest.name, c.name).to_lowercase();
+                        // 英字でも引けるよう、プラグインとコマンドの id も含める
+                        let label =
+                            format!("{} {} {} {}", plugin.manifest.name, c.name, plugin.id, c.id)
+                                .to_lowercase();
                         if q.split_whitespace().all(|w| label.contains(w)) {
                             p.items.push(PaletteItem::Plugin(pi, ci));
                         }

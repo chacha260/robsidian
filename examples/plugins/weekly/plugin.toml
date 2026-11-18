@@ -1,0 +1,14 @@
+# 常駐するプラグインの例（段階2。Python 3）。robsidian.py は、そのまま写して使える助け
+name = "今週のまとめ"
+version = "0.1.0"
+description = "今週のタスクをノートにまとめる。このノートへのつながりをパネルに出す"
+mode = "server"                # 起動したままにして、JSON-RPC で話す
+run = "python3 -u main.py"     # -u: 出力をためずにすぐ送る
+
+[[command]]
+id = "weekly"
+name = "今週のタスクをまとめる"
+
+[[panel]]
+id = "links"
+title = "つながり"
