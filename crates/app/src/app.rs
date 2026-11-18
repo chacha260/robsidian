@@ -75,6 +75,13 @@ enum Command {
     GitPush,
     RandomNote,
     UniqueNote,
+    ExtractNote,
+    MergeNote,
+    SaveLayout,
+    OpenLayout,
+    DeleteLayout,
+    Slides,
+    Record,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -123,6 +130,13 @@ impl Command {
             Command::Rescan => "rescan reload refresh index",
             Command::RandomNote => "random note open shuffle",
             Command::UniqueNote => "unique note zettelkasten timestamp new create",
+            Command::ExtractNote => "extract selection heading note composer split refactor",
+            Command::MergeNote => "merge note composer combine join",
+            Command::SaveLayout => "save workspace layout tabs",
+            Command::OpenLayout => "open load workspace layout tabs",
+            Command::DeleteLayout => "delete remove workspace layout",
+            Command::Slides => "slides presentation present slideshow",
+            Command::Record => "audio recorder record voice microphone",
             Command::GitCommit => "git commit snapshot save version",
             Command::GitPull => "git pull fetch sync download remote",
             Command::GitPush => "git push sync upload remote",
@@ -228,6 +242,25 @@ const COMMANDS: &[CommandEntry] = &[
         "ユニークノートを作成（日時の名前）",
         None,
     ),
+    (
+        Command::ExtractNote,
+        "選択範囲（または見出しの節）を新しいノートに切り出す",
+        None,
+    ),
+    (Command::MergeNote, "このノートを別のノートに結合", None),
+    (
+        Command::SaveLayout,
+        "ワークスペース（タブと分割の配置）を保存",
+        None,
+    ),
+    (Command::OpenLayout, "ワークスペースを開く", None),
+    (Command::DeleteLayout, "ワークスペースを削除", None),
+    (
+        Command::Slides,
+        "スライドとして表示（`---` で区切って全画面）",
+        None,
+    ),
+    (Command::Record, "録音を開始 / 停止", None),
     (Command::GitCommit, "gitにスナップショットをコミット", None),
     (
         Command::GitPull,
@@ -282,6 +315,24 @@ enum Dialog {
     },
     Delete {
         path: String,
+    },
+    /// 選択範囲（または見出しの節）を新しいノートに切り出す
+    Extract {
+        path: String,
+        /// 切り出す範囲（バイト位置）と、そのときの本文の版
+        range: std::ops::Range<usize>,
+        version: u64,
+        /// 見出しの節を切り出すときは、見出しの行を残す
+        heading: bool,
+        name: String,
+    },
+    /// `source` を `target` の末尾に結合する
+    Merge {
+        source: String,
+        target: String,
+    },
+    SaveLayout {
+        name: String,
     },
 }
 
@@ -380,6 +431,8 @@ enum PaletteItem {
     Cmd(usize),
     /// ユーザーコマンド（`.robsidian/commands.toml`）
     User(usize),
+    /// ワークスペースの名前
+    Layout(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -390,6 +443,12 @@ enum PaletteMode {
     InsertTemplate,
     /// 選んだテンプレートで新規ノートを作る
     NewFromTemplate,
+    /// 現在のノートを結合する先を選ぶ
+    MergeTarget,
+    /// 開くワークスペースを選ぶ
+    Layouts,
+    /// 削除するワークスペースを選ぶ
+    DeleteLayout,
 }
 
 struct Palette {
@@ -557,6 +616,14 @@ pub struct App {
     commit_message: Option<String>,
     theme: crate::theme::ThemeFile,
     mermaid: crate::mermaid::Mermaid,
+    /// 開いている `.base` の表
+    base_view: Option<crate::base_view::BaseView>,
+    /// 開いている `.canvas`
+    canvas_view: Option<crate::canvas_view::CanvasView>,
+    /// 録音中
+    recorder: Option<crate::recorder::Recorder>,
+    /// スライド表示中: (ノート, 何枚目)
+    slideshow: Option<(String, usize)>,
     /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
     callout_folds: HashMap<(String, usize), bool>,
     /// 関連ノート: (索引の世代, ノートのパス, 計算した時刻, 結果)
@@ -627,6 +694,10 @@ impl App {
             related: None,
             mermaid: Default::default(),
             callout_folds: HashMap::new(),
+            base_view: None,
+            canvas_view: None,
+            recorder: None,
+            slideshow: None,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -1351,6 +1422,53 @@ impl App {
                 }
                 self.create_and_open(&name);
             }
+            Command::ExtractNote => self.start_extract(ctx),
+            Command::Record => match self.recorder.take() {
+                Some(rec) => self.finish_recording(rec),
+                None => match current {
+                    Some(path) => match crate::recorder::Recorder::start(path) {
+                        Ok(rec) => self.recorder = Some(rec),
+                        Err(e) => self.toast(format!("{e:#}")),
+                    },
+                    None => self.toast("録音を埋め込むノートを開いてください"),
+                },
+            },
+            Command::Slides => match current {
+                Some(path) => {
+                    self.save_all();
+                    self.slideshow = Some((path, 0));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+                None => self.toast("スライドにするノートを開いてください"),
+            },
+            Command::MergeNote | Command::OpenLayout | Command::DeleteLayout => {
+                let mode = match cmd {
+                    Command::MergeNote if current.is_none() => {
+                        self.toast("結合するノートを開いてください");
+                        return;
+                    }
+                    Command::MergeNote => PaletteMode::MergeTarget,
+                    _ if self.workspace.layouts.is_empty() => {
+                        self.toast("保存したワークスペースはありません");
+                        return;
+                    }
+                    Command::OpenLayout => PaletteMode::Layouts,
+                    _ => PaletteMode::DeleteLayout,
+                };
+                self.palette = Some(Palette {
+                    mode,
+                    query: String::new(),
+                    computed_for: None,
+                    items: Vec::new(),
+                    selected: 0,
+                    slash: None,
+                });
+            }
+            Command::SaveLayout => {
+                self.dialog = Some(Dialog::SaveLayout {
+                    name: String::new(),
+                });
+            }
             Command::GitCommit | Command::GitPull | Command::GitPush => {
                 let root = self.vault.as_ref().map(|v| v.root().to_path_buf());
                 if !self.git.repo {
@@ -1766,6 +1884,45 @@ impl App {
             rel.clone()
         };
         self.insert_at_cursor(&format!("![[{shown}]]"));
+    }
+
+    /// 録音を止めて添付フォルダに WAV で保存し、録音を始めたノートに埋め込む。
+    fn finish_recording(&mut self, rec: crate::recorder::Recorder) {
+        let note = rec.note.clone();
+        let bytes = match rec.finish() {
+            Ok(b) => b,
+            Err(e) => {
+                self.toast(format!("録音を保存できません: {e:#}"));
+                return;
+            }
+        };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let name = format!(
+            "Recording {}.wav",
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
+        let rel = vault.attachment_path(&note, &name);
+        if let Err(e) = vault.write_file(&rel, &bytes) {
+            self.toast(format!("録音を保存できません: {e:#}"));
+            return;
+        }
+        self.generation += 1;
+        let shown = if vault.resolve_file(file_name(&rel), &note) == Some(rel.as_str()) {
+            file_name(&rel).to_string()
+        } else {
+            rel.clone()
+        };
+        // 別のノートに移っていたら、録音を始めたノートに戻ってから埋め込む
+        if self.current().map(|t| t.path.as_str()) != Some(note.as_str()) {
+            self.open_note(&note, None);
+        }
+        if self.current().map(|t| t.path.as_str()) == Some(note.as_str()) {
+            self.insert_at_cursor(&format!("![[{shown}]]"));
+        } else {
+            self.toast(format!("録音を保存しました: {rel}"));
+        }
     }
 
     /// 未リンクの言及を `[[リンク]]` に書き換える。開いているタブはタブの本文を、
@@ -2306,6 +2463,16 @@ impl App {
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Open(path, line) => self.open_note(&path, line),
+            Action::OpenExternal(path) if path.ends_with(".base") => {
+                self.base_view = Some(crate::base_view::BaseView::new(path));
+                self.canvas_view = None;
+                self.show_graph = false;
+            }
+            Action::OpenExternal(path) if path.ends_with(".canvas") => {
+                self.canvas_view = Some(crate::canvas_view::CanvasView::new(path));
+                self.base_view = None;
+                self.show_graph = false;
+            }
             Action::OpenExternal(path) => self.open_external(&path, ctx),
             Action::FollowLink { target, from } => self.follow_link(&target, &from, ctx),
             Action::Activate(i) => {
@@ -2478,6 +2645,24 @@ impl App {
             }
             for job in &self.jobs {
                 ui.weak(format!("「{}」を実行中…", job.name));
+            }
+            if let Some(err) = self.recorder.as_ref().and_then(|r| r.error()) {
+                // マイクが外されたなど。そこまでの録音を保存する
+                git_cmd = Some(Command::Record);
+                self.toast(format!("録音が中断されました: {err}"));
+            }
+            if let Some(rec) = &self.recorder {
+                let secs = rec.elapsed().as_secs();
+                let label = RichText::new(format!("● 録音中 {}:{:02}", secs / 60, secs % 60))
+                    .color(egui::Color32::from_rgb(0xe9, 0x3e, 0x3e));
+                if ui
+                    .add(egui::Button::new(label).frame(false))
+                    .on_hover_text("クリックで録音を止めて、ノートに埋め込む")
+                    .clicked()
+                {
+                    git_cmd = Some(Command::Record);
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(tab) = self.tabs.get(self.active) {
@@ -3064,6 +3249,41 @@ impl App {
         self.toolbar(ui, actions);
         ui.separator();
 
+        if let (Some(view), Some(vault)) = (self.canvas_view.as_mut(), self.vault.as_ref()) {
+            use crate::canvas_view::Outcome;
+            let colors = self.theme.colors(self.cfg.dark);
+            match view.show(ui, vault, &colors) {
+                Some(Outcome::Open(path)) => {
+                    self.canvas_view = None;
+                    actions.push(Action::Open(path, None));
+                }
+                Some(Outcome::OpenUrl(url)) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+                Some(Outcome::OpenExternal(path)) => {
+                    let ctx = ui.ctx().clone();
+                    self.open_external(&path, &ctx);
+                }
+                Some(Outcome::Close) => self.canvas_view = None,
+                None => {}
+            }
+            return;
+        }
+        if let (Some(view), Some(vault)) = (self.base_view.as_mut(), self.vault.as_ref()) {
+            use crate::base_view::Outcome;
+            match view.show(ui, vault, self.generation) {
+                Some(Outcome::Open(path)) => {
+                    self.base_view = None;
+                    actions.push(Action::Open(path, None));
+                }
+                Some(Outcome::OpenExternal(path)) => {
+                    let ctx = ui.ctx().clone();
+                    self.open_external(&path, &ctx);
+                }
+                Some(Outcome::Close) => self.base_view = None,
+                None => {}
+            }
+            return;
+        }
+
         if self.show_graph {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.graph.local, true, "ローカル（現在のノート周辺）");
@@ -3374,8 +3594,15 @@ impl App {
             }
         }
 
-        if std::mem::take(&mut tab.focus) {
-            ctx.memory_mut(|m| m.request_focus(id));
+        if tab.focus {
+            // ダイアログを閉じた直後のフレームでは、egui が前のフレームのモーダルより下へのフォーカスを止める。
+            // その間は要求を保留し、次のフレームで要求し直す
+            if ctx.memory(|m| m.is_above_modal_layer(ui.layer_id())) {
+                tab.focus = false;
+                ctx.memory_mut(|m| m.request_focus(id));
+            } else {
+                ctx.request_repaint();
+            }
         }
         // ライブ表示ではfrontmatterを畳むので、カーソルが入り込まないよう本文の先頭へ寄せる
         let fm_end = if live {
@@ -3669,22 +3896,61 @@ impl App {
                     let stroke = egui::Stroke::new(1.0, colors.dim.gamma_multiply(0.7));
                     painter.line_segment([egui::pos2(left, y), egui::pos2(right, y)], stroke);
                 }
-                editor::DecoKind::Checkbox(checked) => {
+                editor::DecoKind::Checkbox(status) => {
                     let side = size * 0.95;
                     let rect = egui::Rect::from_center_size(span.center(), egui::vec2(side, side));
-                    if *checked {
-                        painter.rect_filled(rect, 3.0, colors.accent);
-                        let (c, u) = (rect.center(), side * 0.5);
-                        let points = vec![
-                            c + egui::vec2(-0.5 * u, 0.0),
-                            c + egui::vec2(-0.12 * u, 0.4 * u),
-                            c + egui::vec2(0.55 * u, -0.4 * u),
-                        ];
-                        let stroke = egui::Stroke::new(1.8, colors.code_bg);
-                        painter.add(egui::Shape::line(points, stroke));
-                    } else {
-                        let stroke = egui::Stroke::new(1.3, colors.dim);
-                        painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                    let (c, u) = (rect.center(), side * 0.5);
+                    let mark = egui::Stroke::new(1.8, colors.code_bg);
+                    match status {
+                        ' ' => {
+                            let stroke = egui::Stroke::new(1.3, colors.dim);
+                            painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                        }
+                        'x' | 'X' => {
+                            painter.rect_filled(rect, 3.0, colors.accent);
+                            let points = vec![
+                                c + egui::vec2(-0.5 * u, 0.0),
+                                c + egui::vec2(-0.12 * u, 0.4 * u),
+                                c + egui::vec2(0.55 * u, -0.4 * u),
+                            ];
+                            painter.add(egui::Shape::line(points, mark));
+                        }
+                        // 進行中: 左半分を塗る
+                        '/' => {
+                            let stroke = egui::Stroke::new(1.3, colors.accent);
+                            painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                            let half =
+                                egui::Rect::from_min_max(rect.min, egui::pos2(c.x, rect.max.y));
+                            painter.rect_filled(
+                                half,
+                                egui::CornerRadius {
+                                    nw: 3,
+                                    sw: 3,
+                                    ne: 0,
+                                    se: 0,
+                                },
+                                colors.accent,
+                            );
+                        }
+                        // 取り消し: 横線
+                        '-' => {
+                            painter.rect_filled(rect, 3.0, colors.dim);
+                            painter.line_segment(
+                                [c + egui::vec2(-0.5 * u, 0.0), c + egui::vec2(0.5 * u, 0.0)],
+                                mark,
+                            );
+                        }
+                        // そのほか（`>` `!` `?` など）は、その文字を描く
+                        other => {
+                            painter.rect_filled(rect, 3.0, colors.accent.gamma_multiply(0.75));
+                            painter.text(
+                                c,
+                                Align2::CENTER_CENTER,
+                                other.to_string(),
+                                egui::FontId::new(size * 0.75, fonts::bold()),
+                                colors.code_bg,
+                            );
+                        }
                     }
                     // クリックで切り替える（カーソルは動かさない）
                     if clip.contains_rect(rect) {
@@ -3696,8 +3962,14 @@ impl App {
                         if hit.hovered() {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        if hit.clicked() {
-                            toggle = Some((deco.chars.start + 1, !*checked));
+                        let label = match status {
+                            ' ' => "クリックで完了にする",
+                            _ => "クリックで未完了に戻す",
+                        };
+                        if hit.on_hover_text(label).clicked() {
+                            // Obsidian と同じく、未完了なら完了に、それ以外の状態なら未完了に戻す
+                            let next = if *status == ' ' { 'x' } else { ' ' };
+                            toggle = Some((deco.chars.start + 1, next));
                         }
                     }
                 }
@@ -3983,9 +4255,13 @@ impl App {
             let rect = egui::Rect::from_min_size(here.left_top(), egui::vec2(width, here.height()));
             painter.rect_filled(rect, 1.0, colors.accent.gamma_multiply(0.45));
         }
-        if let Some((ch, checked)) = toggle {
+        if let Some((ch, next)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
-            if tab.text.is_char_boundary(byte) && tab.text.is_char_boundary(byte + 1) {
+            let end = tab.text[byte..]
+                .chars()
+                .next()
+                .map_or(byte, |c| byte + c.len_utf8());
+            if end > byte {
                 // Ctrl+Zで戻せるよう、変更前の状態をTextEditの履歴に積む
                 let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
                 let range = state.cursor.char_range().unwrap_or_default();
@@ -3993,8 +4269,7 @@ impl App {
                 undoer.add_undo(&(range, tab.text.clone()));
                 state.set_undoer(undoer);
                 state.store(&ctx, id);
-                tab.text
-                    .replace_range(byte..byte + 1, if checked { "x" } else { " " });
+                tab.text.replace_range(byte..end, &next.to_string());
                 // チェックボックスのクリックでエディタのフォーカスが外れないようにする
                 ctx.memory_mut(|m| m.request_focus(id));
                 tab.dirty = true;
@@ -4294,6 +4569,7 @@ impl App {
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let current_path = self.tabs.get(self.active).map(|t| t.path.clone());
         let Some(p) = self.palette.as_mut() else {
             return;
         };
@@ -4325,11 +4601,23 @@ impl App {
                     p.items
                         .extend(hits.map(|t| PaletteItem::Template(t.to_string())));
                 }
+            } else if matches!(p.mode, PaletteMode::Layouts | PaletteMode::DeleteLayout) {
+                let q = q.to_lowercase();
+                p.items.extend(
+                    self.workspace
+                        .layouts
+                        .keys()
+                        .filter(|n| n.to_lowercase().contains(&q))
+                        .map(|n| PaletteItem::Layout(n.clone())),
+                );
             } else if p.mode == PaletteMode::Commands {
                 let q = q.to_lowercase();
                 let hits = COMMANDS.iter().enumerate().filter(|(_, c)| {
-                    // IMEをオフにしたまま英語でも引けるようにする
-                    c.1.to_lowercase().contains(&q) || c.0.keywords().contains(q.as_str())
+                    // IMEをオフにしたまま英語でも引けるようにする。空白で区切った語がすべて含まれれば一致
+                    let label = c.1.to_lowercase();
+                    let keywords = c.0.keywords();
+                    q.split_whitespace()
+                        .all(|w| label.contains(w) || keywords.contains(w))
                 });
                 p.items.extend(hits.map(|(i, _)| PaletteItem::Cmd(i)));
                 let user = self.user_cmds.list.iter().enumerate();
@@ -4357,8 +4645,12 @@ impl App {
                             .strip_suffix(".md")
                             .is_some_and(|s| s.eq_ignore_ascii_case(q))
                 });
+                if p.mode == PaletteMode::MergeTarget {
+                    // 結合先の候補から、結合するノート自身は除く
+                    notes.retain(|n| Some(n) != current_path.as_ref());
+                }
                 p.items.extend(notes.into_iter().map(PaletteItem::Note));
-                if !q.is_empty() && !exact {
+                if !q.is_empty() && !exact && p.mode == PaletteMode::Notes {
                     p.items.push(PaletteItem::Create(q.to_string()));
                 }
             }
@@ -4392,6 +4684,11 @@ impl App {
                         PaletteMode::Notes => "ノート名を入力…（無ければEnterで新規作成）",
                         PaletteMode::InsertTemplate => "挿入するテンプレートを選ぶ…",
                         PaletteMode::NewFromTemplate => "新規ノートに使うテンプレートを選ぶ…",
+                        PaletteMode::MergeTarget => {
+                            "結合先のノートを選ぶ…（このノートの本文を末尾に足します）"
+                        }
+                        PaletteMode::Layouts => "開くワークスペースを選ぶ…",
+                        PaletteMode::DeleteLayout => "削除するワークスペースを選ぶ…",
                     };
                     let edit = TextEdit::singleline(&mut p.query)
                         .hint_text(hint)
@@ -4408,6 +4705,19 @@ impl App {
                                     ui.horizontal(|ui| {
                                         let r = ui.selectable_label(selected, file_name(full));
                                         ui.weak(parent_dir(full));
+                                        r
+                                    })
+                                    .inner
+                                }
+                                PaletteItem::Layout(name) => {
+                                    let tabs = self
+                                        .workspace
+                                        .layouts
+                                        .get(name)
+                                        .map_or(0, |l| l.tabs.len());
+                                    ui.horizontal(|ui| {
+                                        let r = ui.selectable_label(selected, name.as_str());
+                                        ui.weak(format!("{tabs}個のタブ"));
                                         r
                                     })
                                     .inner
@@ -4469,7 +4779,21 @@ impl App {
         } else if let Some(i) = chosen {
             let Some(p) = self.palette.take() else { return };
             match &p.items[i] {
+                PaletteItem::Note(path) if p.mode == PaletteMode::MergeTarget => {
+                    if let Some(source) = current_path {
+                        self.dialog = Some(Dialog::Merge {
+                            source,
+                            target: path.clone(),
+                        });
+                    }
+                }
                 PaletteItem::Note(path) => actions.push(Action::Open(path.clone(), None)),
+                PaletteItem::Layout(name) if p.mode == PaletteMode::DeleteLayout => {
+                    self.workspace.layouts.remove(name);
+                    self.save_workspace();
+                    self.toast(format!("ワークスペース「{name}」を削除しました"));
+                }
+                PaletteItem::Layout(name) => self.open_layout(name),
                 PaletteItem::Template(path) if p.mode == PaletteMode::InsertTemplate => {
                     let title = self
                         .current()
@@ -4507,6 +4831,267 @@ impl App {
         } else if close {
             self.palette = None;
         }
+    }
+
+    /// スライド表示（全画面）。→ / Space / PageDown で次、← / PageUp で前、Home / End、Esc で終わる。
+    fn slides_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some((path, index)) = self.slideshow.clone() else {
+            return;
+        };
+        let text = match self.tabs.iter().find(|t| t.path == path) {
+            Some(tab) => tab.text.clone(),
+            None => self
+                .vault
+                .as_ref()
+                .and_then(|v| v.note(&path))
+                .map_or_else(String::new, |n| n.text.clone()),
+        };
+        let slides = robsidian_core::text::slides(&text);
+        let mut exit = slides.is_empty();
+        let last = slides.len().saturating_sub(1);
+        let mut index = index.min(last);
+        ctx.input_mut(|i| {
+            let mut pressed = |k| i.consume_key(Modifiers::NONE, k);
+            if pressed(Key::Escape) {
+                exit = true;
+            }
+            if pressed(Key::ArrowRight)
+                || pressed(Key::Space)
+                || pressed(Key::PageDown)
+                || pressed(Key::ArrowDown)
+                || pressed(Key::Enter)
+            {
+                index = (index + 1).min(last);
+            }
+            if pressed(Key::ArrowLeft)
+                || pressed(Key::PageUp)
+                || pressed(Key::ArrowUp)
+                || pressed(Key::Backspace)
+            {
+                index = index.saturating_sub(1);
+            }
+            if pressed(Key::Home) {
+                index = 0;
+            }
+            if pressed(Key::End) {
+                index = last;
+            }
+        });
+        if exit {
+            if slides.is_empty() {
+                self.toast("スライドにする本文がありません");
+            }
+            self.slideshow = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
+        self.slideshow = Some((path.clone(), index));
+        let Some(vault) = self.vault.as_ref() else {
+            return;
+        };
+        let md = preview::to_preview(&slides[index], &path, vault);
+        let md_cache = &mut self.md_cache;
+        let base = self.cfg.font_size;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(48.0))
+            .show(ui, |ui| {
+                // 文字を大きくする
+                ui.style_mut()
+                    .text_styles
+                    .iter_mut()
+                    .for_each(|(style, font)| {
+                        font.size = match style {
+                            egui::TextStyle::Heading => base * 2.6,
+                            egui::TextStyle::Small => base * 1.2,
+                            _ => base * 1.7,
+                        };
+                    });
+                let footer = 40.0;
+                let height = (ui.available_height() - footer).max(100.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                    ScrollArea::vertical()
+                        .id_salt(("slide", &path, index))
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            let side = ((ui.available_width() - 1100.0) / 2.0).max(0.0);
+                            ui.horizontal_top(|ui| {
+                                ui.add_space(side);
+                                ui.vertical(|ui| {
+                                    ui.set_width(ui.available_width() - side);
+                                    let width = ui.available_width().max(100.0) as usize;
+                                    CommonMarkViewer::new()
+                                        .alerts(preview::alerts())
+                                        .render_math_fn(Some(&crate::math_view::show))
+                                        .max_image_width(Some(width))
+                                        .show(ui, md_cache, &md);
+                                });
+                            });
+                        });
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("◀").clicked() {
+                        index = index.saturating_sub(1);
+                    }
+                    if ui.button("▶").clicked() {
+                        index = (index + 1).min(last);
+                    }
+                    ui.weak(format!(
+                        "{} / {}　←→ で移動・Esc で終了",
+                        index + 1,
+                        last + 1
+                    ));
+                });
+            });
+        if let Some(show) = self.slideshow.as_mut() {
+            show.1 = index;
+        }
+    }
+
+    /// 切り出しの準備: 選択範囲か、カーソルのある見出しの節を決めて、名前を聞くダイアログを出す。
+    fn start_extract(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.toast("切り出すノートを開いてください");
+            return;
+        };
+        let sel = selection_bytes(ctx, tab);
+        let (range, heading, name) = if !sel.is_empty() {
+            let text = &tab.text[sel.clone()];
+            (sel, false, suggested_name(text))
+        } else {
+            // カーソルのある見出しの節（見出しの次の行から、同じかより上の見出しの手前まで）
+            let headings = parse::parse(&tab.text).headings;
+            let line = tab.text[..tab.cursor.min(tab.text.len())]
+                .matches('\n')
+                .count();
+            let Some(i) = headings.iter().rposition(|h| h.line <= line) else {
+                self.toast("切り出す範囲を選ぶか、見出しの中で実行してください");
+                return;
+            };
+            let h = &headings[i];
+            let end_line = headings[i + 1..]
+                .iter()
+                .find(|n| n.level <= h.level)
+                .map(|n| n.line);
+            let start = editor::line_start(&tab.text, h.line + 1).min(tab.text.len());
+            let end = end_line.map_or(tab.text.len(), |l| editor::line_start(&tab.text, l));
+            if start >= end || tab.text[start..end].trim().is_empty() {
+                self.toast("この見出しの下には切り出す本文がありません");
+                return;
+            }
+            (start..end, true, sanitize_name(&h.text))
+        };
+        self.dialog = Some(Dialog::Extract {
+            path: tab.path.clone(),
+            range,
+            version: tab.version,
+            heading,
+            name,
+        });
+    }
+
+    /// 切り出しを行う: 新しいノートを作り、元の範囲をそのノートへのリンクに置き換える（Ctrl+Zで戻せる）。
+    fn extract(
+        &mut self,
+        path: &str,
+        range: std::ops::Range<usize>,
+        version: u64,
+        heading: bool,
+        name: &str,
+        ctx: &egui::Context,
+    ) {
+        let Some(tab) = self.tabs.iter().find(|t| t.path == path) else {
+            return;
+        };
+        if tab.version != version || range.end > tab.text.len() {
+            self.toast("ノートが変わったので切り出しを取りやめました。もう一度選んでください");
+            return;
+        }
+        let body = tab.text[range.clone()].trim_matches('\n').to_string() + "\n";
+        let body_starts_blank = tab.text[range.clone()].starts_with('\n');
+        let dir = parent_dir(path);
+        let full = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        };
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let created = match vault.create_note(&full, &body) {
+            Ok(p) => p,
+            Err(e) => return self.toast(format!("作れません: {e:#}")),
+        };
+        self.generation += 1;
+        let title = file_name(&created).trim_end_matches(".md").to_string();
+        let link = if heading {
+            // 見出しの直後の空行は残す
+            let blank = if body_starts_blank { "\n" } else { "" };
+            format!("{blank}[[{title}]]\n\n")
+        } else {
+            format!("[[{title}]]")
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
+            let mut text = tab.text.clone();
+            text.replace_range(range.clone(), &link);
+            let end = range.start + link.trim_end().len();
+            replace_text_undoable(ctx, tab, text, range.start..end);
+            tab.focus = true;
+        }
+        self.toast(format!(
+            "「{title}」に切り出しました（Ctrl+Zで元の本文に戻せます）"
+        ));
+    }
+
+    /// 結合を行う: 結合先の末尾に本文を足し、リンクを付け替え、結合元をゴミ箱へ移す。
+    fn merge(&mut self, source: &str, target: &str) {
+        self.save_all();
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let updated = match vault.merge(source, target) {
+            Ok(u) => u,
+            Err(e) => return self.toast(format!("結合できません: {e:#}")),
+        };
+        let trashed = trash::delete(vault.abs(source));
+        vault.rescan();
+        self.generation += 1;
+        self.tabs.retain(|t| t.path != source);
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.workspace.renamed(source, target);
+        self.save_workspace();
+        self.sync_tabs();
+        self.open_note(target, None);
+        let links = updated.len().saturating_sub(1);
+        if let Err(e) = trashed {
+            return self.toast(format!("結合しましたが、結合元をゴミ箱へ移せません: {e}"));
+        }
+        self.toast(format!(
+            "「{}」を「{}」に結合しました（リンクを{links}件のノートで付け替え、結合元はゴミ箱へ）",
+            file_name(source).trim_end_matches(".md"),
+            file_name(target).trim_end_matches(".md"),
+        ));
+    }
+
+    /// 保存したワークスペースを開く（今のタブは閉じる）。
+    fn open_layout(&mut self, name: &str) {
+        let Some(layout) = self.workspace.layouts.get(name).cloned() else {
+            return;
+        };
+        self.save_all();
+        self.tabs.clear();
+        self.other = None;
+        for path in &layout.tabs {
+            if self.vault.as_ref().is_some_and(|v| v.note(path).is_some()) {
+                self.open_note(path, None);
+            }
+        }
+        self.active = layout.active.min(self.tabs.len().saturating_sub(1));
+        self.other = layout
+            .split
+            .filter(|p| self.tabs.iter().any(|t| t.path == *p));
+        self.focus_right = layout.focus_right && self.other.is_some();
+        self.show_graph = false;
+        self.toast(format!("ワークスペース「{name}」を開きました"));
     }
 
     /// スラッシュコマンドで入力した `/` を消す（コマンドを選んだとき）。
@@ -4577,6 +5162,30 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(format!("「{path}」をゴミ箱へ移動しますか？"));
                 }
+                Dialog::Extract {
+                    heading, name, range, ..
+                } => {
+                    let what = if *heading { "見出しの節" } else { "選択範囲" };
+                    input(ui, &format!("{what}を新しいノートに切り出す"), "新しいノートの名前", name);
+                    ui.weak(format!(
+                        "{}文字を同じフォルダの新しいノートに移し、元の場所はそのノートへのリンクにします",
+                        range.len()
+                    ));
+                }
+                Dialog::Merge { source, target } => {
+                    ui.heading("ノートを結合");
+                    ui.add_space(6.0);
+                    ui.label(format!(
+                        "「{}」の本文を「{}」の末尾に足します。",
+                        file_name(source).trim_end_matches(".md"),
+                        file_name(target).trim_end_matches(".md")
+                    ));
+                    ui.weak("結合元へのリンクは結合先に付け替え、結合元はゴミ箱へ移します。");
+                }
+                Dialog::SaveLayout { name } => {
+                    input(ui, "ワークスペースを保存", "名前（同じ名前なら上書き）", name);
+                    ui.weak("開いているタブと、左右の分割の配置を保存します");
+                }
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -4621,6 +5230,33 @@ impl App {
                 self.rename(&path, &new)
             }
             Some(Dialog::Delete { path }) => self.delete(&path),
+            Some(Dialog::Extract {
+                path,
+                range,
+                version,
+                heading,
+                name,
+            }) => {
+                let name = sanitize_name(&name);
+                if name.is_empty() {
+                    self.toast("名前を入れてください");
+                } else {
+                    self.extract(&path, range, version, heading, &name, ctx);
+                }
+            }
+            Some(Dialog::Merge { source, target }) => self.merge(&source, &target),
+            Some(Dialog::SaveLayout { name }) if !name.trim().is_empty() => {
+                let name = name.trim().to_string();
+                let layout = workspace::Layout {
+                    tabs: self.tabs.iter().map(|t| t.path.clone()).collect(),
+                    active: self.active,
+                    split: self.other.clone(),
+                    focus_right: self.focus_right,
+                };
+                self.workspace.layouts.insert(name.clone(), layout);
+                self.save_workspace();
+                self.toast(format!("ワークスペース「{name}」を保存しました"));
+            }
             _ => {}
         }
     }
@@ -4702,6 +5338,37 @@ fn mermaid_images(
     }
     out.push_str(&src[at..]);
     out
+}
+
+/// ファイル名に使えない文字を除く
+fn sanitize_name(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '#' | '^' | '[' | ']'
+            )
+        })
+        .collect();
+    cleaned
+        .trim()
+        .chars()
+        .take(50)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 切り出す文字列から、新しいノートの名前の候補を作る（最初の空でない行。見出しや箇条書きの記号は除く）
+fn suggested_name(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let line = line.trim_start_matches(['#', '-', '*', '+', '>', ' ']);
+    sanitize_name(line)
 }
 
 /// 数式の文字の大きさ（表示数式は少し大きくする）
@@ -5020,6 +5687,11 @@ impl eframe::App for App {
         self.autosave(&ctx);
         self.poll_external(&ctx);
         self.apply_style(&ctx);
+        if self.slideshow.is_some() {
+            self.slides_ui(ui, &ctx);
+            self.toast_ui(&ctx);
+            return;
+        }
         // ウィンドウからフォーカスが外れたら即保存する
         if ctx.input(|i| {
             i.events
@@ -5104,5 +5776,18 @@ impl eframe::App for App {
         self.cfg.open_tabs = self.tabs.iter().map(|t| t.path.clone()).collect();
         self.cfg.active_tab = self.active;
         self.cfg.save();
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+
+    #[test]
+    fn names_for_extracted_notes() {
+        assert_eq!(suggested_name("\n\n## 設計の方針\n本文"), "設計の方針");
+        assert_eq!(suggested_name("- 買い物: 牛乳/卵 [[x]]"), "買い物 牛乳卵 x");
+        assert_eq!(sanitize_name("  a#b^c?  "), "abc");
+        assert_eq!(sanitize_name(&"長".repeat(80)).chars().count(), 50);
     }
 }

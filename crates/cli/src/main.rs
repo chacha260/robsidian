@@ -130,6 +130,14 @@ enum Cmd {
     Serve,
     /// MCPサーバーとして動く（AIアシスタントから vault を検索・読み書きできるようにする）
     Mcp,
+    /// Bases（.base ファイル）を表にして出力する（タブ区切り。--json でJSON）
+    Base {
+        /// .base ファイル（vault内のパスか名前）
+        file: String,
+        /// ビューの名前（省略時は最初のビュー）
+        #[arg(long)]
+        view: Option<String>,
+    },
     /// ユーザーコマンド（.robsidian/commands.toml）を実行する。名前を省くと一覧
     Run {
         name: Option<String>,
@@ -512,6 +520,38 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Serve => {
             out.w.flush()?;
             return serve::run(vault);
+        }
+        Cmd::Base { file, view } => {
+            let rel = vault
+                .resolve_file(&file, "")
+                .or_else(|| vault.resolve_file(&format!("{file}.base"), ""))
+                .map(str::to_string)
+                .with_context(|| format!("Base が見つかりません: {file}"))?;
+            let yaml = std::fs::read_to_string(vault.abs(&rel))?;
+            let base = robsidian_core::bases::parse(&yaml)?;
+            let table = robsidian_core::bases::run(&vault, &base, view.as_deref())?;
+            if out.json {
+                let rows: Vec<_> = table
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let cells: serde_json::Map<String, serde_json::Value> = table
+                            .columns
+                            .iter()
+                            .zip(&r.cells)
+                            .map(|((k, _), c)| (k.clone(), json!(c)))
+                            .collect();
+                        json!({ "path": r.path, "cells": cells })
+                    })
+                    .collect();
+                out.value(&json!({ "view": table.view, "total": table.total, "rows": rows }))?;
+            } else {
+                let header: Vec<&str> = table.columns.iter().map(|(_, n)| n.as_str()).collect();
+                out.lines(
+                    std::iter::once(header.join("\t"))
+                        .chain(table.rows.iter().map(|r| r.cells.join("\t"))),
+                )?;
+            }
         }
         Cmd::Mcp => {
             out.w.flush()?;

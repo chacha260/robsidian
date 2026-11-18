@@ -52,6 +52,7 @@ pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
     let today = chrono::Local::now().date_naive();
     let expanded = expand_embeds(text, from, vault);
     let expanded = expand_queries(&expanded, vault, today);
+    let expanded = expand_bases(&expanded, from, vault);
     let expanded = split_callout_titles(&expanded);
     let text = expanded.as_str();
     let parsed = parse::parse(text);
@@ -131,6 +132,76 @@ pub fn expand_queries(text: &str, vault: &Vault, today: chrono::NaiveDate) -> St
         out.push_str(&render_query(query.trim(), vault, today));
     }
     out
+}
+
+/// Bases を表にする: ` ```base ` ブロックと、`![[ファイル.base]]` / `![[ファイル.base#ビュー]]` だけの行。
+pub fn expand_bases(text: &str, from: &str, vault: &Vault) -> String {
+    if !text.contains("```base") && !text.contains(".base") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut lines = text.split_inclusive('\n');
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        // ![[ファイル.base#ビュー]]
+        if let Some(inner) = t.strip_prefix("![[").and_then(|r| r.strip_suffix("]]")) {
+            let (file, view) = match inner.split_once('#') {
+                Some((f, v)) => (f.trim(), Some(v.trim())),
+                None => (inner.split('|').next().unwrap_or(inner).trim(), None),
+            };
+            if file.ends_with(".base") {
+                let rel = vault.resolve_file(file, from).map(str::to_string);
+                let yaml = rel
+                    .as_deref()
+                    .and_then(|r| std::fs::read_to_string(vault.abs(r)).ok());
+                out.push_str(&match yaml {
+                    Some(y) => render_base(&y, view, vault),
+                    None => format!("*Base が見つかりません: {file}*\n\n"),
+                });
+                continue;
+            }
+        }
+        // ```base
+        if line
+            .trim_start()
+            .strip_prefix("```")
+            .is_some_and(|r| r.trim() == "base")
+        {
+            let mut yaml = String::new();
+            let mut closed = false;
+            for inner in lines.by_ref() {
+                if inner.trim_start().starts_with("```") {
+                    closed = true;
+                    break;
+                }
+                yaml.push_str(inner);
+            }
+            if closed {
+                out.push_str(&render_base(&yaml, None, vault));
+            } else {
+                // 書きかけのブロックは、そのまま見せる
+                out.push_str(line);
+                out.push_str(&yaml);
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn render_base(yaml: &str, view: Option<&str>, vault: &Vault) -> String {
+    use robsidian_core::bases;
+    let table = bases::parse(yaml).and_then(|b| bases::run(vault, &b, view));
+    match table {
+        Ok(t) => format!(
+            "> Base ・{} ・{}件\n\n{}\n",
+            t.view,
+            t.total,
+            bases::to_markdown(&t)
+        ),
+        Err(e) => format!("*Base を表にできません: {e:#}*\n\n"),
+    }
 }
 
 fn note_link(path: &str) -> String {

@@ -121,6 +121,34 @@ pub fn footnotes(text: &str) -> Vec<Footnote> {
     list
 }
 
+/// スライドに分ける（Obsidian のスライドと同じく、`---` だけの行で区切る）。
+/// frontmatter は除き、コードブロックの中の `---` では区切らない。空のスライドは捨てる。
+pub fn slides(text: &str) -> Vec<String> {
+    let body = match crate::props::block(text) {
+        Some(fm) => &text[fm.end..],
+        None => text,
+    };
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut fence = false;
+    for line in body.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = !fence;
+        }
+        if !fence && t == "---" {
+            out.push(std::mem::take(&mut current));
+            continue;
+        }
+        current.push_str(line);
+    }
+    out.push(current);
+    out.into_iter()
+        .map(|s| s.trim_matches('\n').to_string())
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +178,14 @@ mod tests {
             }
         );
         assert_eq!(count("  \n\t "), Counts::default());
+    }
+
+    #[test]
+    fn splits_slides() {
+        let text = "---\ntitle: x\n---\n# 表紙\n\n---\n\n## 2枚目\n```\n---\n```\n---\n---\n最後\n";
+        assert_eq!(slides(text), ["# 表紙", "## 2枚目\n```\n---\n```", "最後"]);
+        assert_eq!(slides("一枚だけ"), ["一枚だけ"]);
+        assert!(slides("").is_empty());
     }
 
     #[test]

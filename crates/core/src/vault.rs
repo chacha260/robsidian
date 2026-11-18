@@ -915,8 +915,34 @@ impl Vault {
             }
         };
 
+        let rewrites: Vec<(String, String)> = self
+            .retarget(&moved)
+            .into_iter()
+            .map(|(_, path, text)| (path, text))
+            .collect();
+
+        if let Some(parent) = new_abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&old_abs, &new_abs)
+            .with_context(|| format!("failed to rename {old} -> {new}"))?;
+        history::rename(&self.root, old, &new);
+
+        let mut updated = Vec::new();
+        for (path, text) in rewrites {
+            atomic_write(&self.root.join(&path), text.as_bytes())
+                .with_context(|| format!("failed to update links in {path}"))?;
+            updated.push(path);
+        }
+        self.rescan();
+        Ok(updated)
+    }
+
+    /// ノートやファイルの移動（`moved`: 旧パス → 新パス）に合わせて、リンクを書き換えた本文を作る。
+    /// 書き換えが要るノートごとに (元のパス, 移動後のパス, 書き換えた本文)。書き込みはしない。
+    fn retarget(&self, moved: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String, String)> {
         // 旧索引でリンクを解決しながら、書き換え後の本文を作る
-        let mut rewrites: Vec<(String, String)> = Vec::new();
+        let mut rewrites = Vec::new();
         for note in self.notes.values() {
             let src_new = moved(&note.path);
             let src_final = src_new.as_deref().unwrap_or(&note.path);
@@ -965,23 +991,60 @@ impl Vault {
             for (span, rep) in edits.into_iter().rev() {
                 text.replace_range(span, &rep);
             }
-            rewrites.push((src_final.to_string(), text));
+            rewrites.push((note.path.clone(), src_final.to_string(), text));
         }
 
-        if let Some(parent) = new_abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(&old_abs, &new_abs)
-            .with_context(|| format!("failed to rename {old} -> {new}"))?;
-        history::rename(&self.root, old, &new);
+        rewrites
+    }
 
+    /// `source` の本文を `target` の末尾に足し、`source` へのリンクを `target` に付け替える
+    /// （ノートコンポーザーの「結合」）。`source` のファイルは消さないので、呼び出し側でゴミ箱へ移す。
+    /// 書き換えたノートのパスを返す。
+    pub fn merge(&mut self, source: &str, target: &str) -> Result<Vec<String>> {
+        if source == target {
+            bail!("同じノートには結合できません");
+        }
+        let (Some(src), Some(dst)) = (self.notes.get(source), self.notes.get(target)) else {
+            bail!("ノートが見つかりません");
+        };
+        let target_text = dst.text.clone();
+        let source_text = src.text.clone();
+        let (source_path, target_path) = (source.to_string(), target.to_string());
+        let moved = move |p: &str| (p == source_path).then(|| target_path.clone());
+        let mut source_body = source_text;
+        let mut target_body = target_text;
         let mut updated = Vec::new();
-        for (path, text) in rewrites {
-            atomic_write(&self.root.join(&path), text.as_bytes())
-                .with_context(|| format!("failed to update links in {path}"))?;
+        let mut others = Vec::new();
+        for (orig, _, text) in self.retarget(&moved) {
+            if orig == source {
+                // 結合元の本文（相対パスのリンクは結合先の場所に合わせて書き換え済み）
+                source_body = text;
+            } else if orig == target {
+                target_body = text;
+            } else {
+                others.push((orig, text));
+            }
+        }
+        // 結合元の frontmatter は、本文の途中に入らないよう外す
+        if let Some(fm) = crate::props::block(&source_body) {
+            source_body = source_body[fm.end..]
+                .trim_start_matches(['\n', '\r'])
+                .to_string();
+        }
+        let mut merged = target_body.trim_end().to_string();
+        if !merged.is_empty() {
+            merged.push_str("\n\n");
+        }
+        merged.push_str(&source_body);
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        self.write_note(target, &merged)?;
+        updated.push(target.to_string());
+        for (path, text) in others {
+            self.write_note(&path, &text)?;
             updated.push(path);
         }
-        self.rescan();
         Ok(updated)
     }
 
@@ -1338,6 +1401,43 @@ mod tests {
         fs::remove_file(d.path().join("a.md")).unwrap();
         assert!(v.reload("a.md"));
         assert!(v.note("a.md").is_none());
+    }
+
+    #[test]
+    fn merge_moves_text_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, t: &str| {
+            let abs = dir.path().join(p);
+            fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            fs::write(abs, t).unwrap();
+        };
+        w(
+            "a/src.md",
+            "---\ntags: [x]\n---\n# 元\n画像 ![](pic.png) と [[target]] と [[src]]\n",
+        );
+        w("a/pic.png", "png");
+        w("b/target.md", "# 先\n本文\n");
+        w(
+            "other.md",
+            "[[src]] / [[src|別名]] / [[src#元]] / [md](a/src.md)\n",
+        );
+        let mut v = Vault::open(dir.path()).unwrap();
+        let updated = v.merge("a/src.md", "b/target.md").unwrap();
+        assert_eq!(updated, ["b/target.md", "other.md"]);
+        let target = fs::read_to_string(dir.path().join("b/target.md")).unwrap();
+        // 結合元の frontmatter は外し、相対パスのリンクは結合先の場所から直す
+        assert_eq!(
+            target,
+            "# 先\n本文\n\n# 元\n画像 ![](../a/pic.png) と [[target]] と [[target]]\n"
+        );
+        let other = fs::read_to_string(dir.path().join("other.md")).unwrap();
+        assert_eq!(
+            other,
+            "[[target]] / [[target|別名]] / [[target#元]] / [md](b/target.md)\n"
+        );
+        // 結合元のファイルは呼び出し側で消す
+        assert!(dir.path().join("a/src.md").exists());
+        assert!(v.merge("b/target.md", "b/target.md").is_err());
     }
 
     #[test]
