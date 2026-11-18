@@ -2779,6 +2779,15 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // 右端に設定を開くボタン（コマンドパレットをオフにしても開けるように）
+                if ui
+                    .add(egui::Button::new("設定").frame(false))
+                    .on_hover_text("設定を開く (Ctrl+,)")
+                    .clicked()
+                {
+                    git_cmd = Some(Command::Settings);
+                }
+                ui.separator();
                 if let Some(tab) = self.tabs.get(self.active) {
                     ui.weak(if tab.dirty {
                         "● 未保存"
