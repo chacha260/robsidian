@@ -123,7 +123,7 @@ impl Finished {
     }
 }
 
-fn shell(run: &str) -> Command {
+pub(crate) fn shell(run: &str) -> Command {
     if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(run);

@@ -1,0 +1,10 @@
+# いちばん小さいプラグインの例（シェル。macOS / Linux）
+# JSON を返さなければ、出力した文字がそのまま通知になる
+name = "単語数"
+description = "選択範囲の単語数を通知する"
+run = "sh main.sh"
+
+[[command]]
+id = "count"
+name = "選択範囲の単語数"
+input = "selection"

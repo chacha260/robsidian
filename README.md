@@ -214,6 +214,65 @@ output = "insert"
   許可はvaultの外（アプリの設定）に記録します。ファイルが書き換わったら、もう一度確認します。
 - `rob run <名前>` でシェルからも実行できます（標準入力が入力になります）。
 
+### プラグイン（自分で作る）
+
+`.robsidian/plugins/<id>/plugin.toml` を置くと、プラグインとして読み込みます（`<id>` はフォルダ名。英数字・`-`・`_`）。
+プラグインはどの言語でも書けます。呼ぶたびに `run` のコマンドを起動し、標準入力に JSON を1つ渡して、標準出力から JSON を1つ受け取ります。
+プラグインは中身（Markdown や「してほしいこと」）を返すだけで、描くのとファイルを書き換えるのは Robsidian が行います
+（書き換えにもローカル履歴が効き、Ctrl+Z で戻せます）。例は [`examples/plugins/`](examples/plugins/) にあります。
+
+```toml
+name = "サンプル"
+version = "0.1.0"
+description = "説明"
+run = "python3 main.py"     # プラグインのフォルダで sh -c（Windows は cmd /C）として実行する
+
+[[command]]                 # コマンドパレットとショートカットに出る
+id = "upper"
+name = "選択範囲を大文字に"
+input = "selection"         # none / selection / note（リクエストに入れるもの）
+key = "ctrl+alt+u"
+
+[[codeblock]]               # ```csv のブロックを、プラグインが返した Markdown で描く（プレビュー）
+lang = "csv"
+
+[[panel]]                   # 右サイドバーの欄（ノートを開いたとき・保存したときに作り直す）
+id = "stats"
+title = "ノートの統計"
+
+[[event]]                   # save（保存したとき）/ open（開いたとき）
+on = "save"
+```
+
+標準入力に渡すリクエスト:
+
+```json
+{"api": 1, "kind": "command", "id": "upper", "vault": "/path/to/vault",
+ "note": {"path": "a.md", "text": "本文（note・event・panel のとき）", "selection": "選択範囲", "line": 3},
+ "code": "コードブロックの中身（codeblock のとき）"}
+```
+
+標準出力に返すレスポンス（JSON でなければ、出力そのものを通知、またはコードブロック・パネルの Markdown として扱います）:
+
+```json
+{"markdown": "コードブロック・パネルの中身",
+ "actions": [
+   {"type": "notice", "text": "通知"},
+   {"type": "replace_selection", "text": "選択範囲を置き換える（コマンドだけ）"},
+   {"type": "insert", "text": "カーソル位置に挿入する（コマンドだけ）"},
+   {"type": "replace_note", "text": "開いているノートの本文を置き換える"},
+   {"type": "open", "path": "ノートを開く"},
+   {"type": "write_note", "path": "b.md", "text": "ほかのノートを書く・作る"}]}
+```
+
+- **許可**：初めて使うときと `plugin.toml` が変わったときに、中身を見せて許可を求めます（設定の「プラグイン」でも許可・取り消し・オン/オフができます）。
+  プラグインはあなたの権限でコマンドを実行するので、他人の vault のプラグインは、フォルダの中身を確かめてから許可してください
+- 実行は別スレッドで行い、30秒で打ち切ります。頼んだあとにノートを編集していたら、置き換えは反映しません
+- プラグインが書き換えた内容を保存したときは、保存のイベントをもう一度は呼びません（無限に続かないように）
+- 環境変数 `ROB_VAULT` `ROB_NOTE` `ROB_PLUGIN_DIR` も渡します
+- 画面なしで試すには `rob plugin list` と `rob plugin run <id> <command|codeblock|panel|event> <名前> [--note ノート] [--text 中身]`
+- 設計と今後（常駐するプラグイン、WASM）は [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズE
+
 ### Obsidian のコアプラグインに相当する機能
 
 画面の左端の「リボン」に、有効なコアプラグインのアイコンが並びます（マウスを乗せると名前が出ます）。
@@ -415,6 +474,7 @@ rob daily --append "- 14:00 打ち合わせ"
 | `rob tags [tag]` | タグ一覧 / そのタグを持つノート |
 | `rob tasks [条件] [--all \| --done]` | タスクの一覧（`path:行: [ ] 本文  📅 期日`。優先度・繰り返し・完了日も） |
 | `rob query <条件>` | 条件に合うノートやタスク（クエリブロックと同じ書き方） |
+| `rob plugin list` / `rob plugin run …` | プラグインの一覧と、画面なしでの実行（プラグインを作るときの確かめに） |
 | `rob orphans` / `rob unresolved` | 孤立ノート / リンク切れ |
 | `rob new <name> [-c 本文 \| -c -] [-t テンプレート]` | ノート作成（`-` で標準入力、`-t` でテンプレートを展開） |
 | `rob templates` | テンプレートの一覧 |

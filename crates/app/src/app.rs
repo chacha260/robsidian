@@ -322,6 +322,8 @@ enum Action {
     Slash(String, usize),
     /// 音声を再生する / 止める（vault内のパス）
     PlayAudio(String),
+    /// プラグインのコマンドを実行する（プラグインの番号, コマンドの番号）
+    RunPlugin(usize, usize),
     /// 新しいキャンバス・ベースを作って開く
     NewCanvas,
     NewBase,
@@ -396,6 +398,10 @@ struct Tab {
     outline: Option<(u64, Vec<Heading>)>,
     /// 文字数・単語数（本文の版ごとに数え直す）
     counts: std::cell::Cell<Option<(u64, robsidian_core::text::Counts)>>,
+    /// 保存した回数（プラグインのパネルを作り直す目安）
+    saves: u64,
+    /// プラグインが本文を書き換えた直後の版（その内容の保存では、保存のイベントを呼ばない）
+    plugin_edit: Option<u64>,
 }
 
 impl Tab {
@@ -419,6 +425,8 @@ impl Tab {
             preview: None,
             outline: None,
             counts: std::cell::Cell::new(None),
+            saves: 0,
+            plugin_edit: None,
         }
     }
 
@@ -460,6 +468,8 @@ enum PaletteItem {
     Cmd(usize),
     /// ユーザーコマンド（`.robsidian/commands.toml`）
     User(usize),
+    /// プラグインのコマンド（プラグインの番号, コマンドの番号）
+    Plugin(usize, usize),
     /// ワークスペースの名前
     Layout(String),
 }
@@ -640,6 +650,14 @@ pub struct App {
     /// 実行の許可を待っているユーザーコマンド
     /// (実行を頼まれたコマンド, 許可を求めている設定ファイルの本文)
     trust_prompt: Option<(external::Request, String)>,
+    /// プラグイン（フェーズE1）
+    plugins: crate::plugins::Plugins,
+    /// プラグインの許可を求めている（プラグインの id, 許可したら実行するコマンド）
+    plugin_trust: Option<(String, Option<(usize, usize)>)>,
+    /// これから呼ぶプラグインのイベント（ノート, 種類）
+    plugin_events: Vec<(String, robsidian_core::plugin::EventKind)>,
+    /// プラグインのパネルを描く Markdown のキャッシュ
+    plugin_md: CommonMarkCache,
     git: external::GitState,
     /// コミットメッセージの入力中
     commit_message: Option<String>,
@@ -720,6 +738,10 @@ impl App {
             user_cmds: Default::default(),
             jobs: Vec::new(),
             trust_prompt: None,
+            plugins: Default::default(),
+            plugin_trust: None,
+            plugin_events: Vec::new(),
+            plugin_md: CommonMarkCache::default(),
             git: Default::default(),
             commit_message: None,
             theme: Default::default(),
@@ -799,6 +821,9 @@ impl App {
                 self.user_cmds = Default::default();
                 self.jobs.clear();
                 self.trust_prompt = None;
+                self.plugins = Default::default();
+                self.plugin_trust = None;
+                self.plugin_events.clear();
                 self.git = external::GitState::detect(vault.root());
                 self.commit_message = None;
                 self.theme.reset();
@@ -933,6 +958,12 @@ impl App {
                 tab.dirty = false;
                 tab.edited_at = None;
                 tab.base.clone_from(&tab.text);
+                tab.saves += 1;
+                // プラグインが書き換えた内容の保存では、保存のイベントをもう一度は呼ばない（無限に続かないように）
+                if tab.plugin_edit != Some(tab.version) {
+                    self.plugin_events
+                        .push((tab.path.clone(), robsidian_core::plugin::EventKind::Save));
+                }
                 self.generation += 1;
                 self.git.mark_stale();
             }
@@ -995,6 +1026,8 @@ impl App {
         self.tabs[idx].focus = true;
         self.show_graph = false;
         self.completion = None;
+        self.plugin_events
+            .push((path.to_string(), robsidian_core::plugin::EventKind::Open));
     }
 
     /// 別のノートへ移る前に、いまの場所を「戻る」の履歴に積む。
@@ -1713,6 +1746,7 @@ impl App {
         if let Some(err) = self.user_cmds.refresh(&root) {
             self.toast(err);
         }
+        self.poll_plugins(&root, ctx);
         if let Some(err) = self.theme.refresh(&root) {
             self.toast(err);
         }
@@ -1764,6 +1798,287 @@ impl App {
         self.jobs.push(external::Job::spawn(req, root, ctx));
     }
 
+    // ---- プラグイン（フェーズE1） ----
+
+    /// プラグインのコマンドを実行する。未許可なら、先に許可を求める。
+    fn run_plugin(&mut self, pi: usize, ci: usize, ctx: &egui::Context) {
+        use robsidian_core::plugin::{Kind, NoteInfo, Request};
+        let Some(root) = self.vault.as_ref().map(|v| v.root().to_path_buf()) else {
+            return;
+        };
+        let Some(p) = self.plugins.list.get(pi).cloned() else {
+            return;
+        };
+        let Some(cmd) = p.manifest.command.get(ci).cloned() else {
+            return;
+        };
+        match crate::plugins::usable(&self.cfg, &root, &p) {
+            crate::plugins::Usable::Disabled => {
+                return self.toast(format!(
+                    "プラグイン「{}」は設定でオフになっています",
+                    p.manifest.name
+                ));
+            }
+            crate::plugins::Usable::Untrusted => {
+                self.plugin_trust = Some((p.id.clone(), Some((pi, ci))));
+                return;
+            }
+            crate::plugins::Usable::Yes => {}
+        }
+        if cmd.input != Input::None && self.tabs.get(self.active).is_none() {
+            return self.toast("ノートを開いてから実行してください");
+        }
+        // プラグインがファイルを読んでも編集中の内容が見えるよう、先に保存する
+        self.save_tab(self.active);
+        let mut req = Request::new(Kind::Command, &cmd.id, &root);
+        let origin = match self.tabs.get(self.active) {
+            Some(tab) => {
+                let sel = selection_bytes(ctx, tab);
+                req.note = Some(NoteInfo {
+                    path: tab.path.clone(),
+                    text: (cmd.input == Input::Note).then(|| tab.text.clone()),
+                    selection: (cmd.input == Input::Selection)
+                        .then(|| tab.text[sel.clone()].to_string()),
+                    line: Some(tab.text[..sel.start].matches('\n').count() + 1),
+                });
+                crate::plugins::Origin::Command {
+                    path: Some(tab.path.clone()),
+                    version: tab.version,
+                    range: sel,
+                }
+            }
+            None => crate::plugins::Origin::Command {
+                path: None,
+                version: 0,
+                range: 0..0,
+            },
+        };
+        self.plugins.spawn(&p, req, origin, ctx);
+    }
+
+    /// プラグインの一覧の読み直し、イベントとパネルの実行、終わった実行の結果の反映
+    fn poll_plugins(&mut self, root: &std::path::Path, ctx: &egui::Context) {
+        use crate::plugins::{Origin, Output, Usable};
+        use robsidian_core::plugin::{Kind, NoteInfo, Request};
+        if self.plugins.refresh(root) {
+            for (id, why) in self.plugins.broken.clone() {
+                self.toast(format!("プラグイン「{id}」: {why}"));
+            }
+            for tab in &mut self.tabs {
+                tab.preview = None;
+            }
+        }
+        // イベント（保存・開いたとき）
+        for (path, kind) in std::mem::take(&mut self.plugin_events) {
+            let Some(tab) = self.tabs.iter().find(|t| t.path == path) else {
+                continue;
+            };
+            let (text, version) = (tab.text.clone(), tab.version);
+            for p in self.plugins.list.clone() {
+                if !p.listens(kind) || crate::plugins::usable(&self.cfg, root, &p) != Usable::Yes {
+                    continue;
+                }
+                let mut req = Request::new(Kind::Event, kind.name(), root);
+                req.note = Some(NoteInfo {
+                    path: path.clone(),
+                    text: Some(text.clone()),
+                    selection: None,
+                    line: None,
+                });
+                let origin = Origin::Event {
+                    path: path.clone(),
+                    version,
+                };
+                self.plugins.spawn(&p, req, origin, ctx);
+            }
+        }
+        // パネル: 開いているノートが変わったか、保存したら作り直す
+        if self.cfg.show_right {
+            if let Some(tab) = self.tabs.get(self.active) {
+                let (path, saves, text) = (tab.path.clone(), tab.saves, tab.text.clone());
+                for p in self.plugins.list.clone() {
+                    if crate::plugins::usable(&self.cfg, root, &p) != Usable::Yes {
+                        continue;
+                    }
+                    for panel in &p.manifest.panel {
+                        let key = (p.id.clone(), panel.id.clone());
+                        let fresh = self
+                            .plugins
+                            .panels
+                            .get(&key)
+                            .is_some_and(|x| x.note == path && x.saves == saves);
+                        if fresh {
+                            continue;
+                        }
+                        self.plugins.panels.insert(
+                            key.clone(),
+                            crate::plugins::Panel {
+                                note: path.clone(),
+                                saves,
+                                output: Output::Running,
+                            },
+                        );
+                        let mut req = Request::new(Kind::Panel, &panel.id, root);
+                        req.note = Some(NoteInfo {
+                            path: path.clone(),
+                            text: Some(text.clone()),
+                            selection: None,
+                            line: None,
+                        });
+                        let origin = Origin::Panel {
+                            key,
+                            note: path.clone(),
+                            saves,
+                        };
+                        self.plugins.spawn(&p, req, origin, ctx);
+                    }
+                }
+            }
+        }
+        let mut blocks_done = false;
+        for (job, result) in self.plugins.poll() {
+            match &job.origin {
+                Origin::Block(_) => blocks_done = true,
+                Origin::Panel { .. } => {}
+                _ => self.finish_plugin(job, result, ctx),
+            }
+        }
+        if blocks_done {
+            for tab in &mut self.tabs {
+                tab.preview = None;
+            }
+        }
+    }
+
+    /// プラグインのコマンド・イベントの結果（してほしいこと）を反映する
+    fn finish_plugin(
+        &mut self,
+        job: crate::plugins::Job,
+        result: anyhow::Result<robsidian_core::plugin::Response>,
+        ctx: &egui::Context,
+    ) {
+        use crate::plugins::Origin;
+        use robsidian_core::plugin::Action as P;
+        let res = match result {
+            Ok(r) => r,
+            Err(e) => return self.toast(format!("{e:#}")),
+        };
+        let name = job.name.clone();
+        // 書き換える対象のノートと、頼んだときの版
+        let (path, version, range) = match &job.origin {
+            Origin::Command {
+                path,
+                version,
+                range,
+            } => (path.clone(), *version, range.clone()),
+            Origin::Event { path, version } => (Some(path.clone()), *version, 0..0),
+            _ => (None, 0, 0..0),
+        };
+        let is_command = matches!(job.origin, Origin::Command { .. });
+        for action in res.actions {
+            match action {
+                P::Notice { text } => {
+                    let mut short: String = text.chars().take(500).collect();
+                    if short.len() < text.len() {
+                        short.push('…');
+                    }
+                    self.toast(short);
+                }
+                P::Open { path } => {
+                    let found = self
+                        .vault
+                        .as_ref()
+                        .and_then(|v| v.resolve(&path, "").map(str::to_string));
+                    match found {
+                        Some(p) => self.open_note(&p, None),
+                        None => self.toast(format!("「{name}」: ノートが見つかりません: {path}")),
+                    }
+                }
+                P::WriteNote { path: target, text } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == target) {
+                        // 開いているノートは、タブの本文を置き換える（Ctrl+Z で戻せる）
+                        let cursor = tab.cursor.min(text.len());
+                        let cursor = (0..=cursor)
+                            .rev()
+                            .find(|&c| text.is_char_boundary(c))
+                            .unwrap_or(0);
+                        replace_text_undoable(ctx, tab, text, cursor..cursor);
+                        tab.plugin_edit = Some(tab.version);
+                        continue;
+                    }
+                    let Some(vault) = self.vault.as_mut() else {
+                        continue;
+                    };
+                    match vault.write_note(&target, &text) {
+                        Ok(()) => self.generation += 1,
+                        Err(e) => self.toast(format!("「{name}」: 書けません: {e:#}")),
+                    }
+                }
+                P::ReplaceNote { text } => {
+                    self.apply_plugin_edit(&name, path.as_deref(), version, None, text, ctx);
+                }
+                P::ReplaceSelection { text } if is_command => {
+                    let r = range.clone();
+                    self.apply_plugin_edit(&name, path.as_deref(), version, Some(r), text, ctx);
+                }
+                P::Insert { text } if is_command => {
+                    let r = range.end..range.end;
+                    self.apply_plugin_edit(&name, path.as_deref(), version, Some(r), text, ctx);
+                }
+                P::ReplaceSelection { .. } | P::Insert { .. } => {
+                    self.toast(format!(
+                        "「{name}」: 選択範囲の置き換え・挿入はコマンドでだけ使えます"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// プラグインによる本文の書き換え。`range` が None ならノート全体、Some ならその範囲を置き換える。
+    /// 頼んだときから本文が変わっていたら反映しない。Ctrl+Z で戻せる
+    fn apply_plugin_edit(
+        &mut self,
+        name: &str,
+        path: Option<&str>,
+        version: u64,
+        range: Option<std::ops::Range<usize>>,
+        text: String,
+        ctx: &egui::Context,
+    ) {
+        let Some(path) = path else {
+            return self.toast(format!("「{name}」: 書き換えるノートがありません"));
+        };
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) else {
+            return self.toast(format!(
+                "ノートが閉じられたので「{name}」の結果を反映しませんでした"
+            ));
+        };
+        if tab.version != version {
+            return self.toast(format!(
+                "実行中にノートが変わったので「{name}」の結果を反映しませんでした"
+            ));
+        }
+        let (new, select) = match range {
+            None => {
+                let cursor = tab.cursor.min(text.len());
+                let cursor = (0..=cursor)
+                    .rev()
+                    .find(|&c| text.is_char_boundary(c))
+                    .unwrap_or(0);
+                (text, cursor..cursor)
+            }
+            Some(r) if r.end <= tab.text.len() => {
+                let mut body = tab.text.clone();
+                body.replace_range(r.clone(), &text);
+                let end = r.start + text.len();
+                (body, r.start..end)
+            }
+            Some(_) => return,
+        };
+        replace_text_undoable(ctx, tab, new, select);
+        tab.plugin_edit = Some(tab.version);
+        tab.focus = true;
+    }
     /// 実行に使う入力（選択範囲・本文）と環境を、いまのエディタの状態から決める。
     fn prepare_user(&mut self, cmd: UserCommand, ctx: &egui::Context) -> Option<external::Request> {
         let uses_note =
@@ -1872,6 +2187,28 @@ impl App {
         let Some(root) = self.vault.as_ref().map(|v| v.root().to_path_buf()) else {
             return;
         };
+        if let Some((id, pending)) = self.plugin_trust.clone() {
+            match self.plugins.find(&id).cloned() {
+                None => self.plugin_trust = None,
+                Some(p) => match crate::plugins::trust_ui(ctx, &p) {
+                    Some(crate::plugins::TrustOutcome::Allow) => {
+                        self.plugin_trust = None;
+                        let key = crate::plugins::trust_key(&root, &p.id);
+                        self.cfg.trusted_commands.insert(key, p.text.clone());
+                        self.cfg.save();
+                        // 許可を待っていたコードブロックを描き直す
+                        for tab in &mut self.tabs {
+                            tab.preview = None;
+                        }
+                        if let Some((pi, ci)) = pending {
+                            self.run_plugin(pi, ci, ctx);
+                        }
+                    }
+                    Some(crate::plugins::TrustOutcome::Cancel) => self.plugin_trust = None,
+                    None => {}
+                },
+            }
+        }
         if let Some((_, text)) = &self.trust_prompt {
             match external::trust_ui(ctx, &root, text) {
                 Some(TrustOutcome::Allow) => {
@@ -2437,7 +2774,11 @@ impl App {
             self.vault.as_ref(),
             note,
             self.font_in_use.as_deref(),
+            &self.plugins,
         );
+        if let Some(id) = &out.trust_plugin {
+            self.plugin_trust = Some((id.clone(), None));
+        }
         if out.font {
             let path =
                 (!self.cfg.font_path.is_empty()).then(|| std::path::Path::new(&self.cfg.font_path));
@@ -2713,6 +3054,7 @@ impl App {
             Action::OpenExternal(path) => self.open_external(&path, ctx),
             Action::FollowLink { target, from } => self.follow_link(&target, &from, ctx),
             Action::PlayAudio(path) => self.toggle_audio(&path),
+            Action::RunPlugin(pi, ci) => self.run_plugin(pi, ci, ctx),
             Action::NewCanvas => {
                 let body = robsidian_core::canvas::to_json(&Default::default());
                 self.create_file("無題のキャンバス", "canvas", &body, ctx);
@@ -2782,6 +3124,11 @@ impl App {
                 .is_some_and(|t| ctx.memory(|m| m.has_focus(editor_id(&t.path))));
         ctx.input_mut(|input| {
             // ユーザーコマンドを先に見る（修飾キーまで完全一致。組み込みより具体的な指定なので優先する）
+            for &(pi, ci, key) in &self.plugins.keys {
+                if external::consume_exact(input, key) {
+                    actions.push(Action::RunPlugin(pi, ci));
+                }
+            }
             for (i, key) in self.user_cmds.keys.iter().enumerate() {
                 if key.is_some_and(|k| external::consume_exact(input, k)) {
                     actions.push(Action::RunUser(i));
@@ -2917,6 +3264,9 @@ impl App {
             }
             for job in &self.jobs {
                 ui.weak(format!("「{}」を実行中…", job.name));
+            }
+            for name in self.plugins.running() {
+                ui.weak(format!("プラグイン「{name}」を実行中…"));
             }
             if let Some(p) = &self.player {
                 let label = format!("▶ {}  {}", file_name(&p.path), p.progress_label());
@@ -3252,6 +3602,31 @@ impl App {
         let related_cache = &mut self.related;
         let generation = self.generation;
         let features = self.cfg.features;
+        // プラグインのパネル（このノートの中身があるもの）: (プラグイン名, 題, 中身)
+        let plugin_panels: Vec<(String, String, crate::plugins::Output)> = self
+            .plugins
+            .list
+            .iter()
+            .filter(|p| {
+                crate::plugins::usable(&self.cfg, vault.root(), p) == crate::plugins::Usable::Yes
+            })
+            .flat_map(|p| {
+                p.manifest.panel.iter().map(move |panel| {
+                    let key = (p.id.clone(), panel.id.clone());
+                    (p.manifest.name.clone(), panel.title.clone(), key)
+                })
+            })
+            .map(|(name, title, key)| {
+                let output = self
+                    .plugins
+                    .panels
+                    .get(&key)
+                    .filter(|x| x.note == tab.path)
+                    .map_or(crate::plugins::Output::Running, |x| x.output.clone());
+                (name, title, output)
+            })
+            .collect();
+        let plugin_md = &mut self.plugin_md;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if features.backlinks {
@@ -3478,6 +3853,33 @@ impl App {
                             }
                         }
                     });
+            }
+
+            // プラグインのパネル
+            for (name, title, output) in &plugin_panels {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(RichText::new(title).strong())
+                    .id_salt(("plugin-panel", name, title))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        match output {
+                            crate::plugins::Output::Running => {
+                                ui.weak("作っています…");
+                            }
+                            crate::plugins::Output::Failed(e) => {
+                                ui.colored_label(ui.visuals().error_fg_color, e);
+                            }
+                            crate::plugins::Output::Done(md) if md.trim().is_empty() => {
+                                ui.weak("（空）");
+                            }
+                            crate::plugins::Output::Done(md) => {
+                                CommonMarkViewer::new().show(ui, plugin_md, md);
+                            }
+                        }
+                    })
+                    .header_response
+                    .on_hover_text(format!("プラグイン「{name}」"));
             }
 
             if !features.outline {
@@ -4945,6 +5347,7 @@ impl App {
             cfg,
             mermaid,
             hover_cache,
+            plugins,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -4957,6 +5360,8 @@ impl App {
         {
             let src = preview::to_preview(&tab.text, &tab.path, vault);
             let src = mermaid_images(&src, vault.root(), mermaid, cfg, ui.ctx());
+            // プラグインが描くコードブロック（結果が来たら、もう一度ここを通る）
+            let src = plugins.render_blocks(&src, cfg, vault.root(), &tab.path, ui.ctx());
             tab.preview = Some((tab.version, *generation, src));
         }
         let Some((_, _, src)) = &tab.preview else {
@@ -5099,6 +5504,14 @@ impl App {
                 let user = self.user_cmds.list.iter().enumerate();
                 let user = user.filter(|(_, c)| c.name.to_lowercase().contains(&q));
                 p.items.extend(user.map(|(i, _)| PaletteItem::User(i)));
+                for (pi, plugin) in self.plugins.list.iter().enumerate() {
+                    for (ci, c) in plugin.manifest.command.iter().enumerate() {
+                        let label = format!("{} {}", plugin.manifest.name, c.name).to_lowercase();
+                        if q.split_whitespace().all(|w| label.contains(w)) {
+                            p.items.push(PaletteItem::Plugin(pi, ci));
+                        }
+                    }
+                }
             } else if let Some(vault) = &self.vault {
                 let mut notes = search::fuzzy(vault, q, 30);
                 if q.is_empty() {
@@ -5217,6 +5630,25 @@ impl App {
                                     })
                                     .inner
                                 }
+                                PaletteItem::Plugin(pi, ci) => {
+                                    let plugin = &self.plugins.list[*pi];
+                                    let cmd = &plugin.manifest.command[*ci];
+                                    let key = self
+                                        .plugins
+                                        .keys
+                                        .iter()
+                                        .find(|(a, b, _)| a == pi && b == ci)
+                                        .map(|(_, _, k)| *k);
+                                    ui.horizontal(|ui| {
+                                        let r = ui.selectable_label(selected, &cmd.name);
+                                        if let Some(k) = key {
+                                            ui.weak(ui.ctx().format_shortcut(&k));
+                                        }
+                                        ui.weak(format!("プラグイン「{}」", plugin.manifest.name));
+                                        r
+                                    })
+                                    .inner
+                                }
                                 PaletteItem::User(ui_idx) => {
                                     let cmd = &self.user_cmds.list[*ui_idx];
                                     let key = self.user_cmds.keys[*ui_idx];
@@ -5302,6 +5734,10 @@ impl App {
                 PaletteItem::User(i) => {
                     self.remove_slash(p.slash.as_ref());
                     actions.push(Action::RunUser(*i));
+                }
+                PaletteItem::Plugin(pi, ci) => {
+                    self.remove_slash(p.slash.as_ref());
+                    actions.push(Action::RunPlugin(*pi, *ci));
                 }
             }
         } else if close {
@@ -6227,8 +6663,16 @@ impl eframe::App for App {
         }
         // 右サイドバーに出すものが1つも無ければ（コアプラグインをオフにした）、出さない
         let f = self.cfg.features;
-        let right_has_content =
-            f.backlinks || f.related || f.outgoing_links || f.footnotes || f.outline;
+        let right_has_content = f.backlinks
+            || f.related
+            || f.outgoing_links
+            || f.footnotes
+            || f.outline
+            || self
+                .plugins
+                .list
+                .iter()
+                .any(|p| !p.manifest.panel.is_empty());
         if self.vault.is_some()
             && self.cfg.show_right
             && right_has_content

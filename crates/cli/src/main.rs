@@ -10,7 +10,7 @@ mod serve;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use robsidian_core::{git, related, search, usercmd, Vault};
+use robsidian_core::{git, plugin, related, search, usercmd, Vault};
 use serde_json::json;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -138,6 +138,11 @@ enum Cmd {
         #[arg(long)]
         view: Option<String>,
     },
+    /// プラグイン（.robsidian/plugins）の一覧と、画面なしでの実行（プラグインを作るときの確かめに）
+    Plugin {
+        #[command(subcommand)]
+        action: PluginCmd,
+    },
     /// ユーザーコマンド（.robsidian/commands.toml）を実行する。名前を省くと一覧
     Run {
         name: Option<String>,
@@ -154,6 +159,27 @@ enum Cmd {
         /// コミットメッセージ（省略時は日時）
         #[arg(short, long)]
         message: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// プラグインの一覧（読めなかったものは理由も）
+    List,
+    /// プラグインを1回呼び、返した JSON をそのまま出す
+    Run {
+        /// プラグインの id（フォルダ名）
+        plugin: String,
+        /// command / codeblock / panel / event
+        kind: String,
+        /// command・panel の id、codeblock の言語、event の save / open
+        id: String,
+        /// このノートについて呼ぶ（本文もリクエストに入れる）
+        #[arg(short, long)]
+        note: Option<String>,
+        /// コードブロックの中身や選択範囲（省くと、標準入力がつながっていればそこから読む）
+        #[arg(long)]
+        text: Option<String>,
     },
 }
 
@@ -565,6 +591,87 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Mcp => {
             out.w.flush()?;
             return mcp::run(vault);
+        }
+        Cmd::Plugin { action } => {
+            let (plugins, broken) = plugin::discover(vault.root());
+            match action {
+                PluginCmd::List => {
+                    if out.json {
+                        let ok: Vec<_> = plugins
+                            .iter()
+                            .map(|p| {
+                                json!({
+                                    "id": p.id,
+                                    "name": p.manifest.name,
+                                    "version": p.manifest.version,
+                                    "commands": p.manifest.command.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                                    "codeblocks": p.manifest.codeblock.iter().map(|c| &c.lang).collect::<Vec<_>>(),
+                                    "panels": p.manifest.panel.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                                    "events": p.manifest.event.iter().map(|e| e.on.name()).collect::<Vec<_>>(),
+                                })
+                            })
+                            .collect();
+                        let bad: Vec<_> = broken
+                            .iter()
+                            .map(|(id, why)| json!({"id": id, "error": why}))
+                            .collect();
+                        out.value(&json!({"plugins": ok, "errors": bad}))?;
+                    } else {
+                        let mut lines = Vec::new();
+                        for p in &plugins {
+                            let m = &p.manifest;
+                            let mut parts = Vec::new();
+                            parts.extend(m.command.iter().map(|c| format!("command:{}", c.id)));
+                            parts.extend(
+                                m.codeblock.iter().map(|c| format!("codeblock:{}", c.lang)),
+                            );
+                            parts.extend(m.panel.iter().map(|c| format!("panel:{}", c.id)));
+                            parts.extend(m.event.iter().map(|e| format!("event:{}", e.on.name())));
+                            lines.push(format!("{}\t{}\t{}", p.id, m.name, parts.join(" ")));
+                        }
+                        for (id, why) in &broken {
+                            lines.push(format!("{id}\t（読めません）{why}"));
+                        }
+                        out.lines(lines)?;
+                    }
+                }
+                PluginCmd::Run {
+                    plugin: id,
+                    kind,
+                    id: what,
+                    note,
+                    text,
+                } => {
+                    let Some(p) = plugins.iter().find(|p| p.id == id) else {
+                        bail!("プラグインが見つかりません: {id}");
+                    };
+                    let Some(kind) = plugin::Kind::parse(&kind) else {
+                        bail!("kind は command / codeblock / panel / event のどれかです: {kind}");
+                    };
+                    // 標準入力を使うのはコードブロック（中身）とコマンド（選択範囲）だけ
+                    let reads_stdin =
+                        matches!(kind, plugin::Kind::Codeblock | plugin::Kind::Command);
+                    let text = match text {
+                        Some(t) => Some(t),
+                        None if !reads_stdin || std::io::stdin().is_terminal() => None,
+                        None => Some(std::io::read_to_string(std::io::stdin())?),
+                    };
+                    let mut req = plugin::Request::new(kind, &what, vault.root());
+                    if let Some(n) = note.map(|n| note_arg(&vault, &n)).transpose()? {
+                        req.note = Some(plugin::NoteInfo {
+                            text: vault.note(&n).map(|x| x.text.clone()),
+                            path: n,
+                            selection: text.clone().filter(|_| kind == plugin::Kind::Command),
+                            line: None,
+                        });
+                    }
+                    if kind == plugin::Kind::Codeblock {
+                        req.code = text;
+                    }
+                    let res = plugin::execute(p, &req)?;
+                    out.value(&serde_json::to_value(&res)?)?;
+                }
+            }
         }
         Cmd::Run { name, note } => {
             let list = usercmd::load(vault.root())?
