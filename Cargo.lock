@@ -2743,6 +2743,7 @@ dependencies = [
  "cpal",
  "dirs",
  "eframe",
+ "egui",
  "egui-file-dialog",
  "egui_commonmark",
  "egui_extras",
