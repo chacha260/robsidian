@@ -4806,6 +4806,13 @@ fn tree_ui(
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // ホイールのスクロールを、egui がならして遅らせる前に、すぐ反映される形に直す
+        if !self.cfg.smooth_scroll {
+            crate::wheel::make_immediate(raw_input);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_watcher(&ctx);

@@ -52,6 +52,8 @@ pub struct Config {
     pub font_path: String,
     /// 本文を読みやすい幅に収め、中央に置く
     pub readable_width: bool,
+    /// マウスホイールのスクロールをなめらかにする（少し遅れて動く）。オフなら回した瞬間に動く
+    pub smooth_scroll: bool,
     pub max_width: f32,
     /// Enterでのリスト継続とTabでの字下げ
     pub smart_lists: bool,
@@ -90,6 +92,7 @@ impl Default for Config {
             font_size: 15.0,
             font_path: String::new(),
             readable_width: true,
+            smooth_scroll: false,
             max_width: 760.0,
             smart_lists: true,
             auto_pair: true,
