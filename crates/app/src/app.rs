@@ -3311,6 +3311,16 @@ impl App {
                 Some(Outcome::Close) => self.canvas_view = None,
                 None => {}
             }
+            // 編集した内容をファイルに書く
+            if let (Some(view), Some(vault)) = (self.canvas_view.as_mut(), self.vault.as_mut()) {
+                if let Some(json) = view.take_save() {
+                    match vault.write_file(&view.path, json.as_bytes()) {
+                        Ok(()) => view.saved(vault),
+                        Err(e) => actions
+                            .push(Action::Toast(format!("キャンバスを保存できません: {e:#}"))),
+                    }
+                }
+            }
             return;
         }
         if let (Some(view), Some(vault)) = (self.base_view.as_mut(), self.vault.as_ref()) {
