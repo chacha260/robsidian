@@ -529,6 +529,8 @@ pub struct App {
     commit_message: Option<String>,
     theme: crate::theme::ThemeFile,
     mermaid: crate::mermaid::Mermaid,
+    /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
+    callout_folds: HashMap<(String, usize), bool>,
     /// 関連ノート: (索引の世代, ノートのパス, 計算した時刻, 結果)
     related: Option<(u64, String, Instant, Vec<robsidian_core::related::Related>)>,
 }
@@ -596,6 +598,7 @@ impl App {
             theme: Default::default(),
             related: None,
             mermaid: Default::default(),
+            callout_folds: HashMap::new(),
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -2997,6 +3000,7 @@ impl App {
             find: find_bar,
             vim: vim_state,
             theme,
+            callout_folds,
             props_panel,
             ..
         } = self;
@@ -3330,6 +3334,9 @@ impl App {
                     );
                     Some(b.size())
                 };
+                let fold_path = tab.path.clone();
+                let callout_open =
+                    |line: usize| callout_folds.get(&(fold_path.clone(), line)).copied();
                 let options = editor::Options {
                     size,
                     colors: &colors,
@@ -3338,6 +3345,7 @@ impl App {
                     image: &image_size,
                     note_embed: &note_embed,
                     math: &math_size,
+                    callout_open: &callout_open,
                     hide_frontmatter: live,
                     marks,
                     current_mark,
@@ -3444,6 +3452,7 @@ impl App {
         };
         let mut behind = Vec::new();
         let mut toggle = None;
+        let mut fold_toggle = None;
         for deco in &tab.layout.decos {
             let (a, b) = (row(deco.chars.start), row(deco.chars.end));
             if b.bottom() < clip.top() || a.top() > clip.bottom() {
@@ -3569,6 +3578,7 @@ impl App {
                     color,
                     first,
                     label,
+                    fold,
                 } => {
                     let rect = egui::Rect::from_min_max(
                         egui::pos2(left - 8.0, a.top() - if *first { 3.0 } else { 0.0 }),
@@ -3590,6 +3600,47 @@ impl App {
                             egui::FontId::new(size, fonts::bold()),
                             *color,
                         );
+                    }
+                    // 折りたためるコールアウトは、右端の三角で開閉する（カーソルは動かさない）
+                    if let Some((line, open)) = fold {
+                        let c = egui::pos2(right - 6.0, a.center().y);
+                        let r = size * 0.32;
+                        let points = if *open {
+                            vec![
+                                c + egui::vec2(-r, -r * 0.5),
+                                c + egui::vec2(r, -r * 0.5),
+                                c + egui::vec2(0.0, r * 0.6),
+                            ]
+                        } else {
+                            vec![
+                                c + egui::vec2(-r * 0.5, -r),
+                                c + egui::vec2(-r * 0.5, r),
+                                c + egui::vec2(r * 0.6, 0.0),
+                            ]
+                        };
+                        painter.add(egui::Shape::convex_polygon(
+                            points,
+                            *color,
+                            egui::Stroke::NONE,
+                        ));
+                        let hit_rect =
+                            egui::Rect::from_center_size(c, egui::vec2(size * 1.4, size * 1.4));
+                        if clip.contains_rect(hit_rect) {
+                            let hit = ui.interact(
+                                hit_rect,
+                                id.with(("fold", *line)),
+                                egui::Sense::click(),
+                            );
+                            if hit.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if hit
+                                .on_hover_text(if *open { "折りたたむ" } else { "開く" })
+                                .clicked()
+                            {
+                                fold_toggle = Some((*line, !*open));
+                            }
+                        }
                     }
                 }
                 editor::DecoKind::NoteEmbed(target) => {
@@ -3672,6 +3723,11 @@ impl App {
             }
         }
         painter.set(background, egui::Shape::Vec(behind));
+        if let Some((line, open)) = fold_toggle {
+            callout_folds.insert((tab.path.clone(), line), open);
+            tab.layout_stale = true;
+            ctx.request_repaint();
+        }
 
         if block_cursor && output.response.response.has_focus() {
             // ノーマルモードではIMEを止める（日本語入力のままでもキーがコマンドとして届くように）
