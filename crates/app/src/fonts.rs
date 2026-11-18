@@ -67,6 +67,59 @@ pub fn bold() -> egui::FontFamily {
     egui::FontFamily::Name("bold".into())
 }
 
+/// フォントの縦の寸法（1em あたり）: (ascent, 行の高さ)。epaint と同じく skrifa の値を使う。
+fn vertical_metrics(data: &egui::FontData) -> Option<(f32, f32)> {
+    let bytes: &[u8] = data.font.as_ref().as_ref();
+    let font = skrifa::FontRef::from_index(bytes, data.index).ok()?;
+    use skrifa::MetadataProvider as _;
+    let m = font.metrics(
+        skrifa::instance::Size::unscaled(),
+        skrifa::instance::LocationRef::default(),
+    );
+    let em = f32::from(m.units_per_em).max(1.0);
+    Some((m.ascent / em, (m.ascent - m.descent + m.leading) / em))
+}
+
+/// 欧文フォントの後ろに足した日本語フォントのベースラインを、欧文にそろえる。
+///
+/// egui は代替フォントの文字を「そのフォントの ascent ＋ 行の高さの差の半分」の位置に置くので、
+/// ascent と descent の比率が違うフォントを混ぜると、日本語だけ上下にずれる。
+/// その差を `y_offset_factor` で打ち消す。先頭のフォントはファミリーごとに違うので、
+/// 日本語フォントはファミリーごとに別名で登録する（中身は共有されるので複製はしない）。
+fn align_fallbacks(fonts: &mut egui::FontDefinitions) {
+    let mut added = Vec::new();
+    for (family, names) in &mut fonts.families {
+        let Some(primary) = names.first().and_then(|n| fonts.font_data.get(n)) else {
+            continue;
+        };
+        let Some((pa, ph)) = vertical_metrics(primary) else {
+            continue;
+        };
+        for name in names.iter_mut().skip(1) {
+            if !name.starts_with("cjk") {
+                continue;
+            }
+            let Some(data) = fonts.font_data.get(name.as_str()) else {
+                continue;
+            };
+            let Some((fa, fh)) = vertical_metrics(data) else {
+                continue;
+            };
+            // 正なら下へずらす（欧文のベースラインのほうが下にある）
+            let shift = pa - (fa + 0.5 * (ph - fh));
+            if shift.abs() < 0.005 {
+                continue;
+            }
+            let mut tweaked = (**data).clone();
+            tweaked.tweak.y_offset_factor += shift;
+            let alias = format!("{name}@{family:?}");
+            added.push((alias.clone(), Arc::new(tweaked)));
+            *name = alias;
+        }
+    }
+    fonts.font_data.extend(added);
+}
+
 fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
     paths.iter().find_map(|p| std::fs::read(p).ok())
 }
@@ -129,6 +182,37 @@ pub fn install(ctx: &egui::Context, configured: Option<&Path>) -> Option<PathBuf
     }
     fonts.families.insert(bold(), bold_fonts);
     fonts.families.insert(math_italic(), italic_fonts);
+    align_fallbacks(&mut fonts);
     ctx.set_fonts(fonts);
     found.map(|(p, _)| p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_baselines_are_aligned_per_family() {
+        // 同梱の Hack を「日本語フォント」に見立てて、本文（Ubuntu）とコード（Hack）の両方に足す
+        let mut fonts = egui::FontDefinitions::default();
+        let hack = fonts.font_data["Hack"].clone();
+        fonts.font_data.insert("cjk".into(), hack);
+        for f in fonts.families.values_mut() {
+            f.push("cjk".into());
+        }
+        let (ua, uh) = vertical_metrics(&fonts.font_data["Ubuntu-Light"]).unwrap();
+        let (ha, hh) = vertical_metrics(&fonts.font_data["Hack"]).unwrap();
+        align_fallbacks(&mut fonts);
+
+        let prop = &fonts.families[&egui::FontFamily::Proportional];
+        let alias = prop.last().unwrap();
+        assert!(alias.starts_with("cjk@"), "{prop:?}");
+        let shift = fonts.font_data[alias].tweak.y_offset_factor;
+        assert!((shift - (ua - (ha + 0.5 * (uh - hh)))).abs() < 1e-6);
+        // 先頭が同じフォント（Hack）のファミリーでは、ずれが無いので別名を作らない
+        let mono = &fonts.families[&egui::FontFamily::Monospace];
+        assert_eq!(mono.last().unwrap(), "cjk");
+        // 元のフォントの設定は変えない
+        assert_eq!(fonts.font_data["cjk"].tweak.y_offset_factor, 0.0);
+    }
 }
