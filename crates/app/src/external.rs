@@ -232,23 +232,27 @@ pub fn trust_ui(ctx: &egui::Context, root: &Path, text: &str) -> Option<TrustOut
 
 // ---- git ----
 
+/// 数え直した結果: (未コミットの変更の件数, リモートとの差)
+type Counts = (usize, Option<git::Upstream>);
+
 /// gitの状態。vaultがリポジトリの中に無ければ何もしない。
 #[derive(Default)]
 pub struct GitState {
     pub repo: bool,
     /// コミットされていない変更の件数（数え終わるまで `None`）
     pub changes: Option<usize>,
+    /// 追跡しているリモートとの差（追跡先が無ければ `None`）
+    pub upstream: Option<git::Upstream>,
     /// 変更があったので数え直す
     stale: bool,
     last: Option<Instant>,
-    counting: Option<mpsc::Receiver<anyhow::Result<usize>>>,
-    committing: Option<mpsc::Receiver<anyhow::Result<Option<String>>>>,
+    counting: Option<mpsc::Receiver<anyhow::Result<Counts>>>,
+    /// 実行中の操作: (ステータスバーに出す名前, 結果)
+    busy: Option<(&'static str, mpsc::Receiver<anyhow::Result<String>>)>,
 }
 
 pub enum GitEvent {
-    /// 短いコミットID
-    Committed(String),
-    NothingToCommit,
+    Done(String),
     Failed(String),
 }
 
@@ -265,8 +269,9 @@ impl GitState {
         self.stale = true;
     }
 
-    pub fn committing(&self) -> bool {
-        self.committing.is_some()
+    /// 実行中の操作の名前（「コミット中」など）
+    pub fn busy(&self) -> Option<&'static str> {
+        self.busy.as_ref().map(|(label, _)| *label)
     }
 
     /// 数え直しの開始と、終わった処理の受け取り。
@@ -277,7 +282,13 @@ impl GitState {
         if let Some(rx) = &self.counting {
             match rx.try_recv() {
                 Ok(r) => {
-                    self.changes = r.ok();
+                    match r {
+                        Ok((changes, upstream)) => {
+                            self.changes = Some(changes);
+                            self.upstream = upstream;
+                        }
+                        Err(_) => self.changes = None,
+                    }
                     self.counting = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.counting = None,
@@ -285,26 +296,25 @@ impl GitState {
             }
         }
         let mut event = None;
-        if let Some(rx) = &self.committing {
+        if let Some((_, rx)) = &self.busy {
             let done = match rx.try_recv() {
                 Ok(r) => Some(r),
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err(anyhow::anyhow!("コミットが中断されました")))
+                    Some(Err(anyhow::anyhow!("gitの操作が中断されました")))
                 }
                 Err(mpsc::TryRecvError::Empty) => None,
             };
             if let Some(r) = done {
-                self.committing = None;
+                self.busy = None;
                 self.stale = true;
                 self.last = None;
                 event = Some(match r {
-                    Ok(Some(hash)) => GitEvent::Committed(hash),
-                    Ok(None) => GitEvent::NothingToCommit,
+                    Ok(msg) => GitEvent::Done(msg),
                     Err(e) => GitEvent::Failed(format!("{e:#}")),
                 });
             }
         }
-        if self.stale && self.counting.is_none() && self.committing.is_none() {
+        if self.stale && self.counting.is_none() && self.busy.is_none() {
             let wait = self
                 .last
                 .map_or(Duration::ZERO, |t| GIT_INTERVAL.saturating_sub(t.elapsed()));
@@ -312,7 +322,8 @@ impl GitState {
                 self.stale = false;
                 self.last = Some(Instant::now());
                 self.counting = Some(spawn(root, ctx, |root| {
-                    git::changes(&root).map(|c| c.len())
+                    let changes = git::changes(&root)?.len();
+                    Ok((changes, git::upstream(&root)?))
                 }));
             } else {
                 ctx.request_repaint_after(wait);
@@ -321,11 +332,33 @@ impl GitState {
         event
     }
 
-    pub fn commit(&mut self, root: &Path, message: String, ctx: &egui::Context) {
-        if self.committing.is_some() {
-            return;
+    fn start(
+        &mut self,
+        label: &'static str,
+        root: &Path,
+        ctx: &egui::Context,
+        f: impl FnOnce(PathBuf) -> anyhow::Result<String> + Send + 'static,
+    ) {
+        if self.busy.is_none() {
+            self.busy = Some((label, spawn(root, ctx, f)));
         }
-        self.committing = Some(spawn(root, ctx, move |root| git::snapshot(&root, &message)));
+    }
+
+    pub fn commit(&mut self, root: &Path, message: String, ctx: &egui::Context) {
+        self.start("コミット中…", root, ctx, move |root| {
+            Ok(match git::snapshot(&root, &message)? {
+                Some(hash) => format!("コミットしました: {hash}"),
+                None => "コミットする変更はありません".into(),
+            })
+        });
+    }
+
+    pub fn pull(&mut self, root: &Path, ctx: &egui::Context) {
+        self.start("取り込み中…", root, ctx, |root| git::pull(&root));
+    }
+
+    pub fn push(&mut self, root: &Path, ctx: &egui::Context) {
+        self.start("送信中…", root, ctx, |root| git::push(&root));
     }
 }
 

@@ -5,6 +5,7 @@
 
 mod export;
 mod lint;
+mod mcp;
 mod serve;
 
 use anyhow::{bail, Context, Result};
@@ -127,6 +128,8 @@ enum Cmd {
     TagRename { old: String, new: String },
     /// 標準入出力で、1行1リクエストのJSONに答え続ける（エディタ連携用）
     Serve,
+    /// MCPサーバーとして動く（AIアシスタントから vault を検索・読み書きできるようにする）
+    Mcp,
     /// ユーザーコマンド（.robsidian/commands.toml）を実行する。名前を省くと一覧
     Run {
         name: Option<String>,
@@ -134,6 +137,10 @@ enum Cmd {
         #[arg(short, long)]
         note: Option<String>,
     },
+    /// リモートの変更を取り込む（git pull --rebase。競合したら取り消して元に戻す）
+    Pull,
+    /// こちらのコミットをリモートへ送る（git push）
+    Push,
     /// vault以下の変更をgitにコミットする（スナップショット）
     Snapshot {
         /// コミットメッセージ（省略時は日時）
@@ -506,6 +513,10 @@ fn run(cli: Cli) -> Result<()> {
             out.w.flush()?;
             return serve::run(vault);
         }
+        Cmd::Mcp => {
+            out.w.flush()?;
+            return mcp::run(vault);
+        }
         Cmd::Run { name, note } => {
             let list = usercmd::load(vault.root())?
                 .map(|(_, l)| l)
@@ -542,6 +553,17 @@ fn run(cli: Cli) -> Result<()> {
                 out.w.flush()?;
                 std::process::exit(1);
             }
+        }
+        Cmd::Pull | Cmd::Push => {
+            if !git::is_repo(vault.root()) {
+                bail!("vaultはgitのリポジトリの中にありません");
+            }
+            let msg = if matches!(cli.cmd, Cmd::Pull) {
+                git::pull(vault.root())?
+            } else {
+                git::push(vault.root())?
+            };
+            eprintln!("{msg}");
         }
         Cmd::Snapshot { message } => {
             if !git::is_repo(vault.root()) {

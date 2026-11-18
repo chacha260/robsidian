@@ -71,6 +71,8 @@ enum Command {
     ToggleTheme,
     Rescan,
     GitCommit,
+    GitPull,
+    GitPush,
 }
 
 const CTRL: Modifiers = Modifiers::COMMAND;
@@ -118,6 +120,8 @@ impl Command {
             Command::ToggleTheme => "theme dark light",
             Command::Rescan => "rescan reload refresh index",
             Command::GitCommit => "git commit snapshot save version",
+            Command::GitPull => "git pull fetch sync download remote",
+            Command::GitPush => "git push sync upload remote",
         }
     }
 }
@@ -215,6 +219,12 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::ToggleTheme, "ダーク/ライト切替", None),
     (Command::Rescan, "vaultを再読み込み", None),
     (Command::GitCommit, "gitにスナップショットをコミット", None),
+    (
+        Command::GitPull,
+        "gitでリモートの変更を取り込む（pull）",
+        None,
+    ),
+    (Command::GitPush, "gitでリモートへ送る（push）", None),
 ];
 
 enum Action {
@@ -519,6 +529,8 @@ pub struct App {
     commit_message: Option<String>,
     theme: crate::theme::ThemeFile,
     mermaid: crate::mermaid::Mermaid,
+    /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
+    callout_folds: HashMap<(String, usize), bool>,
     /// 関連ノート: (索引の世代, ノートのパス, 計算した時刻, 結果)
     related: Option<(u64, String, Instant, Vec<robsidian_core::related::Related>)>,
 }
@@ -586,6 +598,7 @@ impl App {
             theme: Default::default(),
             related: None,
             mermaid: Default::default(),
+            callout_folds: HashMap::new(),
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
         let same = |p: &PathBuf| {
@@ -1267,14 +1280,20 @@ impl App {
                     tab.preview = None;
                 }
             }
-            Command::GitCommit => {
+            Command::GitCommit | Command::GitPull | Command::GitPush => {
+                let root = self.vault.as_ref().map(|v| v.root().to_path_buf());
                 if !self.git.repo {
                     self.toast("このvaultはgitのリポジトリの中にありません");
-                } else if self.git.committing() {
-                    self.toast("コミット中です");
-                } else {
+                } else if let Some(busy) = self.git.busy() {
+                    self.toast(format!("git: {busy}"));
+                } else if let Some(root) = root {
+                    // 取り込む・送る前に、編集中の内容を保存しておく
                     self.save_all();
-                    self.commit_message = Some(external::snapshot_message());
+                    match cmd {
+                        Command::GitPull => self.git.pull(&root, ctx),
+                        Command::GitPush => self.git.push(&root, ctx),
+                        _ => self.commit_message = Some(external::snapshot_message()),
+                    }
                 }
             }
         }
@@ -1316,9 +1335,8 @@ impl App {
             }
         }
         match self.git.poll(&root, ctx) {
-            Some(GitEvent::Committed(hash)) => self.toast(format!("コミットしました: {hash}")),
-            Some(GitEvent::NothingToCommit) => self.toast("コミットする変更はありません"),
-            Some(GitEvent::Failed(e)) => self.toast(format!("コミットできません: {e}")),
+            Some(GitEvent::Done(msg)) => self.toast(msg),
+            Some(GitEvent::Failed(e)) => self.toast(format!("git: {e}")),
             None => {}
         }
     }
@@ -2318,7 +2336,7 @@ impl App {
     // ---- 画面 ----
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let mut commit = false;
+        let mut git_cmd = None;
         ui.horizontal(|ui| {
             if let Some(vault) = &self.vault {
                 let name = vault
@@ -2334,13 +2352,15 @@ impl App {
             if self.cfg.vim {
                 let label = match &self.vim.cmdline {
                     Some(line) => format!(":{line}"),
-                    None => format!("-- {} -- {}", self.vim.mode.label(), self.vim.pending()),
+                    None => format!("-- {} -- {}", self.vim.mode_label(), self.vim.pending()),
                 };
                 ui.label(RichText::new(label).monospace().strong());
             }
             if self.git.repo {
                 let label = match self.git.changes {
-                    _ if self.git.committing() => "git: コミット中…".to_string(),
+                    _ if self.git.busy().is_some() => {
+                        format!("git: {}", self.git.busy().unwrap_or_default())
+                    }
                     Some(0) => "git: 変更なし".to_string(),
                     Some(n) => format!("git: {n}件の変更"),
                     None => "git".to_string(),
@@ -2351,7 +2371,28 @@ impl App {
                     .on_hover_text("クリックでスナップショットをコミット")
                     .clicked()
                 {
-                    commit = true;
+                    git_cmd = Some(Command::GitCommit);
+                }
+                // リモートとの差。クリックで送る / 取り込む
+                if let Some(up) = self.git.upstream {
+                    let ahead = egui::Button::new(RichText::new(format!("↑{}", up.ahead)).weak())
+                        .frame(false);
+                    if ui
+                        .add(ahead)
+                        .on_hover_text("リモートに無いコミットの数。クリックで送る（push）")
+                        .clicked()
+                    {
+                        git_cmd = Some(Command::GitPush);
+                    }
+                    let behind = egui::Button::new(RichText::new(format!("↓{}", up.behind)).weak())
+                        .frame(false);
+                    if ui
+                        .add(behind)
+                        .on_hover_text("リモートにあって手元に無いコミットの数（最後に取り込んだ時点）。クリックで取り込む（pull）")
+                        .clicked()
+                    {
+                        git_cmd = Some(Command::GitPull);
+                    }
                 }
             }
             for job in &self.jobs {
@@ -2372,9 +2413,9 @@ impl App {
                 }
             });
         });
-        if commit {
+        if let Some(cmd) = git_cmd {
             let ctx = ui.ctx().clone();
-            self.run(Command::GitCommit, &ctx);
+            self.run(cmd, &ctx);
         }
     }
 
@@ -2959,6 +3000,7 @@ impl App {
             find: find_bar,
             vim: vim_state,
             theme,
+            callout_folds,
             props_panel,
             ..
         } = self;
@@ -2991,6 +3033,11 @@ impl App {
         let mut scroll_to_cursor: Option<CCursor> = None;
         // ---- Vimキーバインド ----
         let vim_on = cfg.vim;
+        if vim_state.helix != cfg.helix {
+            // 流派を切り替えたら、途中のキーや選択を捨てる
+            *vim_state = Vim::default();
+            vim_state.helix = cfg.helix;
+        }
         if vim_on && ctx.memory(|m| m.has_focus(id)) {
             let normal = vim_state.mode != vim::Mode::Insert;
             let mut keys = Vec::new();
@@ -3017,9 +3064,21 @@ impl App {
             });
             if !keys.is_empty() {
                 let mut state = TextEdit::load_state(&ctx, id).unwrap_or_default();
-                let primary = state.cursor.char_range().map_or(0, |r| r.primary.index.0);
-                let mut cursor = editor::byte_of_char(&tab.text, primary);
-                if vim_state.mode == vim::Mode::Normal {
+                let range = state.cursor.char_range().unwrap_or_default();
+                let (primary, secondary) = (
+                    editor::byte_of_char(&tab.text, range.primary.index.0),
+                    editor::byte_of_char(&tab.text, range.secondary.index.0),
+                );
+                // エンジンが置いた選択のままなら、エンジンの頭の位置を使う（選択の表示では、
+                // 主の端が頭の次の文字になっているため、そのまま読むと1文字ずつずれる）
+                let mut cursor = match vim_state.synced {
+                    Some((p, s, head)) if (p, s) == (primary, secondary) => {
+                        head.min(tab.text.len())
+                    }
+                    _ => primary,
+                };
+                // Vim のノーマルモードではカーソルを改行の上に置かない（Helix は行末の改行も選べる）
+                if vim_state.mode == vim::Mode::Normal && !vim_state.helix {
                     cursor = vim::clamp_normal(&tab.text, cursor);
                 }
                 let mut undoer = state.undoer();
@@ -3059,6 +3118,7 @@ impl App {
                                     &tab.text,
                                     editor::byte_of_char(&tab.text, range.primary.index.0),
                                 );
+                                vim_state.anchor = cursor;
                                 changed = true;
                             }
                         }
@@ -3077,6 +3137,11 @@ impl App {
                 };
                 state.cursor.set_char_range(Some(range));
                 state.store(&ctx, id);
+                vim_state.synced = Some((
+                    editor::byte_of_char(&tab.text, range.primary.index.0),
+                    editor::byte_of_char(&tab.text, range.secondary.index.0),
+                    cursor,
+                ));
                 scroll_to_cursor = Some(to_char(cursor));
                 tab.cursor = cursor;
                 if changed {
@@ -3292,6 +3357,9 @@ impl App {
                     );
                     Some(b.size())
                 };
+                let fold_path = tab.path.clone();
+                let callout_open =
+                    |line: usize| callout_folds.get(&(fold_path.clone(), line)).copied();
                 let options = editor::Options {
                     size,
                     colors: &colors,
@@ -3300,6 +3368,7 @@ impl App {
                     image: &image_size,
                     note_embed: &note_embed,
                     math: &math_size,
+                    callout_open: &callout_open,
                     hide_frontmatter: live,
                     marks,
                     current_mark,
@@ -3406,6 +3475,7 @@ impl App {
         };
         let mut behind = Vec::new();
         let mut toggle = None;
+        let mut fold_toggle = None;
         for deco in &tab.layout.decos {
             let (a, b) = (row(deco.chars.start), row(deco.chars.end));
             if b.bottom() < clip.top() || a.top() > clip.bottom() {
@@ -3531,6 +3601,7 @@ impl App {
                     color,
                     first,
                     label,
+                    fold,
                 } => {
                     let rect = egui::Rect::from_min_max(
                         egui::pos2(left - 8.0, a.top() - if *first { 3.0 } else { 0.0 }),
@@ -3552,6 +3623,47 @@ impl App {
                             egui::FontId::new(size, fonts::bold()),
                             *color,
                         );
+                    }
+                    // 折りたためるコールアウトは、右端の三角で開閉する（カーソルは動かさない）
+                    if let Some((line, open)) = fold {
+                        let c = egui::pos2(right - 6.0, a.center().y);
+                        let r = size * 0.32;
+                        let points = if *open {
+                            vec![
+                                c + egui::vec2(-r, -r * 0.5),
+                                c + egui::vec2(r, -r * 0.5),
+                                c + egui::vec2(0.0, r * 0.6),
+                            ]
+                        } else {
+                            vec![
+                                c + egui::vec2(-r * 0.5, -r),
+                                c + egui::vec2(-r * 0.5, r),
+                                c + egui::vec2(r * 0.6, 0.0),
+                            ]
+                        };
+                        painter.add(egui::Shape::convex_polygon(
+                            points,
+                            *color,
+                            egui::Stroke::NONE,
+                        ));
+                        let hit_rect =
+                            egui::Rect::from_center_size(c, egui::vec2(size * 1.4, size * 1.4));
+                        if clip.contains_rect(hit_rect) {
+                            let hit = ui.interact(
+                                hit_rect,
+                                id.with(("fold", *line)),
+                                egui::Sense::click(),
+                            );
+                            if hit.hovered() {
+                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if hit
+                                .on_hover_text(if *open { "折りたたむ" } else { "開く" })
+                                .clicked()
+                            {
+                                fold_toggle = Some((*line, !*open));
+                            }
+                        }
                     }
                 }
                 editor::DecoKind::NoteEmbed(target) => {
@@ -3610,6 +3722,18 @@ impl App {
                     let baseline = center + (m.asc - m.desc) / 2.0;
                     m.paint(&painter, egui::pos2(x, baseline), colors.text);
                 }
+                editor::DecoKind::InlineImage(target, shown) => {
+                    if let Some((texture, _)) = load_image(target) {
+                        // 確保した字間の右端から幅だけ戻り、行の下端にそろえる
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(b.left() - shown.x - 2.0, a.bottom() - shown.y - 2.0),
+                            *shown,
+                        );
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        painter.image(texture, rect, uv, egui::Color32::WHITE);
+                    }
+                }
                 editor::DecoKind::Image(target) => {
                     if let Some((texture, image_size)) = load_image(target) {
                         let top = a.top() + editor::line_height(size) + 4.0;
@@ -3622,6 +3746,11 @@ impl App {
             }
         }
         painter.set(background, egui::Shape::Vec(behind));
+        if let Some((line, open)) = fold_toggle {
+            callout_folds.insert((tab.path.clone(), line), open);
+            tab.layout_stale = true;
+            ctx.request_repaint();
+        }
 
         if block_cursor && output.response.response.has_focus() {
             // ノーマルモードではIMEを止める（日本語入力のままでもキーがコマンドとして届くように）
@@ -3632,7 +3761,30 @@ impl App {
                     editor::byte_of_char(&tab.text, p),
                     editor::byte_of_char(&tab.text, s),
                 );
-                if vim_state.mode == vim::Mode::Normal && p != s {
+                if vim_state.helix {
+                    // Helix風: エンジンが置いた選択から変わったとき（マウスで選んだ / クリックした）だけ取り込む
+                    let unchanged = vim_state.synced.filter(|&(p, s, _)| (p, s) == (pb, sb));
+                    if let Some((_, _, head)) = unchanged {
+                        // ブロックカーソルは選択の頭に描く
+                        tab.cursor = head;
+                    } else if vim_state.mode != vim::Mode::Insert {
+                        let (anchor, head) = if p == s {
+                            let c = vim::clamp_normal(&tab.text, pb);
+                            (c, c)
+                        } else if pb > sb {
+                            let head =
+                                pb - tab.text[..pb].chars().next_back().map_or(0, char::len_utf8);
+                            (sb, head)
+                        } else {
+                            let anchor =
+                                sb - tab.text[..sb].chars().next_back().map_or(0, char::len_utf8);
+                            (anchor, pb)
+                        };
+                        vim_state.anchor = anchor;
+                        tab.cursor = head;
+                        vim_state.synced = Some((pb, sb, head));
+                    }
+                } else if vim_state.mode == vim::Mode::Normal && p != s {
                     // マウスで範囲を選んだらビジュアルモードにする
                     vim_state.mode = vim::Mode::Visual;
                     vim_state.anchor = sb;

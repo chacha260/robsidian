@@ -110,11 +110,15 @@ pub enum DecoKind {
         color: Color32,
         first: bool,
         label: Option<(String, usize)>,
+        /// 折りたためるコールアウトの最初の行: (行番号, いま開いているか)
+        fold: Option<(usize, bool)>,
     },
     /// 表（範囲は表全体。先頭の行が見出し）
     Table(Vec<TableRow>),
     /// 数式。表示数式（`$$…$$`）は範囲がブロック全体、行内数式は幅を確保した1文字
     Math { tex: String, display: bool },
+    /// 文中の画像（範囲は幅を確保した1文字。中身はリンク先と描く大きさ）
+    InlineImage(String, Vec2),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +139,8 @@ pub struct Options<'a> {
     pub image: &'a dyn Fn(&str) -> Option<Vec2>,
     /// 埋め込んだノート（`ノート#見出し`）を描く高さ。ノートでなければ None
     pub note_embed: &'a dyn Fn(&str) -> Option<f32>,
+    /// 折りたためるコールアウト（最初の行の番号）を、利用者が開いた / 閉じたか。決めていなければ None
+    pub callout_open: &'a dyn Fn(usize) -> Option<bool>,
     /// 数式（TeX, 表示数式か）を描いたときの大きさ。描けなければ None
     pub math: &'a dyn Fn(&str, bool) -> Option<Vec2>,
     /// frontmatterを畳む（プロパティ欄を出しているとき）
@@ -160,6 +166,7 @@ struct Painter<'a> {
     live: bool,
     cursor: Option<(usize, usize)>,
     math: &'a dyn Fn(&str, bool) -> Option<Vec2>,
+    image: &'a dyn Fn(&str) -> Option<Vec2>,
 }
 
 impl Painter<'_> {
@@ -250,6 +257,17 @@ impl Painter<'_> {
         // (記法の開始, 中身の開始, 中身の終了, 記法の終了, 中身の書式)
         type Token = (usize, usize, usize, usize, TextFormat);
         while i < b.len() {
+            if b[i] == b'!' && self.live {
+                if let Some((len, target, size)) = inline_image(&line[i..])
+                    .and_then(|(len, t)| (self.image)(&t).map(|s| (len, t, s)))
+                {
+                    self.push(&line[plain_from..i], self.fmt(base));
+                    self.inline_image(&line[i..i + len], target, size);
+                    plain_from = i + len;
+                    i += len;
+                    continue;
+                }
+            }
             if let Some(span) = maths.iter().find(|r| r.start == i) {
                 self.push(&line[plain_from..i], self.fmt(base));
                 self.inline_math(&line[span.clone()]);
@@ -371,6 +389,29 @@ impl Painter<'_> {
         self.push(&line[plain_from..], self.fmt(base));
     }
 
+    /// 文中の画像。カーソルが触れていなければ、記法を畳んで画像の幅を確保し、上に画像を描く。
+    /// 行の高さは画像に合わせ、記法を見せるときも同じにする。
+    fn inline_image(&mut self, src: &str, target: String, size: Vec2) {
+        // 大きな画像は、行が高くなりすぎないよう縮める
+        let scale = (INLINE_IMAGE_MAX / size.y).min(1.0);
+        let size = size * scale;
+        let row = Some((self.size * LINE_HEIGHT).max(size.y + 4.0));
+        if self.hidden(self.ahead(src)) {
+            let mut slot = self.mark(true);
+            slot.extra_letter_spacing = size.x + 2.0;
+            slot.line_height = row;
+            let at = self.push(&src[..1], slot);
+            let mut rest = self.mark(true);
+            rest.line_height = row;
+            self.push(&src[1..], rest);
+            self.deco(DecoKind::InlineImage(target, size), at);
+        } else {
+            let mut f = self.fmt(self.c.accent);
+            f.line_height = row;
+            self.push(src, f);
+        }
+    }
+
     /// 行内数式 `$…$`。ライブ表示でカーソルが触れていなければ、記法を畳んで描いた数式の幅を確保する
     /// （上に数式を描く）。行の高さは、記法を見せるときも同じにする（カーソルの出入りで動かないように）。
     fn inline_math(&mut self, src: &str) {
@@ -458,6 +499,34 @@ impl Painter<'_> {
     }
 }
 
+/// 文中の画像の高さの上限
+const INLINE_IMAGE_MAX: f32 = 200.0;
+
+/// `![[画像]]` / `![代替](画像)` で始まっていれば、その長さ（バイト）とリンク先。
+fn inline_image(s: &str) -> Option<(usize, String)> {
+    if let Some(rest) = s.strip_prefix("![[") {
+        let close = rest.find("]]")?;
+        let inner = &rest[..close];
+        let target = inner.split(['|', '#']).next()?.trim();
+        if target.is_empty() || inner.contains('[') {
+            return None;
+        }
+        return Some((3 + close + 2, target.to_string()));
+    }
+    let rest = s.strip_prefix("![")?;
+    let mid = rest.find("](")?;
+    if rest[..mid].contains(['[', ']']) {
+        return None;
+    }
+    let close = rest[mid + 2..].find(')')?;
+    let url = &rest[mid + 2..mid + 2 + close];
+    if url.contains("://") || url.trim().is_empty() {
+        return None;
+    }
+    let url = url.trim().trim_start_matches('<').trim_end_matches('>');
+    Some((2 + mid + 2 + close + 1, parse::percent_decode(url)))
+}
+
 /// 行が画像の埋め込みだけで出来ていれば、そのリンク先を返す。
 fn image_only(line: &str) -> Option<String> {
     let t = line.trim();
@@ -539,8 +608,9 @@ pub fn inline_job(text: &str, size: f32, colors: &Colors, color: Color32) -> Lay
         c: colors,
         live: true,
         cursor: None,
-        // 表のセルの数式は、記法を見せたまま色だけ付ける（上に描く仕組みが無いため）
+        // 表のセルの数式・画像は、記法を見せたまま色だけ付ける（上に描く仕組みが無いため）
         math: &|_: &str, _: bool| None,
+        image: &|_: &str| None,
     };
     p.inline(text, color);
     p.job
@@ -575,6 +645,17 @@ pub fn callout_kind(line: &str) -> Option<(String, usize)> {
         len += 1;
     }
     Some((kind.to_lowercase(), len))
+}
+
+/// 折りたためるコールアウトなら、最初に開いているか（`+` なら開、`-` なら閉）。
+pub fn callout_fold(line: &str) -> Option<bool> {
+    let (_, len) = callout_kind(line)?;
+    let t = line.trim_start().strip_prefix('>')?.trim_start();
+    match t.as_bytes().get(len - 1) {
+        Some(b'+') => Some(true),
+        Some(b'-') => Some(false),
+        _ => None,
+    }
 }
 
 /// コールアウトの種類ごとの色（Obsidianの既定に近い色）。
@@ -620,6 +701,7 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         live: opt.live,
         cursor: opt.cursor,
         math: opt.math,
+        image: opt.image,
     };
     let size = opt.size;
     let mut in_frontmatter = text.starts_with("---\n") || text.starts_with("---\r\n");
@@ -628,7 +710,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
     let mut table: Option<(usize, bool, usize, Vec<TableRow>)> = None;
     let mut first_line = 0;
     // 処理中のコールアウト: (種類, 最初の行)
-    let mut callout: Option<(String, usize)> = None;
+    // (種類, 最初の行, 本文を畳んでいるか, 折りたためるなら開いているか)
+    let mut callout: Option<(String, usize, bool, Option<bool>)> = None;
     // 処理中の表示数式: (最後の行, 整形表示するか, 開始文字位置, 行の高さ, TeX)
     let mut math_block: Option<(usize, bool, usize, f32, String)> = None;
     // 処理中のコードブロックの色分け結果: (本文の最初の行, 行ごとの (色, バイト数))
@@ -853,11 +936,36 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             if !trimmed.starts_with('>') {
                 callout = None;
             } else if callout.is_none() && opt.live {
-                callout = callout_kind(line).map(|(kind, _)| (kind, n));
+                callout = callout_kind(line).map(|(kind, _)| {
+                    // `[!種類]-` は閉じた状態、`+` は開いた状態で始まる折りたためるコールアウト
+                    let open =
+                        callout_fold(line).map(|default| (opt.callout_open)(n).unwrap_or(default));
+                    let end = (n + 1..lines.len())
+                        .take_while(|&k| content(lines[k]).trim_start().starts_with('>'))
+                        .last()
+                        .unwrap_or(n);
+                    let title = lines[n].chars().count();
+                    let body: usize = lines[n + 1..=end].iter().map(|l| l.chars().count()).sum();
+                    // 本文にカーソルがあるときは開いて見せる（見えない文字を編集しないように）
+                    let collapsed = open == Some(false)
+                        && end > n
+                        && p.hidden(p.chars + title..p.chars + title + body);
+                    (kind, n, collapsed, open)
+                });
+            }
+            if let Some((_, first, true, _)) = &callout {
+                if *first != n {
+                    // 畳んだ本文の行は、高さ0で見えなくする
+                    let mut gone = p.mark(true);
+                    gone.line_height = Some(0.0);
+                    p.push(line, gone.clone());
+                    p.push(eol, gone);
+                    continue;
+                }
             }
             let (body, color, quote_bar) = p.block_prefix(line);
             match callout.clone() {
-                Some((kind, first)) => {
+                Some((kind, first, collapsed, open)) => {
                     let accent = callout_color(&kind);
                     let mut label = None;
                     if first == n {
@@ -876,11 +984,16 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                     } else {
                         p.inline(&line[body..], p.c.text);
                     }
+                    let fold = (first == n)
+                        .then_some(open)
+                        .flatten()
+                        .map(|_| (n, !collapsed));
                     p.deco(
                         DecoKind::Callout {
                             color: accent,
                             first: first == n,
                             label,
+                            fold,
                         },
                         start..p.chars,
                     );
@@ -1046,6 +1159,7 @@ mod tests {
                 cursor,
                 image: &image,
                 note_embed: &|_: &str| None,
+                callout_open: &|_: usize| None,
                 math: &|tex: &str, display: bool| {
                     Some(Vec2::new(
                         tex.len() as f32 * 7.0,
@@ -1170,6 +1284,7 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &|_: &str| None,
+                callout_open: &|_: usize| None,
                 math: &|tex: &str, display: bool| {
                     Some(Vec2::new(
                         tex.len() as f32 * 7.0,
@@ -1218,6 +1333,7 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &|_: &str| None,
+                callout_open: &|_: usize| None,
                 math: &|tex: &str, display: bool| {
                     Some(Vec2::new(
                         tex.len() as f32 * 7.0,
@@ -1254,6 +1370,7 @@ mod tests {
                 cursor: None,
                 image: &image,
                 note_embed: &embed,
+                callout_open: &|_: usize| None,
                 math: &|_: &str, _: bool| None,
                 hide_frontmatter: false,
             },
@@ -1272,11 +1389,11 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect();
+        // `[!tip]-` は閉じた状態で始まるので、本文の行の装飾は無い
         assert_eq!(
             kinds,
             [
                 "callout:true:-",
-                "callout:false:-",
                 "callout:true:Note",
                 "callout:false:-",
                 "embed:Other#h"
@@ -1356,6 +1473,103 @@ mod tests {
         assert!(run(text, false, None).decos.is_empty());
         assert_eq!(display_math(&["$$x$$"], 0), Some((0, "x".into())));
         assert_eq!(display_math(&["$$\n", "y\n"], 0), None);
+    }
+
+    #[test]
+    fn inline_images_reserve_space() {
+        let text = "前 ![[pic.png]] 後 ![[nope.png]] ![a](pic.png)";
+        let out = run(text, true, None);
+        assert_eq!(out.job.text, text);
+        let images: Vec<_> = out
+            .decos
+            .iter()
+            .filter_map(|d| match &d.kind {
+                DecoKind::InlineImage(t, size) => Some((t.clone(), *size)),
+                _ => None,
+            })
+            .collect();
+        // 読めない画像（nope.png）は記法のまま
+        assert_eq!(
+            images,
+            [
+                ("pic.png".to_string(), Vec2::new(100.0, 50.0)),
+                ("pic.png".to_string(), Vec2::new(100.0, 50.0))
+            ]
+        );
+        // カーソルが触れている画像は記法を見せる
+        assert_eq!(run(text, true, Some((3, 3))).decos.len(), 1);
+        assert_eq!(
+            inline_image("![[a b.png|200]] x"),
+            Some((16, "a b.png".into()))
+        );
+        assert_eq!(
+            inline_image("![x](img/a%20b.png) y"),
+            Some((19, "img/a b.png".into()))
+        );
+        assert_eq!(inline_image("![x](https://e/x.png)"), None);
+        assert_eq!(inline_image("![[]]"), None);
+    }
+
+    #[test]
+    fn foldable_callouts() {
+        let colors = Colors::new(true);
+        let text =
+            "> [!tip]- 閉じている\n> 本文1\n> 本文2\nafter\n> [!note]+ 開いている\n> 本文3\n";
+        let image = |_: &str| None;
+        let run_with = |cursor: Option<(usize, usize)>, opened: Option<bool>| {
+            let open = move |line: usize| (line == 0).then_some(opened).flatten();
+            layout(
+                text,
+                &Options {
+                    marks: &[],
+                    current_mark: None,
+                    size: 14.0,
+                    colors: &colors,
+                    live: true,
+                    cursor,
+                    image: &image,
+                    note_embed: &|_: &str| None,
+                    callout_open: &open,
+                    math: &|_: &str, _: bool| None,
+                    hide_frontmatter: false,
+                },
+            )
+        };
+        // 畳んだ本文の行は高さ0
+        let collapsed = |out: &Layout| -> String {
+            out.job
+                .sections
+                .iter()
+                .filter(|s| s.format.line_height == Some(0.0))
+                .map(|s| &text[s.byte_range.start.0..s.byte_range.end.0])
+                .collect()
+        };
+        let folds = |out: &Layout| -> Vec<(usize, bool)> {
+            out.decos
+                .iter()
+                .filter_map(|d| match &d.kind {
+                    DecoKind::Callout { fold, .. } => *fold,
+                    _ => None,
+                })
+                .collect()
+        };
+        let out = run_with(None, None);
+        assert_eq!(out.job.text, text);
+        assert_eq!(collapsed(&out), "> 本文1\n> 本文2\n");
+        assert_eq!(folds(&out), [(0, false), (4, true)]);
+        // 利用者が開いた
+        let out = run_with(None, Some(true));
+        assert_eq!(collapsed(&out), "");
+        assert_eq!(folds(&out), [(0, true), (4, true)]);
+        // 本文にカーソルがあるときは開いて見せる
+        let out = run_with(Some((18, 18)), None);
+        assert_eq!(collapsed(&out), "");
+        // タイトルにカーソルがあっても畳んだまま
+        let out = run_with(Some((3, 3)), None);
+        assert_eq!(collapsed(&out), "> 本文1\n> 本文2\n");
+        assert_eq!(callout_fold("> [!tip]- x"), Some(false));
+        assert_eq!(callout_fold("> [!TIP]+"), Some(true));
+        assert_eq!(callout_fold("> [!tip] x"), None);
     }
 
     #[test]

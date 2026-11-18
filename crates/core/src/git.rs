@@ -102,6 +102,105 @@ pub fn snapshot(root: &Path, message: &str) -> Result<Option<String>> {
     ))
 }
 
+/// 追跡しているリモートのブランチとの差（コミット数）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Upstream {
+    /// こちらにだけあるコミット（push すると送られる）
+    pub ahead: usize,
+    /// リモートにだけあるコミット（最後に fetch / pull したときの情報）
+    pub behind: usize,
+}
+
+/// 追跡しているリモートのブランチとの差。追跡先が無ければ `None`。ネットワークには触れない。
+pub fn upstream(root: &Path) -> Result<Option<Upstream>> {
+    let out = git(root)
+        .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        .output()
+        .context("git を実行できません")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut n = text.split_whitespace().map(|s| s.parse().unwrap_or(0));
+    Ok(Some(Upstream {
+        ahead: n.next().unwrap_or(0),
+        behind: n.next().unwrap_or(0),
+    }))
+}
+
+/// リモートの変更を取り込む（`git pull --rebase --autostash`）。
+/// 競合したら取り込みを取り消して元の状態に戻し、エラーにする（作業ツリーを中途半端な状態に残さない）。
+pub fn pull(root: &Path) -> Result<String> {
+    if upstream(root)?.is_none() {
+        bail!(
+            "追跡するリモートのブランチが設定されていません（git push -u などで設定してください）"
+        );
+    }
+    let before = head(root);
+    let out = git(root)
+        .args(["pull", "--rebase", "--autostash", "--quiet"])
+        .output()
+        .context("git を実行できません")?;
+    if !out.status.success() {
+        // 競合で止まったリベースは取り消す（自動で退避した変更も戻る）
+        let _ = git(root).args(["rebase", "--abort"]).output();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("CONFLICT") || err.contains("conflict") || err.contains("could not apply") {
+            bail!("リモートの変更と競合したので、取り込みを取り消しました（手元の状態は元のままです）");
+        }
+        let line = err
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("git pull が失敗しました");
+        bail!("{}", line.trim());
+    }
+    let after = head(root);
+    if before == after {
+        return Ok("新しい変更はありません".into());
+    }
+    let n = run(git(root).args(["rev-list", "--count", &format!("{}..{}", before, after)]))
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    Ok(format!("{n}件のコミットを取り込みました"))
+}
+
+/// こちらのコミットをリモートへ送る（`git push`）。
+pub fn push(root: &Path) -> Result<String> {
+    let Some(up) = upstream(root)? else {
+        bail!(
+            "追跡するリモートのブランチが設定されていません（git push -u などで設定してください）"
+        );
+    };
+    if up.ahead == 0 {
+        return Ok("送るコミットはありません".into());
+    }
+    let out = git(root)
+        .args(["push", "--quiet"])
+        .output()
+        .context("git を実行できません")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("rejected")
+            || err.contains("fetch first")
+            || err.contains("non-fast-forward")
+        {
+            bail!("リモートに新しいコミットがあります。先に取り込んでください");
+        }
+        let line = err
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("git push が失敗しました");
+        bail!("{}", line.trim());
+    }
+    Ok(format!("{}件のコミットを送りました", up.ahead))
+}
+
+fn head(root: &Path) -> String {
+    run(git(root).args(["rev-parse", "HEAD"]))
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub hash: String,
@@ -191,6 +290,79 @@ mod tests {
         sh(dir.path(), &["config", "user.email", "t@example.com"]);
         sh(dir.path(), &["config", "commit.gpgsign", "false"]);
         dir
+    }
+
+    #[test]
+    fn pull_and_push_with_a_remote() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let remote = base.path().join("remote.git");
+        sh(
+            base.path(),
+            &["init", "-q", "--bare", "-b", "main", "remote.git"],
+        );
+        let clone = |name: &str| {
+            sh(
+                base.path(),
+                &["clone", "-q", remote.to_str().unwrap(), name],
+            );
+            let d = base.path().join(name);
+            sh(&d, &["config", "user.name", "t"]);
+            sh(&d, &["config", "user.email", "t@example.com"]);
+            sh(&d, &["config", "commit.gpgsign", "false"]);
+            sh(&d, &["checkout", "-q", "-B", "main"]);
+            d
+        };
+        let a = clone("a");
+        // 追跡先が無いうちは pull / push できない
+        assert!(upstream(&a).unwrap().is_none());
+        assert!(pull(&a).is_err());
+        fs::write(a.join("n.md"), "1\n2\n3\n").unwrap();
+        snapshot(&a, "first").unwrap();
+        sh(&a, &["push", "-q", "-u", "origin", "main"]);
+        assert_eq!(upstream(&a).unwrap(), Some(Upstream::default()));
+
+        let b = clone("b");
+        sh(&b, &["branch", "-q", "-u", "origin/main"]);
+        sh(&b, &["reset", "-q", "--hard", "origin/main"]);
+        fs::write(b.join("n.md"), "1\n2\n3\nB\n").unwrap();
+        snapshot(&b, "from b").unwrap();
+        assert_eq!(upstream(&b).unwrap().unwrap().ahead, 1);
+        assert_eq!(push(&b).unwrap(), "1件のコミットを送りました");
+        assert_eq!(push(&b).unwrap(), "送るコミットはありません");
+
+        // 手元に未コミットの変更があっても取り込める（別の行なので競合しない）
+        fs::write(a.join("n.md"), "0\n1\n2\n3\n").unwrap();
+        assert_eq!(pull(&a).unwrap(), "1件のコミットを取り込みました");
+        assert_eq!(
+            fs::read_to_string(a.join("n.md")).unwrap(),
+            "0\n1\n2\n3\nB\n"
+        );
+        assert_eq!(pull(&a).unwrap(), "新しい変更はありません");
+
+        // 同じ行を両方で変えると競合する: 取り込みを取り消し、手元は元のまま
+        snapshot(&a, "a edits").unwrap();
+        fs::write(b.join("n.md"), "X\n1\n2\n3\nB\n").unwrap();
+        snapshot(&b, "b edits").unwrap();
+        push(&b).unwrap();
+        let before = head(&a);
+        let err = pull(&a).unwrap_err().to_string();
+        assert!(err.contains("競合"), "{err}");
+        assert_eq!(head(&a), before);
+        assert_eq!(
+            fs::read_to_string(a.join("n.md")).unwrap(),
+            "0\n1\n2\n3\nB\n"
+        );
+        let state = git(&a).args(["status", "--porcelain"]).output().unwrap();
+        assert!(
+            state.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&state.stdout)
+        );
+        let err = push(&a).unwrap_err().to_string();
+        assert!(err.contains("先に取り込んで"), "{err}");
     }
 
     #[test]

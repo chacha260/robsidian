@@ -7,6 +7,8 @@
 
 use crate::edit::indent_unit;
 
+mod helix;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -96,6 +98,11 @@ pub struct Vim {
     replaying: bool,
     /// `:` コマンドの入力中
     pub cmdline: Option<String>,
+    /// Helix風（選択してから操作する）のキー操作
+    pub helix: bool,
+    /// エディタに最後に反映した選択（主, 副のバイト位置）と、そのときの頭（カーソル）の位置。
+    /// エディタの選択がこのままなら頭の位置を使い、変わっていればマウスで動かしたとみなす
+    pub synced: Option<(usize, usize, usize)>,
 }
 
 impl Default for Vim {
@@ -111,6 +118,8 @@ impl Default for Vim {
             insert_record: None,
             replaying: false,
             cmdline: None,
+            helix: false,
+            synced: None,
         }
     }
 }
@@ -704,8 +713,24 @@ impl Vim {
             .collect()
     }
 
+    /// ステータスバーに出すモード名
+    pub fn mode_label(&self) -> &'static str {
+        match (self.helix, self.mode) {
+            (true, Mode::Visual | Mode::VisualLine) => "SELECT",
+            (_, m) => m.label(),
+        }
+    }
+
     /// ビジュアルモードの選択範囲（バイト位置、終わりは含まない）。
+    /// Helix風ではノーマルモードでも、起点と頭が違えば選択がある。
     pub fn selection(&self, t: &str, cursor: usize) -> Option<(usize, usize)> {
+        if self.helix && self.mode != Mode::Insert {
+            if self.anchor == cursor && self.mode == Mode::Normal {
+                return None;
+            }
+            let (a, b) = (self.anchor.min(cursor), self.anchor.max(cursor));
+            return Some((a, next(t, b).min(t.len()).max(b)));
+        }
         match self.mode {
             Mode::Visual => {
                 let (a, b) = (self.anchor.min(cursor), self.anchor.max(cursor));
@@ -741,8 +766,18 @@ impl Vim {
             return fx;
         }
         if self.mode == Mode::Insert {
+            if self.helix && key == Key::Esc {
+                // Helix は挿入を終えてもカーソルを戻さない
+                self.mode = Mode::Normal;
+                self.insert_record = None;
+                self.anchor = *cursor;
+                return fx;
+            }
             self.insert_key(t, cursor, key, &mut fx);
             return fx;
+        }
+        if self.helix {
+            return self.helix_key(t, cursor, key);
         }
         match key {
             Key::Esc => {
