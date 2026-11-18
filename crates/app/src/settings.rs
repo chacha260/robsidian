@@ -138,6 +138,7 @@ impl SettingsView {
 
                     section(ui, "コアプラグイン");
                     ui.weak("Obsidian のコアプラグインに当たる機能です。使わないものはオフにできます");
+                    ui.weak("（フォーマット変換・Publish・Sync・Web ビューアは Robsidian にありません）");
                     egui::Grid::new("features")
                         .num_columns(2)
                         .spacing([24.0, 6.0])

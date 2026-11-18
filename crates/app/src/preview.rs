@@ -14,10 +14,29 @@ pub const SCHEME: &str = "rob:";
 /// ホバーや埋め込みなど、設定を持たない場所からも組版するので、ここに置いておく
 static BASES: AtomicBool = AtomicBool::new(true);
 static AUDIO: AtomicBool = AtomicBool::new(true);
+static PAGE_PREVIEW: AtomicBool = AtomicBool::new(true);
+static BOOKMARKS: AtomicBool = AtomicBool::new(true);
+static FILE_RECOVERY: AtomicBool = AtomicBool::new(true);
 
 pub fn set_features(f: &crate::config::Features) {
     BASES.store(f.bases, Ordering::Relaxed);
     AUDIO.store(f.audio, Ordering::Relaxed);
+    PAGE_PREVIEW.store(f.page_preview, Ordering::Relaxed);
+    BOOKMARKS.store(f.bookmarks, Ordering::Relaxed);
+    FILE_RECOVERY.store(f.file_recovery, Ordering::Relaxed);
+}
+
+/// マウスを乗せたときにノートの中身を見せるか（ページプレビュー）
+pub fn page_preview_on() -> bool {
+    PAGE_PREVIEW.load(Ordering::Relaxed)
+}
+
+pub fn bookmarks_on() -> bool {
+    BOOKMARKS.load(Ordering::Relaxed)
+}
+
+pub fn file_recovery_on() -> bool {
+    FILE_RECOVERY.load(Ordering::Relaxed)
 }
 
 /// 埋め込んだ音声をその場で鳴らすか

@@ -8,7 +8,7 @@ use crate::find;
 use crate::fonts;
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
-use crate::hover;
+use crate::hover::{self, PreviewHover};
 use crate::math_view;
 use crate::preview;
 use crate::props_ui::PropsPanel;
@@ -156,6 +156,15 @@ impl Command {
             Command::SaveLayout | Command::OpenLayout | Command::DeleteLayout => f.workspaces,
             Command::Slides => f.slides,
             Command::Record => f.audio,
+            Command::Palette => f.command_palette,
+            Command::QuickSwitch => f.quick_switcher,
+            Command::SearchAll => f.search,
+            Command::Daily => f.daily_notes,
+            Command::ToggleGraph => f.graph,
+            Command::History => f.file_recovery,
+            Command::ToggleBookmark => f.bookmarks,
+            Command::InsertTemplate | Command::NewFromTemplate => f.templates,
+            Command::AddProperty => f.properties,
             _ => true,
         }
     }
@@ -2320,6 +2329,9 @@ impl App {
         if !f.audio {
             self.player = None;
         }
+        if !f.graph {
+            self.show_graph = false;
+        }
     }
 
     /// タスクの完了状態を切り替える。開いているタブは未保存の編集ごと書き換え、
@@ -2553,6 +2565,15 @@ impl App {
                 self.completion = None;
             }
             Action::Close(i) => self.close_tab(i),
+            Action::Search(_) if !self.cfg.features.search => {
+                self.toast("検索は設定（コアプラグイン）でオフになっています");
+            }
+            Action::History(_) if !self.cfg.features.file_recovery => {
+                self.toast("ファイル復元は設定（コアプラグイン）でオフになっています");
+            }
+            Action::ToggleBookmark(_) if !self.cfg.features.bookmarks => {
+                self.toast("ブックマークは設定（コアプラグイン）でオフになっています");
+            }
             Action::Search(query) => {
                 self.search_query = query;
                 self.cfg.show_left = true;
@@ -2774,7 +2795,7 @@ impl App {
                         let c = robsidian_core::text::count(&tab.text[sel]);
                         ui.weak(format!("選択 {}文字 ・ {}語", c.chars, c.words));
                     }
-                    if let Some(vault) = &self.vault {
+                    if let Some(vault) = self.vault.as_ref().filter(|_| self.cfg.features.backlinks) {
                         ui.weak(format!("被リンク {}", vault.backlinks(&tab.path).len()));
                     }
                     ui.weak(&tab.path);
@@ -2792,12 +2813,27 @@ impl App {
 
     fn left_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.add_space(4.0);
+        let f = self.cfg.features;
+        let tabs = [
+            (LeftTab::Files, "ファイル", f.file_explorer),
+            (LeftTab::Search, "検索", f.search),
+            (LeftTab::Tags, "タグ", f.tags_view),
+            (LeftTab::Tasks, "タスク", true),
+            (LeftTab::Bookmarks, "★", f.bookmarks),
+        ];
+        // オフにしたタブを開いていたら、出ているタブに移る
+        if !tabs.iter().any(|(t, _, on)| *on && *t == self.left_tab) {
+            self.left_tab = LeftTab::Tasks;
+            if let Some((t, _, _)) = tabs.iter().find(|(_, _, on)| *on) {
+                self.left_tab = *t;
+            }
+        }
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.left_tab, LeftTab::Files, "ファイル");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Search, "検索");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Tags, "タグ");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Tasks, "タスク");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Bookmarks, "★");
+            for (t, name, on) in tabs {
+                if on {
+                    ui.selectable_value(&mut self.left_tab, t, name);
+                }
+            }
         });
         ui.separator();
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
@@ -2821,10 +2857,11 @@ impl App {
                         };
                         actions.push(Action::Dialog(d));
                     }
-                    if ui
-                        .button("今日")
-                        .on_hover_text("デイリーノート (Ctrl+D)")
-                        .clicked()
+                    if self.cfg.features.daily_notes
+                        && ui
+                            .button("今日")
+                            .on_hover_text("デイリーノート (Ctrl+D)")
+                            .clicked()
                     {
                         actions.push(Action::Run(Command::Daily));
                     }
@@ -2867,7 +2904,7 @@ impl App {
                                 active == Some(hit.path.as_str()),
                                 RichText::new(title).strong(),
                             )
-                            .on_hover_ui(|ui| {
+                            .on_hover_preview(|ui| {
                                 hover::note_preview(
                                     ui,
                                     vault,
@@ -2953,7 +2990,7 @@ impl App {
                                 if row.clicked() {
                                     actions.push(Action::Open(t.path.clone(), Some(t.task.line)));
                                 }
-                                row.on_hover_ui(|ui| hover::note_preview(ui, vault, &mut self.hover_cache, &t.path, None));
+                                row.on_hover_preview(|ui| hover::note_preview(ui, vault, &mut self.hover_cache, &t.path, None));
                             });
                             let note = file_name(&t.path).trim_end_matches(".md");
                             let meta = match t.task.due {
@@ -2984,7 +3021,7 @@ impl App {
                         };
                         let row = ui
                             .selectable_label(active == Some(path.as_str()), text)
-                            .on_hover_ui(|ui| {
+                            .on_hover_preview(|ui| {
                                 hover::note_preview(ui, vault, &mut self.hover_cache, path, None)
                             });
                         if row.clicked() && exists {
@@ -3028,6 +3065,7 @@ impl App {
         let features = self.cfg.features;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if features.backlinks {
             ui.add_space(4.0);
             let backlinks = vault.backlinks(&tab.path);
             ui.strong(format!("バックリンク ({})", backlinks.len()));
@@ -3043,7 +3081,7 @@ impl App {
                     let title = name.strip_suffix(".md").unwrap_or(name);
                     if ui
                         .selectable_label(false, title)
-                        .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &link.source, None))
+                        .on_hover_preview(|ui| hover::note_preview(ui, vault, cache, &link.source, None))
                         .clicked()
                     {
                         actions.push(Action::Open(link.source.to_string(), Some(link.line)));
@@ -3093,7 +3131,7 @@ impl App {
                             let title = file_name(&m.source).trim_end_matches(".md");
                             let row = ui
                                 .selectable_label(false, title)
-                                .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &m.source, None));
+                                .on_hover_preview(|ui| hover::note_preview(ui, vault, cache, &m.source, None));
                             if row.clicked() {
                                 actions.push(Action::Open(m.source.clone(), Some(m.line)));
                             }
@@ -3112,6 +3150,7 @@ impl App {
             // 閉じている間は結果を捨てる（大きなvaultで無駄に走査しないよう、開いているときだけ計算する）
             if header.body_returned.is_none() {
                 *mentions_cache = None;
+            }
             }
 
             if features.related {
@@ -3155,7 +3194,7 @@ impl App {
                         }
                         let row = ui
                             .selectable_label(false, title)
-                            .on_hover_ui(|ui| {
+                            .on_hover_preview(|ui| {
                                 ui.weak(why.join("\n"));
                                 ui.separator();
                                 hover::note_preview(ui, vault, cache, &r.path, None);
@@ -3197,7 +3236,7 @@ impl App {
                                 let title = file_name(path).trim_end_matches(".md");
                                 let row = ui
                                     .selectable_label(false, title)
-                                    .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, path, None));
+                                    .on_hover_preview(|ui| hover::note_preview(ui, vault, cache, path, None));
                                 if row.clicked() {
                                     actions.push(Action::Open(path.to_string(), None));
                                 }
@@ -3252,6 +3291,9 @@ impl App {
                     });
             }
 
+            if !features.outline {
+                return;
+            }
             ui.add_space(10.0);
             ui.separator();
             ui.strong("アウトライン");
@@ -3298,10 +3340,11 @@ impl App {
             {
                 self.toggle_split();
             }
-            if ui
-                .selectable_label(self.show_graph, "グラフ")
-                .on_hover_text("Ctrl+G")
-                .clicked()
+            if self.cfg.features.graph
+                && ui
+                    .selectable_label(self.show_graph, "グラフ")
+                    .on_hover_text("Ctrl+G")
+                    .clicked()
             {
                 self.show_graph = !self.show_graph;
             }
@@ -3323,10 +3366,12 @@ impl App {
                         if ui.button("閉じる").clicked() {
                             actions.push(Action::Close(i));
                         }
-                        if ui.button("ブックマークに追加 / 解除").clicked() {
+                        if self.cfg.features.bookmarks
+                            && ui.button("ブックマークに追加 / 解除").clicked()
+                        {
                             actions.push(Action::ToggleBookmark(tab.path.clone()));
                         }
-                        if ui.button("履歴…").clicked() {
+                        if self.cfg.features.file_recovery && ui.button("履歴…").clicked() {
                             actions.push(Action::History(tab.path.clone()));
                         }
                         if ui.button("改名/移動…").clicked() {
@@ -3877,7 +3922,7 @@ impl App {
                     note_embed: &note_embed,
                     math: &math_size,
                     callout_open: &callout_open,
-                    hide_frontmatter: live,
+                    hide_frontmatter: live && cfg.features.properties,
                     marks,
                     current_mark,
                 };
@@ -3908,7 +3953,7 @@ impl App {
                             ui.vertical(|ui| {
                                 ui.set_width((ui.available_width() - side).max(80.0));
                                 // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
-                                if live {
+                                if live && cfg.features.properties {
                                     if let Some(new) =
                                         props_panel.show(ui, &note_path, text, &colors)
                                     {
@@ -4540,7 +4585,8 @@ impl App {
                     };
                     path.map(|p| (p.to_string(), heading.map(str::to_string)))
                 });
-                if let Some((path, heading)) = resolved {
+                // ページプレビュー（オフなら、リンクの上でも中身は見せない）
+                if let Some((path, heading)) = resolved.filter(|_| cfg.features.page_preview) {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     egui::Tooltip::always_open(
                         ctx.clone(),
@@ -5853,7 +5899,7 @@ fn tree_ui(
         let mut row = ui.selectable_label(active == Some(path.as_str()), text);
         // ファイル一覧では、Ctrlを押しているときだけプレビューを出す（一覧を眺めるときに邪魔にならないように）
         if *note && ui.input(|i| i.modifiers.command) {
-            row = row.on_hover_ui(|ui| hover::note_preview(ui, vault, cache, path, None));
+            row = row.on_hover_preview(|ui| hover::note_preview(ui, vault, cache, path, None));
         }
         if row.clicked() {
             actions.push(if *note {
@@ -5863,10 +5909,11 @@ fn tree_ui(
             });
         }
         row.context_menu(|ui| {
-            if *note && ui.button("ブックマークに追加 / 解除").clicked() {
+            if *note && preview::bookmarks_on() && ui.button("ブックマークに追加 / 解除").clicked()
+            {
                 actions.push(Action::ToggleBookmark(path.clone()));
             }
-            if *note && ui.button("履歴…").clicked() {
+            if *note && preview::file_recovery_on() && ui.button("履歴…").clicked() {
                 actions.push(Action::History(path.clone()));
             }
             if ui.button("改名/移動…").clicked() {
@@ -5951,7 +5998,15 @@ impl eframe::App for App {
                 .size_range(160.0..=500.0)
                 .show(ui, |ui| self.left_panel(ui, &mut actions));
         }
-        if self.vault.is_some() && self.cfg.show_right && !self.tabs.is_empty() && !self.show_graph
+        // 右サイドバーに出すものが1つも無ければ（コアプラグインをオフにした）、出さない
+        let f = self.cfg.features;
+        let right_has_content =
+            f.backlinks || f.related || f.outgoing_links || f.footnotes || f.outline;
+        if self.vault.is_some()
+            && self.cfg.show_right
+            && right_has_content
+            && !self.tabs.is_empty()
+            && !self.show_graph
         {
             egui::Panel::right("right")
                 .default_size(240.0)
