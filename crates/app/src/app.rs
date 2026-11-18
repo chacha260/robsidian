@@ -322,6 +322,9 @@ enum Action {
     Slash(String, usize),
     /// 音声を再生する / 止める（vault内のパス）
     PlayAudio(String),
+    /// 新しいキャンバス・ベースを作って開く
+    NewCanvas,
+    NewBase,
 }
 
 enum Dialog {
@@ -1124,6 +1127,157 @@ impl App {
             // Obsidianと同じく、存在しないリンクを開くとノートを作る
             self.create_and_open(target);
         }
+    }
+
+    /// 新しいファイル（キャンバス・ベース）を、開いているノートと同じフォルダに作って開く。
+    /// 同じ名前があれば「名前 1」「名前 2」…にする
+    fn create_file(&mut self, stem: &str, ext: &str, body: &str, ctx: &egui::Context) {
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let dir = self
+            .tabs
+            .get(self.active)
+            .map(|t| robsidian_core::vault::parent_dir(&t.path).to_string())
+            .unwrap_or_default();
+        let join = |name: &str| {
+            if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{dir}/{name}")
+            }
+        };
+        let mut path = join(&format!("{stem}.{ext}"));
+        let mut n = 1;
+        while vault.abs(&path).exists() {
+            path = join(&format!("{stem} {n}.{ext}"));
+            n += 1;
+        }
+        if let Err(e) = vault.write_file(&path, body.as_bytes()) {
+            self.toast(format!("作れませんでした: {e:#}"));
+            return;
+        }
+        self.generation += 1;
+        self.apply(Action::OpenExternal(path), ctx);
+    }
+
+    /// リボン（左端のアイコンの列）。有効なコアプラグインのアイコンを並べ、下端に設定の歯車
+    fn ribbon_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        use crate::ribbon::{button, Icon};
+        let f = self.cfg.features;
+        let recording = self.recorder.is_some();
+        let size = 30.0;
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let items: [(bool, Icon, &str, Option<Action>); 11] = [
+                (
+                    f.quick_switcher,
+                    Icon::QuickSwitch,
+                    "ノートを開く（クイックスイッチャー） Ctrl+P",
+                    Some(Action::Run(Command::QuickSwitch)),
+                ),
+                (
+                    f.graph,
+                    Icon::Graph,
+                    "グラフビュー Ctrl+G",
+                    Some(Action::Run(Command::ToggleGraph)),
+                ),
+                (
+                    f.canvas,
+                    Icon::Canvas,
+                    "新しいキャンバスを作る",
+                    Some(Action::NewCanvas),
+                ),
+                (
+                    f.daily_notes,
+                    Icon::Daily,
+                    "今日のデイリーノート Ctrl+D",
+                    Some(Action::Run(Command::Daily)),
+                ),
+                (
+                    f.templates,
+                    Icon::Template,
+                    "テンプレートを挿入",
+                    Some(Action::Run(Command::InsertTemplate)),
+                ),
+                (
+                    f.command_palette,
+                    Icon::Palette,
+                    "コマンドパレット Ctrl+Shift+P",
+                    Some(Action::Run(Command::Palette)),
+                ),
+                (
+                    f.random_note,
+                    Icon::Random,
+                    "ランダムなノートを開く",
+                    Some(Action::Run(Command::RandomNote)),
+                ),
+                (
+                    f.bases,
+                    Icon::Bases,
+                    "新しいベースを作る",
+                    Some(Action::NewBase),
+                ),
+                (
+                    f.slides,
+                    Icon::Slides,
+                    "スライドとして表示",
+                    Some(Action::Run(Command::Slides)),
+                ),
+                (
+                    f.unique_note,
+                    Icon::UniqueNote,
+                    "ユニークノートを作成",
+                    Some(Action::Run(Command::UniqueNote)),
+                ),
+                (
+                    f.audio,
+                    Icon::Mic,
+                    if recording {
+                        "録音を止めて、ノートに埋め込む"
+                    } else {
+                        "録音を始める"
+                    },
+                    Some(Action::Run(Command::Record)),
+                ),
+            ];
+            for (on, icon, tip, action) in items {
+                if !on {
+                    continue;
+                }
+                let active = (icon == Icon::Mic && recording)
+                    .then_some(egui::Color32::from_rgb(0xe9, 0x3e, 0x3e));
+                if button(ui, icon, size, active).on_hover_text(tip).clicked() {
+                    actions.extend(action);
+                }
+            }
+            if f.workspaces {
+                let resp = button(ui, Icon::Workspaces, size, None).on_hover_text("ワークスペース");
+                egui::Popup::menu(&resp)
+                    .align(egui::RectAlign::RIGHT_START)
+                    .show(|ui| {
+                        if ui.button("いまの配置を保存…").clicked() {
+                            actions.push(Action::Run(Command::SaveLayout));
+                        }
+                        if ui.button("ワークスペースを開く…").clicked() {
+                            actions.push(Action::Run(Command::OpenLayout));
+                        }
+                        if ui.button("ワークスペースを削除…").clicked() {
+                            actions.push(Action::Run(Command::DeleteLayout));
+                        }
+                    });
+            }
+        });
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            ui.add_space(6.0);
+            if button(ui, Icon::Gear, size, None)
+                .on_hover_text("設定 (Ctrl+,)")
+                .clicked()
+            {
+                actions.push(Action::Run(Command::Settings));
+            }
+        });
     }
 
     /// 音声を鳴らす。同じファイルを鳴らしていれば止める。
@@ -2559,6 +2713,14 @@ impl App {
             Action::OpenExternal(path) => self.open_external(&path, ctx),
             Action::FollowLink { target, from } => self.follow_link(&target, &from, ctx),
             Action::PlayAudio(path) => self.toggle_audio(&path),
+            Action::NewCanvas => {
+                let body = robsidian_core::canvas::to_json(&Default::default());
+                self.create_file("無題のキャンバス", "canvas", &body, ctx);
+            }
+            Action::NewBase => {
+                let body = "views:\n  - type: table\n    name: 表\n";
+                self.create_file("無題のベース", "base", body, ctx);
+            }
             Action::Activate(i) => {
                 self.active = i;
                 self.show_graph = false;
@@ -2688,6 +2850,14 @@ impl App {
         }
         let mut stop_audio = false;
         ui.horizontal(|ui| {
+            // リボンを出していないときは、左端に設定を開く歯車（コマンドパレットをオフにしても開けるように）
+            if (self.vault.is_none() || !self.cfg.show_ribbon)
+                && crate::ribbon::button(ui, crate::ribbon::Icon::Gear, 20.0, None)
+                    .on_hover_text("設定 (Ctrl+,)")
+                    .clicked()
+            {
+                git_cmd = Some(Command::Settings);
+            }
             if let Some(vault) = &self.vault {
                 let name = vault
                     .root()
@@ -5992,6 +6162,12 @@ impl eframe::App for App {
         }
 
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if self.vault.is_some() && self.cfg.show_ribbon {
+            egui::Panel::left("ribbon")
+                .exact_size(40.0)
+                .resizable(false)
+                .show(ui, |ui| self.ribbon_ui(ui, &mut actions));
+        }
         if self.vault.is_some() && self.cfg.show_left {
             egui::Panel::left("left")
                 .default_size(250.0)

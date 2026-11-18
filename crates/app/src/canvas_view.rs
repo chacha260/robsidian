@@ -285,14 +285,6 @@ impl CanvasView {
         let (mut undo, mut redo) = (false, false);
         ui.horizontal(|ui| {
             let title = robsidian_core::vault::file_name(&self.path).trim_end_matches(".canvas");
-            ui.heading(title);
-            ui.weak("使い方").on_hover_text(
-                "空いた所のドラッグで移動、ホイールで拡大縮小\n\
-                 カードはクリックで選び、ドラッグで動かす（グループは名前をつかむと中ごと動く）\n\
-                 選んだカードの丸からドラッグで、別のカードにつなぐ。右下の角で大きさを変える\n\
-                 ダブルクリック: テキストは書き換え、ノートは開く、空いた所ならカードを作る\n\
-                 右クリックで色・削除など。Delete で削除、Ctrl+Z / Ctrl+Shift+Z で元に戻す / やり直す",
-            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("閉じる").clicked() {
                     outcome = Some(Outcome::Close);
@@ -319,6 +311,20 @@ impl CanvasView {
                 ui.separator();
                 add_note = ui.button("ノートを追加").clicked();
                 add_text = ui.button("カードを追加").clicked();
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(title).heading())
+                            .truncate(),
+                    )
+                    .on_hover_text(&self.path);
+                    ui.weak("使い方").on_hover_text(
+                        "空いた所のドラッグで移動、ホイールで拡大縮小\n\
+                         カードはクリックで選び、ドラッグで動かす（グループは名前をつかむと中ごと動く）\n\
+                         選んだカードの丸からドラッグで、別のカードにつなぐ。右下の角で大きさを変える\n\
+                         ダブルクリック: テキストは書き換え、ノートは開く、空いた所ならカードを作る\n\
+                         右クリックで色・削除など。Delete で削除、Ctrl+Z / Ctrl+Shift+Z で元に戻す / やり直す",
+                    );
+                });
             });
         });
         ui.separator();
