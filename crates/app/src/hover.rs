@@ -122,6 +122,21 @@ pub fn split_target(target: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// ページプレビューがオンのときだけ、マウスを乗せたらノートの中身を見せる
+pub trait PreviewHover {
+    fn on_hover_preview(self, add: impl FnOnce(&mut egui::Ui)) -> egui::Response;
+}
+
+impl PreviewHover for egui::Response {
+    fn on_hover_preview(self, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+        if crate::preview::page_preview_on() {
+            self.on_hover_ui(add)
+        } else {
+            self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

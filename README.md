@@ -61,7 +61,7 @@ cargo run --release -p robsidian -- /path/to/vault
 | ペイン分割 | ツールバーの「分割」で、左右に別のノートを並べる。もう一方のペインをクリックするとそちらに移る。リンクで開いたノートはフォーカスのあるペインに出る。分割の状態は次回も復元 |
 | プロパティ | ライブ表示では、frontmatter（YAML）を本文から隠し、上に「プロパティ」欄として表示。値の編集・追加・削除ができる（リストはカンマ区切りで入力）。変更したキーの行だけを書き換えるので、他の行やコメントは崩れない |
 | ノート内の検索・置換 | Ctrl+Fで検索バー、Ctrl+Hで置換。一致をエディタ上で色付けし、Enter / F3で次へ。大文字小文字の区別と正規表現（置換で `$1`）に対応。置換もCtrl+Zで戻せる |
-| 設定 | Ctrl+,。テーマ、文字サイズ、読みやすい行幅（本文を一定幅で中央に）、表示モード、日本語フォント、編集補助のオン/オフ、自動保存までの時間、ローカル履歴の件数・日数。vaultのテンプレート・デイリーノート・添付の保存先も確認できる |
+| 設定 | Ctrl+,。テーマ、文字サイズ、読みやすい行幅（本文を一定幅で中央に）、表示モード、日本語フォント、編集補助のオン/オフ、自動保存までの時間、ローカル履歴の件数・日数、コアプラグインに当たる機能のオン/オフ。vaultのテンプレート・デイリーノート・添付の保存先も確認できる |
 | ホバープレビュー | リンク先を開かずに覗く。エディタではCtrl（macOSはCmd）を押しながらリンクに乗せる。バックリンク・検索結果・ブックマークは乗せるだけ、ファイル一覧はCtrl+ホバー。見出しリンクはその節だけを表示 |
 | 未リンクの言及 | 右サイドバーで、現在のノートの名前（とaliases）がリンクにならずに書かれている箇所を一覧し、1件ずつ、またはまとめて `[[リンク]]` にできる |
 | 戻る / 進む | Alt+← / Alt+→、またはマウスの戻る/進むボタン。リンクを辿った経路を行き来できる |
@@ -215,6 +215,13 @@ output = "insert"
 
 ### Obsidian のコアプラグインに相当する機能
 
+設定（Ctrl+,）の「コアプラグイン」で、下の表の機能（Obsidian のコアプラグインに当たるもの）を1つずつオン/オフできます（既定はすべてオン）。
+- オフにした機能は、コマンドパレット・ショートカット・サイドバー・ツールバー・ステータスバー・右クリックのメニューから消えます。
+  左右のサイドバーは、出すものが無くなったタブや欄を隠します。
+- Bases・Canvas・音声録音をオフにすると、`.base` `.canvas` WAV は、ほかのファイルと同じく既定のアプリで開きます。
+- ファイル復元をオフにすると、ローカル履歴を残しません。プロパティをオフにすると、frontmatter を YAML のまま見せます。
+- フォーマット変換・Publish・Sync・Web ビューアは Robsidian にありません（下記）。
+
 | Obsidian のコアプラグイン | Robsidian |
 |---|---|
 | バックリンク・発リンク・アウトライン | 右サイドバー。発リンクは、まだ無いノートを薄く表示し、クリックで作る |
@@ -227,11 +234,11 @@ output = "insert"
 | ワークスペース | 開いているタブと分割の配置を名前を付けて保存し、コマンドパレットから開く・削除する（`.robsidian/workspace.json`） |
 | Bases | `.base` ファイルを開くと、プロパティの表を出す（ビューの切り替え、名前のクリックでノートを開く）。ノートの中の ` ```base ` ブロックと `![[ファイル.base#ビュー]]` は、プレビューで表にする。書き方は下記 |
 | スライド | コマンド「スライドとして表示」で、ノートを `---` だけの行で区切って全画面で表示する。→ / Space で次、← で前、Esc で終わる |
-| Canvas | `.canvas` ファイル（JSON Canvas）を開くと、カードと矢印を表示する。ドラッグで移動、ホイールで拡大縮小、カードのクリックでノート・ファイル・URLを開く。編集はまだできない（「ファイルを開く」で既定のアプリへ） |
-| 音声録音 | コマンド「録音を開始 / 停止」。録音中はステータスバーに「● 録音中」が出て、クリックで止まる。止めると添付の場所に `Recording 年月日時分秒.wav` を保存し、ノートに埋め込む |
+| Canvas | `.canvas` ファイル（JSON Canvas）を開くと、カードと矢印を表示して編集できる。空いた所のドラッグで移動、ホイールで拡大縮小。カードはクリックで選んでドラッグで動かし、右下の角で大きさを変え、選んだカードの丸からドラッグで別のカードにつなぐ。ダブルクリックで、テキストは書き換え・ノートは開く・空いた所ならカードを作る。右クリックで色・矢印・削除。Ctrl+Z / Ctrl+Shift+Z で元に戻す / やり直す |
+| 音声録音 | コマンド「録音を開始 / 停止」。録音中はステータスバーに「● 録音中」が出て、クリックで止まる。止めると添付の場所に `Recording 年月日時分秒.wav` を保存し、ノートに埋め込む。埋め込んだ WAV は、ライブ表示の再生ボタンやプレビューの「▶」リンクで、その場で再生できる（もう一度クリックで止まる） |
 | ブックマーク・コマンドパレット・デイリーノート・ファイル一覧・グラフ・検索・タグ・テンプレート・クイックスイッチャー・ページプレビュー・プロパティ・ファイル復元 | それぞれ実装済み（上の各節） |
 
-Canvas の編集など、後回しにしたものと作らないものは [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズDにまとめています。
+後回しにしたものと作らないものは [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズDにまとめています。
 
 #### Bases の書き方
 
@@ -242,23 +249,43 @@ filters:            # すべてのビューに効く条件。and / or / not を�
   and:
     - file.hasTag("book")
     - 'status != "読了"'
+formulas:           # 計算列。列や並べ替えでは formula.名前 と書く
+  星: 'if(rating, "★".repeat(rating), "未評価")'
+  経過年: 'if(published, today().year - published.year + "年前", "")'
 properties:
   author:
     displayName: 著者
+  formula.星:
+    displayName: 評価
 views:
   - type: table
     name: 読書中
-    order: [file.name, author, status]   # 列
+    order: [file.name, author, status, formula.星]   # 列
     sort:
       - property: rating
         direction: DESC
     limit: 20
     filters: 'rating >= 4'               # このビューだけの条件
+  - type: cards                          # カード
+    name: 表紙
+    image: note.cover                    # 画像にするプロパティ（[[表紙.png]]・ファイル名・URL）
+    cardSize: 200                        # カードの幅
+    imageAspectRatio: 1.4                # 画像の高さ / 幅
+    imageFit: contain                    # 全体を収める（既定は枠いっぱいに切り抜く）
 ```
 
-- 条件式：比較（`==` `!=` `>` `<` `>=` `<=`）、`file.hasTag()` `file.inFolder()` `file.hasLink()` `file.hasProperty()`、`プロパティ.contains()`、先頭の `!` による否定
-- プロパティ：frontmatter のキー（`note.` は省略可）と、`file.name` `file.path` `file.folder` `file.mtime` `file.tags` `file.links` など
-- 未対応：`formulas`（計算式）、表以外のビュー（カードなど）、グループ分け。未対応の式は、黙って無視せずエラーとして表示します
+- 式（条件と計算列で同じ）
+  - 演算子：`+ - * / %`、比較（`==` `!=` `>` `<` `>=` `<=`）、`&&` `||` `!`、`条件 ? A : B`、かっこ、リスト `[a, b]`
+  - 参照：frontmatter のキー（`note.x`、空白などを含む名前は `note["x y"]`）、`file.name` `file.basename` `file.path` `file.folder` `file.ext` `file.size` `file.mtime` `file.ctime` `file.tags` `file.links` `file.backlinks`、`formula.x`
+  - ファイル：`file.hasTag()` `file.inFolder()` `file.hasLink()` `file.hasProperty()`
+  - 関数：`if()` `now()` `today()` `date()` `number()` `string()` `list()` `link()` `max()` `min()` `duration()`
+  - 文字列：`.length` `contains()` `containsAny()` `containsAll()` `startsWith()` `endsWith()` `lower()` `upper()` `title()` `trim()` `replace()` `repeat()` `slice()` `split()`
+  - 数値：`toFixed()` `round()` `abs()` `ceil()` `floor()`
+  - リスト：`.length` `[番号]` `contains()` `containsAny()` `containsAll()` `join()` `reverse()` `sort()` `unique()` `flat()` `slice()`
+  - 日付：`.year` `.month` `.day` `.hour` `.minute` `format("YYYY-MM-DD")` `date()` `time()` `relative()`、期間の足し引き（`now() - "7d"`、単位は `y` `M` `w` `d` `h` `m` `s`）、日付どうしの差（ミリ秒）
+  - どの値にも：`isEmpty()` `toString()`
+- 未対応：グループ分け（`groupBy`）、集計（`summaries`）、`this`、ラムダ式（`map` / `filter`）。未対応のものは、黙って無視せずエラーとして表示します
+- カードのビューは、ノートの中の埋め込みやプレビューでは、画像を先頭の列にした表として出します
 
 ### 関連ノート
 

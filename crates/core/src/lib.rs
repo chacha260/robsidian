@@ -4,6 +4,7 @@
 
 pub mod bases;
 pub mod canvas;
+pub mod formula;
 pub mod git;
 pub mod history;
 pub mod math;

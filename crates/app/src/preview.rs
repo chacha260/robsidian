@@ -6,8 +6,43 @@
 use robsidian_core::search::{self, QueryResult};
 use robsidian_core::{parse, LinkKind, Vault};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const SCHEME: &str = "rob:";
+
+/// 設定の「コアプラグイン」のうち、プレビューとエディタの組版に効くもの。
+/// ホバーや埋め込みなど、設定を持たない場所からも組版するので、ここに置いておく
+static BASES: AtomicBool = AtomicBool::new(true);
+static AUDIO: AtomicBool = AtomicBool::new(true);
+static PAGE_PREVIEW: AtomicBool = AtomicBool::new(true);
+static BOOKMARKS: AtomicBool = AtomicBool::new(true);
+static FILE_RECOVERY: AtomicBool = AtomicBool::new(true);
+
+pub fn set_features(f: &crate::config::Features) {
+    BASES.store(f.bases, Ordering::Relaxed);
+    AUDIO.store(f.audio, Ordering::Relaxed);
+    PAGE_PREVIEW.store(f.page_preview, Ordering::Relaxed);
+    BOOKMARKS.store(f.bookmarks, Ordering::Relaxed);
+    FILE_RECOVERY.store(f.file_recovery, Ordering::Relaxed);
+}
+
+/// マウスを乗せたときにノートの中身を見せるか（ページプレビュー）
+pub fn page_preview_on() -> bool {
+    PAGE_PREVIEW.load(Ordering::Relaxed)
+}
+
+pub fn bookmarks_on() -> bool {
+    BOOKMARKS.load(Ordering::Relaxed)
+}
+
+pub fn file_recovery_on() -> bool {
+    FILE_RECOVERY.load(Ordering::Relaxed)
+}
+
+/// 埋め込んだ音声をその場で鳴らすか
+pub fn audio_on() -> bool {
+    AUDIO.load(Ordering::Relaxed)
+}
 
 const IMAGE_EXTS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
 
@@ -52,7 +87,11 @@ pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
     let today = chrono::Local::now().date_naive();
     let expanded = expand_embeds(text, from, vault);
     let expanded = expand_queries(&expanded, vault, today);
-    let expanded = expand_bases(&expanded, from, vault);
+    let expanded = if BASES.load(Ordering::Relaxed) {
+        expand_bases(&expanded, from, vault)
+    } else {
+        expanded
+    };
     let expanded = split_callout_titles(&expanded);
     let text = expanded.as_str();
     let parsed = parse::parse(text);
@@ -68,11 +107,15 @@ pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
                 let replacement = if let Some(img) = image {
                     format!("![{}](<{}>)", link.target, file_uri(vault, img))
                 } else {
-                    let label = match (&link.alias, &link.heading) {
+                    let mut label = match (&link.alias, &link.heading) {
                         (Some(a), _) if !a.is_empty() => a.clone(),
                         (_, Some(h)) => format!("{} › {h}", link.target),
                         _ => link.target.clone(),
                     };
+                    // 埋め込んだ音声は、クリックでその場で鳴らす
+                    if link.embed && audio_on() && crate::player::is_audio(&link.target) {
+                        label = format!("▶ {label}");
+                    }
                     let target = match &link.heading {
                         Some(h) => format!("{}#{h}", link.target),
                         None => link.target.clone(),

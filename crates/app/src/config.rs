@@ -76,7 +76,222 @@ pub struct Config {
     pub trusted_commands: std::collections::BTreeMap<String, String>,
     /// Mermaid図を画像にするコマンド（空なら使わない）。`-i 入力 -o 出力 -b transparent -t テーマ` を後ろに付けて実行する
     pub mermaid_command: String,
+    /// Obsidian のコアプラグインに当たる機能のオン・オフ
+    pub features: Features,
 }
+
+/// Obsidian のコアプラグインに当たる機能のオン・オフ（設定画面の「コアプラグイン」）。
+/// 新しく足した項目は、古い設定ファイルでもオンで始まる
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Features {
+    pub backlinks: bool,
+    pub bookmarks: bool,
+    pub command_palette: bool,
+    pub daily_notes: bool,
+    pub file_explorer: bool,
+    pub file_recovery: bool,
+    pub graph: bool,
+    pub outline: bool,
+    pub page_preview: bool,
+    pub properties: bool,
+    pub quick_switcher: bool,
+    pub search: bool,
+    pub tags_view: bool,
+    pub templates: bool,
+    pub outgoing_links: bool,
+    pub footnotes: bool,
+    pub word_count: bool,
+    pub related: bool,
+    pub random_note: bool,
+    pub unique_note: bool,
+    pub slash_commands: bool,
+    pub note_composer: bool,
+    pub workspaces: bool,
+    pub bases: bool,
+    pub slides: bool,
+    pub canvas: bool,
+    pub audio: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self {
+            backlinks: true,
+            bookmarks: true,
+            command_palette: true,
+            daily_notes: true,
+            file_explorer: true,
+            file_recovery: true,
+            graph: true,
+            outline: true,
+            page_preview: true,
+            properties: true,
+            quick_switcher: true,
+            search: true,
+            tags_view: true,
+            templates: true,
+            outgoing_links: true,
+            footnotes: true,
+            word_count: true,
+            related: true,
+            random_note: true,
+            unique_note: true,
+            slash_commands: true,
+            note_composer: true,
+            workspaces: true,
+            bases: true,
+            slides: true,
+            canvas: true,
+            audio: true,
+        }
+    }
+}
+
+/// 設定画面に並べる項目（名前, 説明, 値）
+pub struct FeatureInfo {
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub value: fn(&mut Features) -> &mut bool,
+}
+
+pub const FEATURES: &[FeatureInfo] = &[
+    FeatureInfo {
+        name: "音声録音",
+        hint: "録音と、埋め込んだ WAV のその場での再生。オフなら WAV は既定のアプリで開く",
+        value: |f| &mut f.audio,
+    },
+    FeatureInfo {
+        name: "バックリンク",
+        hint: "右サイドバーのバックリンクと未リンクの言及、ステータスバーの被リンク数",
+        value: |f| &mut f.backlinks,
+    },
+    FeatureInfo {
+        name: "Bases",
+        hint: ".base を表やカードで表示する。オフなら既定のアプリで開く",
+        value: |f| &mut f.bases,
+    },
+    FeatureInfo {
+        name: "ブックマーク",
+        hint: "左サイドバーの ★ と、ブックマークの追加",
+        value: |f| &mut f.bookmarks,
+    },
+    FeatureInfo {
+        name: "Canvas",
+        hint: ".canvas を表示・編集する。オフなら既定のアプリで開く",
+        value: |f| &mut f.canvas,
+    },
+    FeatureInfo {
+        name: "コマンドパレット",
+        hint: "Ctrl+Shift+P のコマンドパレット",
+        value: |f| &mut f.command_palette,
+    },
+    FeatureInfo {
+        name: "デイリーノート",
+        hint: "Ctrl+D と「今日」ボタン",
+        value: |f| &mut f.daily_notes,
+    },
+    FeatureInfo {
+        name: "ファイルエクスプローラー",
+        hint: "左サイドバーのファイル一覧",
+        value: |f| &mut f.file_explorer,
+    },
+    FeatureInfo {
+        name: "ファイル復元",
+        hint: "ローカル履歴（保存の直前の内容を .robsidian/history に残す）と履歴の画面。オフなら残さない",
+        value: |f| &mut f.file_recovery,
+    },
+    FeatureInfo {
+        name: "脚注ビュー",
+        hint: "右サイドバーに、脚注の一覧を出す",
+        value: |f| &mut f.footnotes,
+    },
+    FeatureInfo {
+        name: "グラフビュー",
+        hint: "Ctrl+G とツールバーの「グラフ」",
+        value: |f| &mut f.graph,
+    },
+    FeatureInfo {
+        name: "ノートコンポーザー",
+        hint: "選択範囲の切り出しと、ノートの結合",
+        value: |f| &mut f.note_composer,
+    },
+    FeatureInfo {
+        name: "発リンク",
+        hint: "右サイドバーに、このノートからのリンクの一覧を出す",
+        value: |f| &mut f.outgoing_links,
+    },
+    FeatureInfo {
+        name: "アウトライン",
+        hint: "右サイドバーの見出しの一覧",
+        value: |f| &mut f.outline,
+    },
+    FeatureInfo {
+        name: "ページプレビュー",
+        hint: "リンクやノートの名前にマウスを乗せたときの中身のプレビュー",
+        value: |f| &mut f.page_preview,
+    },
+    FeatureInfo {
+        name: "プロパティ",
+        hint: "ライブ表示で frontmatter を欄にして編集する。オフなら YAML のまま見せる",
+        value: |f| &mut f.properties,
+    },
+    FeatureInfo {
+        name: "クイックスイッチャー",
+        hint: "Ctrl+P でノートを開く・作る",
+        value: |f| &mut f.quick_switcher,
+    },
+    FeatureInfo {
+        name: "ランダムノート",
+        hint: "コマンド「ランダムなノートを開く」",
+        value: |f| &mut f.random_note,
+    },
+    FeatureInfo {
+        name: "検索",
+        hint: "左サイドバーの全文検索（Ctrl+Shift+F）",
+        value: |f| &mut f.search,
+    },
+    FeatureInfo {
+        name: "スラッシュコマンド",
+        hint: "行頭で / を入力すると、コマンドパレットを開く",
+        value: |f| &mut f.slash_commands,
+    },
+    FeatureInfo {
+        name: "スライド",
+        hint: "コマンド「スライドとして表示」",
+        value: |f| &mut f.slides,
+    },
+    FeatureInfo {
+        name: "タグ一覧",
+        hint: "左サイドバーのタグの一覧",
+        value: |f| &mut f.tags_view,
+    },
+    FeatureInfo {
+        name: "テンプレート",
+        hint: "テンプレートの挿入と、テンプレートからの新規ノート",
+        value: |f| &mut f.templates,
+    },
+    FeatureInfo {
+        name: "ユニークノート",
+        hint: "コマンド「ユニークノートを作成」",
+        value: |f| &mut f.unique_note,
+    },
+    FeatureInfo {
+        name: "ワークスペース",
+        hint: "タブと分割の配置を保存して開く",
+        value: |f| &mut f.workspaces,
+    },
+    FeatureInfo {
+        name: "文字数カウント",
+        hint: "ステータスバーに文字数と単語数を出す",
+        value: |f| &mut f.word_count,
+    },
+    FeatureInfo {
+        name: "関連ノート",
+        hint: "右サイドバーに、リンクやタグが近いノートを出す（Robsidian 独自）",
+        value: |f| &mut f.related,
+    },
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -105,6 +320,7 @@ impl Default for Config {
             split_focus_right: false,
             trusted_commands: Default::default(),
             mermaid_command: "mmdc".into(),
+            features: Features::default(),
         }
     }
 }
@@ -116,7 +332,12 @@ fn config_path() -> Option<PathBuf> {
 impl Config {
     pub fn history_limits(&self) -> robsidian_core::history::Limits {
         robsidian_core::history::Limits {
-            versions: self.history_versions,
+            // ファイル復元をオフにしたら、履歴を残さない
+            versions: if self.features.file_recovery {
+                self.history_versions
+            } else {
+                0
+            },
             days: self.history_days.max(1),
         }
     }
@@ -143,5 +364,29 @@ impl Config {
         self.recent_vaults.insert(0, path.clone());
         self.recent_vaults.truncate(8);
         self.vault = Some(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn features_default_on_and_keep_unknown_off() {
+        // 古い設定ファイル（features が無い）では、すべてオン
+        let cfg: Config = serde_json::from_str(r#"{"dark": false}"#).unwrap();
+        assert_eq!(cfg.features, Features::default());
+        // 一部だけ書いてあれば、書いていない項目はオン
+        let cfg: Config = serde_json::from_str(r#"{"features": {"canvas": false}}"#).unwrap();
+        assert!(!cfg.features.canvas && cfg.features.bases);
+        // 設定画面の一覧は、すべての項目を指している
+        let mut f = Features::default();
+        for info in FEATURES {
+            *(info.value)(&mut f) = false;
+        }
+        assert_eq!(
+            serde_json::to_string(&f).unwrap().matches("true").count(),
+            0
+        );
     }
 }

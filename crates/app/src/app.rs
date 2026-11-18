@@ -8,7 +8,7 @@ use crate::find;
 use crate::fonts;
 use crate::graph::Graph;
 use crate::history_view::{self, HistoryView};
-use crate::hover;
+use crate::hover::{self, PreviewHover};
 use crate::math_view;
 use crate::preview;
 use crate::props_ui::PropsPanel;
@@ -145,6 +145,30 @@ impl Command {
 }
 
 type CommandEntry = (Command, &'static str, Option<(Modifiers, Key)>);
+
+impl Command {
+    /// 設定の「コアプラグイン」でオフにされていないか
+    fn enabled(self, f: &crate::config::Features) -> bool {
+        match self {
+            Command::RandomNote => f.random_note,
+            Command::UniqueNote => f.unique_note,
+            Command::ExtractNote | Command::MergeNote => f.note_composer,
+            Command::SaveLayout | Command::OpenLayout | Command::DeleteLayout => f.workspaces,
+            Command::Slides => f.slides,
+            Command::Record => f.audio,
+            Command::Palette => f.command_palette,
+            Command::QuickSwitch => f.quick_switcher,
+            Command::SearchAll => f.search,
+            Command::Daily => f.daily_notes,
+            Command::ToggleGraph => f.graph,
+            Command::History => f.file_recovery,
+            Command::ToggleBookmark => f.bookmarks,
+            Command::InsertTemplate | Command::NewFromTemplate => f.templates,
+            Command::AddProperty => f.properties,
+            _ => true,
+        }
+    }
+}
 const COMMANDS: &[CommandEntry] = &[
     (
         Command::Palette,
@@ -296,6 +320,8 @@ enum Action {
     RunUser(usize),
     /// スラッシュコマンド: (ノート, 入力した `/` のバイト位置)
     Slash(String, usize),
+    /// 音声を再生する / 止める（vault内のパス）
+    PlayAudio(String),
 }
 
 enum Dialog {
@@ -622,6 +648,8 @@ pub struct App {
     canvas_view: Option<crate::canvas_view::CanvasView>,
     /// 録音中
     recorder: Option<crate::recorder::Recorder>,
+    /// 再生中の音声
+    player: Option<crate::player::Player>,
     /// スライド表示中: (ノート, 何枚目)
     slideshow: Option<(String, usize)>,
     /// 折りたためるコールアウトを開いた / 閉じた: (ノート, 最初の行) → 開いているか
@@ -633,6 +661,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, vault_arg: Option<PathBuf>) -> Self {
         let cfg = Config::load();
+        preview::set_features(&cfg.features);
         let font = fonts::install(
             &cc.egui_ctx,
             (!cfg.font_path.is_empty()).then(|| std::path::Path::new(&cfg.font_path)),
@@ -697,6 +726,7 @@ impl App {
             base_view: None,
             canvas_view: None,
             recorder: None,
+            player: None,
             slideshow: None,
         };
         // 前回と同じvaultを開くときは、前回のタブを復元する（引数で指定した場合も）
@@ -1084,11 +1114,30 @@ impl App {
                 self.jump_to_heading(&path, heading);
             }
         } else if let Some(file) = vault.resolve_file(target, from).map(str::to_string) {
-            self.open_external(&file, ctx);
+            if self.cfg.features.audio && crate::player::is_audio(&file) {
+                // 録音などの音声は、その場で鳴らす（もう一度で止める）
+                self.toggle_audio(&file);
+            } else {
+                self.open_external(&file, ctx);
+            }
         } else if !target.is_empty() {
             // Obsidianと同じく、存在しないリンクを開くとノートを作る
             self.create_and_open(target);
         }
+    }
+
+    /// 音声を鳴らす。同じファイルを鳴らしていれば止める。
+    fn toggle_audio(&mut self, path: &str) {
+        let same = self.player.as_ref().is_some_and(|p| p.path == path);
+        self.player = None;
+        if same {
+            return;
+        }
+        let Some(vault) = &self.vault else { return };
+        self.player = Some(crate::player::Player::start(
+            vault.abs(path),
+            path.to_string(),
+        ));
     }
 
     /// 開いているノートの見出しへ移動する。`a#b` のような入れ子の指定は最後の見出しで探す。
@@ -1190,6 +1239,12 @@ impl App {
     // ---- コマンド ----
 
     fn run(&mut self, cmd: Command, ctx: &egui::Context) {
+        // オフにした機能は動かさない（録音中にオフにしたときは、止めることだけはできる）
+        if !cmd.enabled(&self.cfg.features) && !(cmd == Command::Record && self.recorder.is_some())
+        {
+            self.toast("この機能は設定（コアプラグイン）でオフになっています");
+            return;
+        }
         let current = self.current().map(|t| t.path.clone());
         match cmd {
             Command::QuickSwitch | Command::Palette => {
@@ -2221,6 +2276,7 @@ impl App {
         };
         let note = self.tabs.get(self.active).map(|t| t.path.as_str());
         let before = self.cfg.history_limits();
+        let features_before = self.cfg.features;
         let out = view.show(
             ctx,
             &mut self.cfg,
@@ -2240,6 +2296,9 @@ impl App {
                 );
             }
         }
+        if self.cfg.features != features_before {
+            self.apply_features();
+        }
         if self.cfg.history_limits() != before {
             if let Some(vault) = self.vault.as_mut() {
                 vault.history_limits = self.cfg.history_limits();
@@ -2248,6 +2307,30 @@ impl App {
         if out.close {
             self.settings = None;
             self.cfg.save();
+        }
+    }
+
+    /// 「コアプラグイン」のオン・オフを反映する
+    fn apply_features(&mut self) {
+        let f = self.cfg.features;
+        preview::set_features(&f);
+        // プレビューとエディタの組版をやり直す
+        self.generation += 1;
+        for tab in &mut self.tabs {
+            tab.layout_stale = true;
+            tab.preview = None;
+        }
+        if !f.bases {
+            self.base_view = None;
+        }
+        if !f.canvas {
+            self.canvas_view = None;
+        }
+        if !f.audio {
+            self.player = None;
+        }
+        if !f.graph {
+            self.show_graph = false;
         }
     }
 
@@ -2463,24 +2546,34 @@ impl App {
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Open(path, line) => self.open_note(&path, line),
-            Action::OpenExternal(path) if path.ends_with(".base") => {
+            Action::OpenExternal(path) if path.ends_with(".base") && self.cfg.features.bases => {
                 self.base_view = Some(crate::base_view::BaseView::new(path));
                 self.canvas_view = None;
                 self.show_graph = false;
             }
-            Action::OpenExternal(path) if path.ends_with(".canvas") => {
+            Action::OpenExternal(path) if path.ends_with(".canvas") && self.cfg.features.canvas => {
                 self.canvas_view = Some(crate::canvas_view::CanvasView::new(path));
                 self.base_view = None;
                 self.show_graph = false;
             }
             Action::OpenExternal(path) => self.open_external(&path, ctx),
             Action::FollowLink { target, from } => self.follow_link(&target, &from, ctx),
+            Action::PlayAudio(path) => self.toggle_audio(&path),
             Action::Activate(i) => {
                 self.active = i;
                 self.show_graph = false;
                 self.completion = None;
             }
             Action::Close(i) => self.close_tab(i),
+            Action::Search(_) if !self.cfg.features.search => {
+                self.toast("検索は設定（コアプラグイン）でオフになっています");
+            }
+            Action::History(_) if !self.cfg.features.file_recovery => {
+                self.toast("ファイル復元は設定（コアプラグイン）でオフになっています");
+            }
+            Action::ToggleBookmark(_) if !self.cfg.features.bookmarks => {
+                self.toast("ブックマークは設定（コアプラグイン）でオフになっています");
+            }
             Action::Search(query) => {
                 self.search_query = query;
                 self.cfg.show_left = true;
@@ -2533,6 +2626,9 @@ impl App {
                 }
             }
             for &(cmd, _, shortcut) in COMMANDS {
+                if !cmd.enabled(&self.cfg.features) {
+                    continue;
+                }
                 if vim_normal && cmd == Command::Daily {
                     continue;
                 }
@@ -2585,6 +2681,12 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let mut git_cmd = None;
+        if let Some(p) = self.player.take_if(|p| p.finished()) {
+            if let Some(e) = p.error() {
+                self.toast(format!("再生できません: {e}"));
+            }
+        }
+        let mut stop_audio = false;
         ui.horizontal(|ui| {
             if let Some(vault) = &self.vault {
                 let name = vault
@@ -2646,6 +2748,18 @@ impl App {
             for job in &self.jobs {
                 ui.weak(format!("「{}」を実行中…", job.name));
             }
+            if let Some(p) = &self.player {
+                let label = format!("▶ {}  {}", file_name(&p.path), p.progress_label());
+                if ui
+                    .add(egui::Button::new(RichText::new(label).weak()).frame(false))
+                    .on_hover_text("クリックで止める")
+                    .clicked()
+                {
+                    stop_audio = true;
+                }
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            }
             if let Some(err) = self.recorder.as_ref().and_then(|r| r.error()) {
                 // マイクが外されたなど。そこまでの録音を保存する
                 git_cmd = Some(Command::Record);
@@ -2671,21 +2785,26 @@ impl App {
                     } else {
                         "保存済み"
                     });
+                    if self.cfg.features.word_count {
                     let counts = tab.counts();
                     ui.weak(format!("{}文字 ・ {}語", counts.chars, counts.words))
                         .on_hover_text("文字数は空白を除く。単語数は、欧文は語、日本語などは1文字を1語と数える");
+                    }
                     let sel = selection_bytes(ui.ctx(), tab);
-                    if !sel.is_empty() {
+                    if self.cfg.features.word_count && !sel.is_empty() {
                         let c = robsidian_core::text::count(&tab.text[sel]);
                         ui.weak(format!("選択 {}文字 ・ {}語", c.chars, c.words));
                     }
-                    if let Some(vault) = &self.vault {
+                    if let Some(vault) = self.vault.as_ref().filter(|_| self.cfg.features.backlinks) {
                         ui.weak(format!("被リンク {}", vault.backlinks(&tab.path).len()));
                     }
                     ui.weak(&tab.path);
                 }
             });
         });
+        if stop_audio {
+            self.player = None;
+        }
         if let Some(cmd) = git_cmd {
             let ctx = ui.ctx().clone();
             self.run(cmd, &ctx);
@@ -2694,12 +2813,27 @@ impl App {
 
     fn left_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.add_space(4.0);
+        let f = self.cfg.features;
+        let tabs = [
+            (LeftTab::Files, "ファイル", f.file_explorer),
+            (LeftTab::Search, "検索", f.search),
+            (LeftTab::Tags, "タグ", f.tags_view),
+            (LeftTab::Tasks, "タスク", true),
+            (LeftTab::Bookmarks, "★", f.bookmarks),
+        ];
+        // オフにしたタブを開いていたら、出ているタブに移る
+        if !tabs.iter().any(|(t, _, on)| *on && *t == self.left_tab) {
+            self.left_tab = LeftTab::Tasks;
+            if let Some((t, _, _)) = tabs.iter().find(|(_, _, on)| *on) {
+                self.left_tab = *t;
+            }
+        }
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.left_tab, LeftTab::Files, "ファイル");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Search, "検索");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Tags, "タグ");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Tasks, "タスク");
-            ui.selectable_value(&mut self.left_tab, LeftTab::Bookmarks, "★");
+            for (t, name, on) in tabs {
+                if on {
+                    ui.selectable_value(&mut self.left_tab, t, name);
+                }
+            }
         });
         ui.separator();
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
@@ -2723,10 +2857,11 @@ impl App {
                         };
                         actions.push(Action::Dialog(d));
                     }
-                    if ui
-                        .button("今日")
-                        .on_hover_text("デイリーノート (Ctrl+D)")
-                        .clicked()
+                    if self.cfg.features.daily_notes
+                        && ui
+                            .button("今日")
+                            .on_hover_text("デイリーノート (Ctrl+D)")
+                            .clicked()
                     {
                         actions.push(Action::Run(Command::Daily));
                     }
@@ -2769,7 +2904,7 @@ impl App {
                                 active == Some(hit.path.as_str()),
                                 RichText::new(title).strong(),
                             )
-                            .on_hover_ui(|ui| {
+                            .on_hover_preview(|ui| {
                                 hover::note_preview(
                                     ui,
                                     vault,
@@ -2855,7 +2990,7 @@ impl App {
                                 if row.clicked() {
                                     actions.push(Action::Open(t.path.clone(), Some(t.task.line)));
                                 }
-                                row.on_hover_ui(|ui| hover::note_preview(ui, vault, &mut self.hover_cache, &t.path, None));
+                                row.on_hover_preview(|ui| hover::note_preview(ui, vault, &mut self.hover_cache, &t.path, None));
                             });
                             let note = file_name(&t.path).trim_end_matches(".md");
                             let meta = match t.task.due {
@@ -2886,7 +3021,7 @@ impl App {
                         };
                         let row = ui
                             .selectable_label(active == Some(path.as_str()), text)
-                            .on_hover_ui(|ui| {
+                            .on_hover_preview(|ui| {
                                 hover::note_preview(ui, vault, &mut self.hover_cache, path, None)
                             });
                         if row.clicked() && exists {
@@ -2927,8 +3062,10 @@ impl App {
         let mentions_cache = &mut self.mentions;
         let related_cache = &mut self.related;
         let generation = self.generation;
+        let features = self.cfg.features;
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if features.backlinks {
             ui.add_space(4.0);
             let backlinks = vault.backlinks(&tab.path);
             ui.strong(format!("バックリンク ({})", backlinks.len()));
@@ -2944,7 +3081,7 @@ impl App {
                     let title = name.strip_suffix(".md").unwrap_or(name);
                     if ui
                         .selectable_label(false, title)
-                        .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &link.source, None))
+                        .on_hover_preview(|ui| hover::note_preview(ui, vault, cache, &link.source, None))
                         .clicked()
                     {
                         actions.push(Action::Open(link.source.to_string(), Some(link.line)));
@@ -2994,7 +3131,7 @@ impl App {
                             let title = file_name(&m.source).trim_end_matches(".md");
                             let row = ui
                                 .selectable_label(false, title)
-                                .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, &m.source, None));
+                                .on_hover_preview(|ui| hover::note_preview(ui, vault, cache, &m.source, None));
                             if row.clicked() {
                                 actions.push(Action::Open(m.source.clone(), Some(m.line)));
                             }
@@ -3014,7 +3151,9 @@ impl App {
             if header.body_returned.is_none() {
                 *mentions_cache = None;
             }
+            }
 
+            if features.related {
             ui.add_space(6.0);
             let header = egui::CollapsingHeader::new(RichText::new("関連ノート").strong())
                 .id_salt("related-notes")
@@ -3055,7 +3194,7 @@ impl App {
                         }
                         let row = ui
                             .selectable_label(false, title)
-                            .on_hover_ui(|ui| {
+                            .on_hover_preview(|ui| {
                                 ui.weak(why.join("\n"));
                                 ui.separator();
                                 hover::note_preview(ui, vault, cache, &r.path, None);
@@ -3069,8 +3208,10 @@ impl App {
             if header.body_returned.is_none() {
                 *related_cache = None;
             }
+            }
 
             // 発リンク（このノートから出ているリンク。存在しないリンク先は薄く表示し、クリックで作る）
+            if features.outgoing_links {
             ui.add_space(6.0);
             let outgoing = vault.outgoing(&tab.path);
             let mut seen = std::collections::HashSet::new();
@@ -3095,7 +3236,7 @@ impl App {
                                 let title = file_name(path).trim_end_matches(".md");
                                 let row = ui
                                     .selectable_label(false, title)
-                                    .on_hover_ui(|ui| hover::note_preview(ui, vault, cache, path, None));
+                                    .on_hover_preview(|ui| hover::note_preview(ui, vault, cache, path, None));
                                 if row.clicked() {
                                     actions.push(Action::Open(path.to_string(), None));
                                 }
@@ -3117,8 +3258,14 @@ impl App {
                     }
                 });
 
+            }
+
             // 脚注（あるときだけ）。定義の行へ移動する
-            let notes = robsidian_core::text::footnotes(&tab.text);
+            let notes = if features.footnotes {
+                robsidian_core::text::footnotes(&tab.text)
+            } else {
+                Vec::new()
+            };
             if !notes.is_empty() {
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(RichText::new(format!("脚注 ({})", notes.len())).strong())
@@ -3144,6 +3291,9 @@ impl App {
                     });
             }
 
+            if !features.outline {
+                return;
+            }
             ui.add_space(10.0);
             ui.separator();
             ui.strong("アウトライン");
@@ -3190,10 +3340,11 @@ impl App {
             {
                 self.toggle_split();
             }
-            if ui
-                .selectable_label(self.show_graph, "グラフ")
-                .on_hover_text("Ctrl+G")
-                .clicked()
+            if self.cfg.features.graph
+                && ui
+                    .selectable_label(self.show_graph, "グラフ")
+                    .on_hover_text("Ctrl+G")
+                    .clicked()
             {
                 self.show_graph = !self.show_graph;
             }
@@ -3215,10 +3366,12 @@ impl App {
                         if ui.button("閉じる").clicked() {
                             actions.push(Action::Close(i));
                         }
-                        if ui.button("ブックマークに追加 / 解除").clicked() {
+                        if self.cfg.features.bookmarks
+                            && ui.button("ブックマークに追加 / 解除").clicked()
+                        {
                             actions.push(Action::ToggleBookmark(tab.path.clone()));
                         }
-                        if ui.button("履歴…").clicked() {
+                        if self.cfg.features.file_recovery && ui.button("履歴…").clicked() {
                             actions.push(Action::History(tab.path.clone()));
                         }
                         if ui.button("改名/移動…").clicked() {
@@ -3264,6 +3417,16 @@ impl App {
                 }
                 Some(Outcome::Close) => self.canvas_view = None,
                 None => {}
+            }
+            // 編集した内容をファイルに書く
+            if let (Some(view), Some(vault)) = (self.canvas_view.as_mut(), self.vault.as_mut()) {
+                if let Some(json) = view.take_save() {
+                    match vault.write_file(&view.path, json.as_bytes()) {
+                        Ok(()) => view.saved(vault),
+                        Err(e) => actions
+                            .push(Action::Toast(format!("キャンバスを保存できません: {e:#}"))),
+                    }
+                }
             }
             return;
         }
@@ -3384,6 +3547,7 @@ impl App {
             theme,
             callout_folds,
             props_panel,
+            player,
             ..
         } = self;
         let (Some(tab), Some(vault)) = (tabs.get_mut(*active), vault.as_ref()) else {
@@ -3758,7 +3922,7 @@ impl App {
                     note_embed: &note_embed,
                     math: &math_size,
                     callout_open: &callout_open,
-                    hide_frontmatter: live,
+                    hide_frontmatter: live && cfg.features.properties,
                     marks,
                     current_mark,
                 };
@@ -3789,7 +3953,7 @@ impl App {
                             ui.vertical(|ui| {
                                 ui.set_width((ui.available_width() - side).max(80.0));
                                 // 文字より後ろに描く装飾（コードブロックの背景）の場所を先に確保しておく
-                                if live {
+                                if live && cfg.features.properties {
                                     if let Some(new) =
                                         props_panel.show(ui, &note_path, text, &colors)
                                     {
@@ -4100,6 +4264,89 @@ impl App {
                         }
                     }
                 }
+                editor::DecoKind::Audio(target) => {
+                    let top = a.top() + editor::line_height(size) + 4.0;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, top),
+                        egui::vec2((right - left).clamp(80.0, 460.0), editor::AUDIO_HEIGHT),
+                    );
+                    behind.push(egui::Shape::rect_filled(rect, 16.0, colors.code_bg));
+                    let file = vault.resolve_file(target, &tab.path).map(str::to_string);
+                    let playing = player
+                        .as_ref()
+                        .filter(|p| Some(&p.path) == file.as_ref() && !p.finished());
+                    // 再生 / 停止のボタン（文字ではなく図形で描く）
+                    let c = egui::pos2(rect.left() + 16.0, rect.center().y);
+                    let r = 6.0;
+                    let mark = if file.is_none() {
+                        colors.dim
+                    } else {
+                        colors.accent
+                    };
+                    if playing.is_some() {
+                        painter.rect_filled(
+                            egui::Rect::from_center_size(c, egui::vec2(r * 1.6, r * 1.6)),
+                            1.0,
+                            mark,
+                        );
+                    } else {
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                c + egui::vec2(-r * 0.7, -r),
+                                c + egui::vec2(-r * 0.7, r),
+                                c + egui::vec2(r, 0.0),
+                            ],
+                            mark,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                    let name = file_name(file.as_deref().unwrap_or(target)).to_string();
+                    let label = match (&file, playing) {
+                        (None, _) => format!("{name}（見つかりません）"),
+                        (_, Some(p)) => format!("{name}   {}", p.progress_label()),
+                        _ => name,
+                    };
+                    painter.with_clip_rect(rect.intersect(clip)).text(
+                        egui::pos2(rect.left() + 32.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(size * 0.9),
+                        colors.text,
+                    );
+                    if let Some(p) = playing {
+                        // 進み具合の細い線
+                        let frac = p.fraction();
+                        let track = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 32.0, rect.bottom() - 5.0),
+                            egui::pos2(rect.right() - 16.0, rect.bottom() - 3.0),
+                        );
+                        painter.rect_filled(track, 1.0, colors.dim.gamma_multiply(0.4));
+                        let mut done = track;
+                        done.set_right(track.left() + track.width() * frac);
+                        painter.rect_filled(done, 1.0, colors.accent);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    if let Some(file) = file.filter(|_| clip.intersects(rect)) {
+                        let hit = ui.interact(
+                            rect,
+                            id.with(("audio", deco.chars.start)),
+                            egui::Sense::click(),
+                        );
+                        if hit.hovered() {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if hit
+                            .on_hover_text(if playing.is_some() {
+                                "止める"
+                            } else {
+                                "再生する"
+                            })
+                            .clicked()
+                        {
+                            actions.push(Action::PlayAudio(file));
+                        }
+                    }
+                }
                 editor::DecoKind::NoteEmbed(target) => {
                     let (note, heading) = hover::split_target(target);
                     let Some(path) = vault.resolve(note, &tab.path).map(str::to_string) else {
@@ -4289,7 +4536,10 @@ impl App {
                     .iter()
                     .any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
             });
-            if typed_slash && !(vim_on && vim_state.mode != vim::Mode::Insert) {
+            if typed_slash
+                && cfg.features.slash_commands
+                && !(vim_on && vim_state.mode != vim::Mode::Insert)
+            {
                 if let Some(c) = output.cursor_range.map(|r| r.primary.index.0) {
                     let at = editor::byte_of_char(&tab.text, c);
                     if at > 0 && tab.text[..at].ends_with('/') {
@@ -4335,7 +4585,8 @@ impl App {
                     };
                     path.map(|p| (p.to_string(), heading.map(str::to_string)))
                 });
-                if let Some((path, heading)) = resolved {
+                // ページプレビュー（オフなら、リンクの上でも中身は見せない）
+                if let Some((path, heading)) = resolved.filter(|_| cfg.features.page_preview) {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     egui::Tooltip::always_open(
                         ctx.clone(),
@@ -4612,7 +4863,11 @@ impl App {
                 );
             } else if p.mode == PaletteMode::Commands {
                 let q = q.to_lowercase();
+                let features = self.cfg.features;
                 let hits = COMMANDS.iter().enumerate().filter(|(_, c)| {
+                    if !c.0.enabled(&features) {
+                        return false;
+                    }
                     // IMEをオフにしたまま英語でも引けるようにする。空白で区切った語がすべて含まれれば一致
                     let label = c.1.to_lowercase();
                     let keywords = c.0.keywords();
@@ -5644,7 +5899,7 @@ fn tree_ui(
         let mut row = ui.selectable_label(active == Some(path.as_str()), text);
         // ファイル一覧では、Ctrlを押しているときだけプレビューを出す（一覧を眺めるときに邪魔にならないように）
         if *note && ui.input(|i| i.modifiers.command) {
-            row = row.on_hover_ui(|ui| hover::note_preview(ui, vault, cache, path, None));
+            row = row.on_hover_preview(|ui| hover::note_preview(ui, vault, cache, path, None));
         }
         if row.clicked() {
             actions.push(if *note {
@@ -5654,10 +5909,11 @@ fn tree_ui(
             });
         }
         row.context_menu(|ui| {
-            if *note && ui.button("ブックマークに追加 / 解除").clicked() {
+            if *note && preview::bookmarks_on() && ui.button("ブックマークに追加 / 解除").clicked()
+            {
                 actions.push(Action::ToggleBookmark(path.clone()));
             }
-            if *note && ui.button("履歴…").clicked() {
+            if *note && preview::file_recovery_on() && ui.button("履歴…").clicked() {
                 actions.push(Action::History(path.clone()));
             }
             if ui.button("改名/移動…").clicked() {
@@ -5742,7 +5998,15 @@ impl eframe::App for App {
                 .size_range(160.0..=500.0)
                 .show(ui, |ui| self.left_panel(ui, &mut actions));
         }
-        if self.vault.is_some() && self.cfg.show_right && !self.tabs.is_empty() && !self.show_graph
+        // 右サイドバーに出すものが1つも無ければ（コアプラグインをオフにした）、出さない
+        let f = self.cfg.features;
+        let right_has_content =
+            f.backlinks || f.related || f.outgoing_links || f.footnotes || f.outline;
+        if self.vault.is_some()
+            && self.cfg.show_right
+            && right_has_content
+            && !self.tabs.is_empty()
+            && !self.show_graph
         {
             egui::Panel::right("right")
                 .default_size(240.0)
