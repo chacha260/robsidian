@@ -2688,6 +2688,10 @@ impl App {
         }
         let mut stop_audio = false;
         ui.horizontal(|ui| {
+            // 左端に設定を開く歯車（Obsidian と同じく左下。コマンドパレットをオフにしても開けるように）
+            if gear_button(ui).on_hover_text("設定 (Ctrl+,)").clicked() {
+                git_cmd = Some(Command::Settings);
+            }
             if let Some(vault) = &self.vault {
                 let name = vault
                     .root()
@@ -2779,15 +2783,6 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // 右端に設定を開くボタン（コマンドパレットをオフにしても開けるように）
-                if ui
-                    .add(egui::Button::new("設定").frame(false))
-                    .on_hover_text("設定を開く (Ctrl+,)")
-                    .clicked()
-                {
-                    git_cmd = Some(Command::Settings);
-                }
-                ui.separator();
                 if let Some(tab) = self.tabs.get(self.active) {
                     ui.weak(if tab.dirty {
                         "● 未保存"
@@ -6063,4 +6058,46 @@ mod composer_tests {
         assert_eq!(sanitize_name("  a#b^c?  "), "abc");
         assert_eq!(sanitize_name(&"長".repeat(80)).chars().count(), 50);
     }
+}
+
+/// 歯車のアイコンのボタン（フォントに歯車の字が無いことがあるので、図形で描く）
+fn gear_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(18.0, 18.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(
+            rect.expand(2.0),
+            4.0,
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    let color = if response.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let painter = ui.painter();
+    let c = rect.center();
+    let r = rect.width() / 2.0 - 1.0;
+    // 8枚の歯（台形）と、本体の円、真ん中の穴
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::TAU / 8.0;
+        let dir = egui::vec2(a.cos(), a.sin());
+        let side = egui::vec2(-dir.y, dir.x);
+        let (inner, outer) = (r * 0.55, r);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                c + dir * inner - side * r * 0.2,
+                c + dir * outer - side * r * 0.13,
+                c + dir * outer + side * r * 0.13,
+                c + dir * inner + side * r * 0.2,
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    painter.circle_filled(c, r * 0.72, color);
+    painter.circle_filled(c, r * 0.3, ui.visuals().panel_fill);
+    response
 }
