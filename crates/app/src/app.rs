@@ -3019,6 +3019,7 @@ impl App {
             }
             vim::Cmd::Undo(_) | vim::Cmd::Redo(_) => {}
             vim::Cmd::Unknown(c) => self.toast(format!("未対応のコマンド: :{c}")),
+            vim::Cmd::Message(m) => self.toast(m),
         }
     }
 
@@ -3247,7 +3248,8 @@ impl App {
                 if !cmd.enabled(&self.cfg.features) {
                     continue;
                 }
-                if vim_normal && cmd == Command::Daily {
+                // Ctrl+D（半画面移動）と Ctrl+O（ジャンプリスト）はエディタに渡す
+                if vim_normal && matches!(cmd, Command::Daily | Command::OpenVault) {
                     continue;
                 }
                 if let Some((mods, key)) = shortcut {
@@ -3328,7 +3330,14 @@ impl App {
             if self.cfg.vim {
                 let label = match &self.vim.cmdline {
                     Some(line) => format!(":{line}"),
-                    None => format!("-- {} -- {}", self.vim.mode_label(), self.vim.pending()),
+                    None => {
+                        let rec = self
+                            .vim
+                            .recording()
+                            .map(|r| format!(" 記録中 @{r}"))
+                            .unwrap_or_default();
+                        format!("-- {} --{rec} {}", self.vim.mode_label(), self.vim.pending())
+                    }
                 };
                 ui.label(RichText::new(label).monospace().strong());
             }
@@ -5267,6 +5276,28 @@ impl App {
             };
             let rect = egui::Rect::from_min_size(here.left_top(), egui::vec2(width, here.height()));
             painter.rect_filled(rect, 1.0, colors.accent.gamma_multiply(0.45));
+            // 矩形選択（エディタの選択では表せないので、行ごとに塗る）
+            let blocks = vim_state.block_ranges(&tab.text, tab.cursor);
+            let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.6);
+            let (mut last_byte, mut last_char) = (0, 0);
+            for (a, b) in blocks {
+                let ca = last_char + tab.text[last_byte..a].chars().count();
+                let cb = ca + tab.text[a..b].chars().count();
+                (last_byte, last_char) = (b, cb);
+                for ch in ca..cb {
+                    let (here, after) = (row(ch), row(ch + 1));
+                    let width = if (after.top() - here.top()).abs() > 1.0 {
+                        size * 0.55
+                    } else {
+                        (after.left() - here.left()).max(2.0)
+                    };
+                    let rect = egui::Rect::from_min_size(
+                        here.left_top(),
+                        egui::vec2(width, here.height()),
+                    );
+                    painter.rect_filled(rect, 0.0, fill);
+                }
+            }
         }
         if let Some((ch, _next)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
@@ -6535,6 +6566,8 @@ fn vim_keys(event: &egui::Event) -> Option<Vec<vim::Key>> {
                 .collect(),
         ),
         Event::Ime(_) => Some(Vec::new()),
+        // Ctrl+V は貼り付けとして届く（クリップボードが空なら届かないので、Ctrl+Q も使える）
+        Event::Paste(_) | Event::PasteImage(_) => Some(vec![vim::Key::CtrlV]),
         Event::Key {
             key,
             pressed: true,
@@ -6549,6 +6582,10 @@ fn vim_keys(event: &egui::Event) -> Option<Vec<vim::Key>> {
             (Key::D, m) if m.command_only() => Some(vec![vim::Key::CtrlD]),
             (Key::U, m) if m.command_only() => Some(vec![vim::Key::CtrlU]),
             (Key::OpenBracket, m) if m.command_only() => Some(vec![vim::Key::Esc]),
+            (Key::O, m) if m.command_only() => Some(vec![vim::Key::CtrlO]),
+            (Key::I, m) if m.command_only() => Some(vec![vim::Key::CtrlI]),
+            (Key::Tab, m) if m.is_none() => Some(vec![vim::Key::CtrlI]),
+            (Key::Q, m) if m.command_only() => Some(vec![vim::Key::CtrlV]),
             _ => None,
         },
         _ => None,
