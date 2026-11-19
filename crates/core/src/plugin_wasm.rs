@@ -277,18 +277,23 @@ impl WasmPlugin {
         let (requests, rx) = mpsc::channel::<(Request, Sender<Result<Response>>)>();
         let dead = Arc::new(AtomicBool::new(false));
         let dead2 = dead.clone();
-        std::thread::spawn(move || {
-            for (req, reply) in rx {
-                let (r, trapped) = handle(&mut store, &instance, &req, fuel);
-                let _ = reply.send(r);
-                // 止まった（trap）ら、中の状態が壊れているかもしれないので、それ以降は使わない
-                // （アプリは次に使うときに読み込み直す）
-                if trapped {
-                    break;
+        // WASM の実行は、スタックに余裕のあるスレッドで行う（デバッグビルドの実行器は、スタックを多めに使う）
+        std::thread::Builder::new()
+            .name(format!("plugin-{name}"))
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                for (req, reply) in rx {
+                    let (r, trapped) = handle(&mut store, &instance, &req, fuel);
+                    let _ = reply.send(r);
+                    // 止まった（trap）ら、中の状態が壊れているかもしれないので、それ以降は使わない
+                    // （アプリは次に使うときに読み込み直す）
+                    if trapped {
+                        break;
+                    }
                 }
-            }
-            dead2.store(true, Ordering::Relaxed);
-        });
+                dead2.store(true, Ordering::Relaxed);
+            })
+            .context("プラグインのスレッドを始められません")?;
         Ok(Self {
             requests,
             calls,

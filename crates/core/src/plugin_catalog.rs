@@ -92,8 +92,15 @@ pub fn resolve(catalog_url: &str, url: &str) -> String {
     if url.contains("://") || url.starts_with('/') {
         return url.to_string();
     }
-    match catalog_url.rfind('/') {
-        Some(i) => format!("{}/{url}", &catalog_url[..i]),
+    // 区切りは `/`。Windows のパス（`D:\…\catalog.json`、`file://D:\…`）では `\` も区切り。
+    // ただし `file://` や `https://` の `//` は区切りとみなさない
+    let start = catalog_url.find("://").map_or(0, |i| i + 3);
+    match catalog_url[start..].rfind(['/', '\\']) {
+        Some(i) => {
+            let at = start + i;
+            let sep = &catalog_url[at..at + 1];
+            format!("{}{sep}{}", &catalog_url[..at], url.replace('/', sep))
+        }
         None => url.to_string(),
     }
 }
@@ -237,6 +244,13 @@ mod tests {
             "https://example.com/p/a/plugin.toml"
         );
         assert_eq!(resolve("https://x/c.json", "https://y/z"), "https://y/z");
+        // Windows のパス
+        assert_eq!(
+            resolve("file://D:\\a\\catalog.json", "p/plugin.toml"),
+            "file://D:\\a\\p\\plugin.toml"
+        );
+        assert_eq!(resolve("D:\\a\\catalog.json", "p/x"), "D:\\a\\p\\x");
+        assert_eq!(resolve("file:///tmp/c.json", "p/x"), "file:///tmp/p/x");
         assert!(!safe_relative(".hidden/x"));
         assert!(safe_relative("lib/robsidian.py"));
     }

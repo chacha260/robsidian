@@ -16,7 +16,7 @@ regex = "1"
 nucleo-matcher = "0.3"
 yaml-rust2 = { version = "0.10", default-features = false }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
-wasmi = "2"
+wasmi = "1.1"
 sha2 = "0.11.1"
 
 [dev-dependencies]
