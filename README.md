@@ -616,7 +616,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
-重さを調べるときは、環境変数 `ROBSIDIAN_PROFILE=1` を付けて起動すると、8ms を超えた描画の内訳（エディタの組み立て・装飾・サイドバーなど）を標準エラーに出します。
+重さを調べるときは、環境変数 `ROBSIDIAN_PROFILE=1` を付けて起動すると、8ms を超えた描画の内訳（エディタの組み立て・装飾・サイドバーなど）を標準エラーに出します。`ROBSIDIAN_PROFILE=2` のように数を渡すと、その時間（ミリ秒）を超えた描画を出します。
 
 ```bash
 ROBSIDIAN_PROFILE=1 cargo run --release -p robsidian -- /path/to/vault

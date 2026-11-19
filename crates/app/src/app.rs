@@ -390,8 +390,11 @@ struct Tab {
     select: Option<std::ops::Range<usize>>,
     /// 最後に確認したカーソル位置（バイト）
     cursor: usize,
-    layout: editor::Layout,
     layout_key: Option<LayoutKey>,
+    /// ブロックごとの組版（変わったブロックだけ組み直す）と、それを組んだときの設定
+    /// （文字サイズ・テーマ・ライブ表示か・幅・テーマの版）
+    blocks: editor::BlockCache,
+    blocks_key: Option<(f32, bool, bool, u32, u64)>,
     /// 画像の読み込み待ちなどで、次の描画で組版をやり直す必要がある
     layout_stale: bool,
     preview: Option<(u64, u64, String)>,
@@ -421,7 +424,8 @@ impl Tab {
             place_cursor: None,
             select: None,
             cursor: 0,
-            layout: editor::Layout::default(),
+            blocks: editor::BlockCache::default(),
+            blocks_key: None,
             layout_key: None,
             layout_stale: false,
             preview: None,
@@ -4636,14 +4640,20 @@ impl App {
             h.finish()
         };
         let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32, marks_key);
+        // カーソルと検索の一致のほかが変わったら、ブロックごとの組版も捨てる
+        let blocks_key = (size, cfg.dark, live, max_width as u32, theme.generation);
+        if tab.blocks_key != Some(blocks_key) || tab.layout_stale {
+            tab.blocks_key = Some(blocks_key);
+            tab.blocks.clear();
+        }
         if tab.layout_key != Some(key) || tab.layout_stale {
             tab.layout_key = Some(key);
-            tab.layout = editor::Layout::default();
+            tab.blocks.invalidate();
         }
-        let Tab { text, layout, .. } = tab;
+        let Tab { text, blocks, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             let _t = crate::profile::span("editor.layouter");
-            if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
+            if blocks.needs(buf.as_str()) {
                 let _t = crate::profile::span("editor.decorate");
                 let math_size = |tex: &str, display: bool| {
                     let b = math_view::layout(
@@ -4671,11 +4681,11 @@ impl App {
                     marks,
                     current_mark,
                 };
-                *layout = editor::layout(buf.as_str(), &options);
+                blocks.update(buf.as_str(), &options);
             }
             // 組み立て済みの文は egui が段落ごとに覚えている。毎回 egui に頼むこと
             // （頼まない描画があると、egui は使われなかった段落を捨て、次の編集で全体を組み直すことになる）
-            let mut job = layout.job.clone();
+            let mut job = blocks.job().clone();
             job.wrap.max_width = wrap_width;
             let _t = crate::profile::span("editor.galley");
             ui.fonts_mut(|f| f.layout_job(job))
@@ -4785,7 +4795,7 @@ impl App {
         let mut toggle = None;
         let mut fold_toggle = None;
         let _deco_t = crate::profile::span("editor.paint_decos");
-        for deco in &tab.layout.decos {
+        for deco in tab.blocks.decos() {
             let (a, b) = (row(deco.chars.start), row(deco.chars.end));
             if b.bottom() < clip.top() || a.top() > clip.bottom() {
                 continue;
