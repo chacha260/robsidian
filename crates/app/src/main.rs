@@ -19,6 +19,7 @@ mod mermaid;
 mod player;
 mod plugins;
 mod preview;
+mod profile;
 mod props_ui;
 mod recorder;
 mod ribbon;
