@@ -271,7 +271,7 @@ on = "save"
 - プラグインが書き換えた内容を保存したときは、保存のイベントをもう一度は呼びません（無限に続かないように）
 - 環境変数 `ROB_VAULT` `ROB_NOTE` `ROB_PLUGIN_DIR` も渡します
 - 画面なしで試すには `rob plugin list` と `rob plugin run <id> <command|codeblock|panel|event> <名前> [--note ノート] [--text 中身]`
-- 設計と今後（WASM と配布）は [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズE
+- 設計は [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズE
 
 #### 常駐するプラグイン（`mode = "server"`）
 
@@ -289,6 +289,33 @@ on = "save"
 通知（返事なし）は `ui/notice` `{text}` と `panel/refresh` `{id?}`（パネルを作り直させる）です。
 プラグインは、標準入力が閉じたら終わるようにしてください（アプリを終了したときに残らないように）。
 Python なら [`examples/plugins/weekly/robsidian.py`](examples/plugins/weekly/robsidian.py) を写すと、関数を1つ書くだけで作れます。
+
+#### WASM のプラグイン（`mode = "wasm"`）
+
+人に配る・人から受け取るプラグインは、WASM で作ると安全です。WASM のプラグインは箱（サンドボックス）の中で動き、
+ファイル・ネットワーク・プロセスには直接触れません。Robsidian への問い合わせ（上の表）も、`permissions` で許した分だけ通します。
+
+```toml
+name = "見出しとつながり"
+mode = "wasm"
+wasm = "plugin.wasm"         # 省くと plugin.wasm
+permissions = ["read"]       # read: vault/read・list・search・backlinks、write: vault/write。書かなければ問い合わせできない
+```
+
+- 依頼と返事の形は、ほかのプラグインと同じ JSON です。WASM との約束（`alloc`・`handle` と、取り込み関数 `robsidian.call`・`notify`・`log`）は
+  [docs/ROADMAP.md](docs/ROADMAP.md) のフェーズE3 にあります
+- Rust で書く例と、そのまま写せる助けの関数は [`examples/plugins/wasm-headings/`](examples/plugins/wasm-headings/)
+- 計算が長すぎるもの（止まらないもの）は止め、次に使うときに読み込み直します。メモリは 256MB まで
+- `.wasm` の中身が変わると、もう一度許可を求めます（許可の記録に `.wasm` の sha256 を含めます）
+
+#### プラグインを探して入れる
+
+プラグインの一覧（`catalog.json`）の URL を、設定の「プラグイン」→「プラグインを探す」に入れると、検索して「入れる」で入れられます。
+CLI では `rob plugin search [語] --catalog <URL>` と `rob plugin install <id> --catalog <URL>`（`ROB_PLUGIN_CATALOG` でも指定できます）。
+
+- ファイルは `curl` で取ってきて、一覧に書かれた sha256 と一致したときだけ入れます（`file://` やファイルのパスも使えます）
+- 入れても許可はしません。使う前に、中身を見て許可してください
+- 一覧の書き方と作り方は [`examples/catalog/`](examples/catalog/)。公式の一覧はまだありません
 
 ### Obsidian のコアプラグインに相当する機能
 
@@ -492,6 +519,7 @@ rob daily --append "- 14:00 打ち合わせ"
 | `rob tasks [条件] [--all \| --done]` | タスクの一覧（`path:行: [ ] 本文  📅 期日`。優先度・繰り返し・完了日も） |
 | `rob query <条件>` | 条件に合うノートやタスク（クエリブロックと同じ書き方） |
 | `rob plugin list` / `rob plugin run …` | プラグインの一覧と、画面なしでの実行（プラグインを作るときの確かめに） |
+| `rob plugin search` / `rob plugin install` | プラグインの一覧（catalog.json）から探す・入れる |
 | `rob orphans` / `rob unresolved` | 孤立ノート / リンク切れ |
 | `rob new <name> [-c 本文 \| -c -] [-t テンプレート]` | ノート作成（`-` で標準入力、`-t` でテンプレートを展開） |
 | `rob templates` | テンプレートの一覧 |

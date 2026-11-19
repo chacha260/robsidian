@@ -17,12 +17,33 @@ pub struct Outcome {
 pub struct SettingsView {
     /// 入力途中のフォントのパス（「適用」で設定に入れる）
     font_input: String,
+    /// プラグインの一覧（catalog.json）を探す欄
+    catalog: CatalogState,
+}
+
+/// プラグインの一覧を探す欄の状態。読み込みと導入は別スレッドで行う
+#[derive(Default)]
+struct CatalogState {
+    loading:
+        Option<std::sync::mpsc::Receiver<anyhow::Result<robsidian_core::plugin_catalog::Catalog>>>,
+    /// 読み込んだ一覧（とその URL）、または失敗の説明
+    loaded: Option<(
+        String,
+        Result<robsidian_core::plugin_catalog::Catalog, String>,
+    )>,
+    query: String,
+    installing: Option<(
+        String,
+        std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
+    )>,
+    message: Option<String>,
 }
 
 impl SettingsView {
     pub fn new(cfg: &Config) -> Self {
         Self {
             font_input: cfg.font_path.clone(),
+            catalog: CatalogState::default(),
         }
     }
 
@@ -171,6 +192,7 @@ impl SettingsView {
 
                     if let Some(vault) = vault {
                         plugins_section(ui, cfg, vault.root(), plugins, &mut out);
+                        catalog_section(ui, cfg, vault.root(), &mut self.catalog);
                     }
 
                     section(ui, "ローカル履歴");
@@ -308,6 +330,25 @@ fn plugins_section(
         if let Some(d) = &m.description {
             ui.weak(d);
         }
+        // 動き方と、WASM なら権限（外部プロセスは制限できないことも示す）
+        let how = match m.mode {
+            robsidian_core::plugin::Mode::Once => "外部プロセス（権限の制限なし）".to_string(),
+            robsidian_core::plugin::Mode::Server => {
+                "外部プロセス・常駐（権限の制限なし）".to_string()
+            }
+            robsidian_core::plugin::Mode::Wasm if m.permissions.is_empty() => {
+                "WASM（権限なし: Robsidian に問い合わせない）".to_string()
+            }
+            robsidian_core::plugin::Mode::Wasm => format!(
+                "WASM（権限: {}）",
+                m.permissions
+                    .iter()
+                    .map(|p| p.label())
+                    .collect::<Vec<_>>()
+                    .join("・")
+            ),
+        };
+        ui.label(RichText::new(how).small());
         let mut parts: Vec<String> = Vec::new();
         parts.extend(m.command.iter().map(|c| format!("コマンド「{}」", c.name)));
         parts.extend(
@@ -332,4 +373,127 @@ fn plugins_section(
     for (id, why) in &plugins.broken {
         ui.colored_label(ui.visuals().error_fg_color, format!("{id}: {why}"));
     }
+}
+
+/// 「プラグインを探す」の欄: 一覧（catalog.json）の URL・検索・入れる
+fn catalog_section(
+    ui: &mut egui::Ui,
+    cfg: &mut Config,
+    root: &std::path::Path,
+    st: &mut CatalogState,
+) {
+    use robsidian_core::plugin_catalog;
+    // 読み込みと導入の結果を受け取る
+    if let Some(rx) = &st.loading {
+        if let Ok(r) = rx.try_recv() {
+            st.loaded = Some((cfg.plugin_catalog.clone(), r.map_err(|e| format!("{e:#}"))));
+            st.loading = None;
+        }
+    }
+    if let Some((id, rx)) = &st.installing {
+        if let Ok(r) = rx.try_recv() {
+            st.message = Some(match r {
+                Ok(_) => format!(
+                    "「{id}」を入れました。上の一覧で「中身を見て許可する…」を押してから使ってください"
+                ),
+                Err(e) => format!("「{id}」を入れられませんでした: {e:#}"),
+            });
+            st.installing = None;
+        }
+    }
+    if st.loading.is_some() || st.installing.is_some() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(RichText::new("プラグインを探す").strong())
+        .id_salt("plugin-catalog")
+        .show(ui, |ui| {
+            ui.weak("プラグインの一覧（catalog.json）の URL。ファイルのパスでもよい（書き方は examples/catalog）");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.plugin_catalog)
+                        .hint_text("https://…/catalog.json")
+                        .desired_width(380.0),
+                );
+                let url = cfg.plugin_catalog.trim().to_string();
+                if ui
+                    .add_enabled(st.loading.is_none() && !url.is_empty(), egui::Button::new("読み込む"))
+                    .clicked()
+                {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(plugin_catalog::load(&url));
+                    });
+                    st.loading = Some(rx);
+                    st.message = None;
+                }
+            });
+            if st.loading.is_some() {
+                ui.weak("読み込んでいます…");
+            }
+            if let Some(m) = &st.message {
+                ui.label(RichText::new(m).small());
+            }
+            let Some((url, loaded)) = &st.loaded else {
+                return;
+            };
+            let catalog = match loaded {
+                Ok(c) => c,
+                Err(e) => {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                    return;
+                }
+            };
+            ui.add(egui::TextEdit::singleline(&mut st.query).hint_text("絞り込み"));
+            let hits = plugin_catalog::search(catalog, &st.query);
+            if hits.is_empty() {
+                ui.weak("一致するプラグインはありません");
+            }
+            let mut install = None;
+            for e in hits {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&e.name).strong());
+                    ui.weak(format!(
+                        "{}{}",
+                        e.id,
+                        e.version.as_deref().map(|v| format!(" ・ {v}")).unwrap_or_default()
+                    ));
+                    let installed = robsidian_core::plugin::dir(root).join(&e.id).exists();
+                    let label = if installed { "入れ直す" } else { "入れる" };
+                    if ui
+                        .add_enabled(st.installing.is_none(), egui::Button::new(label).small())
+                        .clicked()
+                    {
+                        install = Some(e.clone());
+                    }
+                });
+                if let Some(d) = &e.description {
+                    ui.weak(d);
+                }
+                let mut meta = Vec::new();
+                if let Some(a) = &e.author {
+                    meta.push(format!("作者: {a}"));
+                }
+                if let Some(h) = &e.homepage {
+                    meta.push(h.clone());
+                }
+                meta.push(format!("ファイル: {}", e.files.keys().cloned().collect::<Vec<_>>().join(", ")));
+                ui.label(RichText::new(meta.join(" ・ ")).small());
+            }
+            if let Some(entry) = install {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (root, url) = (root.to_path_buf(), url.clone());
+                let id = entry.id.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(plugin_catalog::install(&root, &entry, &url));
+                });
+                st.installing = Some((id, rx));
+                st.message = None;
+            }
+            if let Some((id, _)) = &st.installing {
+                ui.weak(format!("「{id}」を入れています…"));
+            }
+        });
 }

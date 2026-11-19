@@ -82,6 +82,8 @@ pub struct Config {
     pub features: Features,
     /// オフにしたプラグイン（`plugins::trust_key` の形: vault とプラグインの id）
     pub disabled_plugins: std::collections::BTreeSet<String>,
+    /// プラグインの一覧（catalog.json）の URL
+    pub plugin_catalog: String,
 }
 
 /// Obsidian のコアプラグインに当たる機能のオン・オフ（設定画面の「コアプラグイン」）。
@@ -327,6 +329,7 @@ impl Default for Config {
             mermaid_command: "mmdc".into(),
             features: Features::default(),
             disabled_plugins: Default::default(),
+            plugin_catalog: String::new(),
         }
     }
 }

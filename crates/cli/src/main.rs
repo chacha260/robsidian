@@ -10,7 +10,7 @@ mod serve;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use robsidian_core::{git, plugin, related, search, usercmd, Vault};
+use robsidian_core::{git, plugin, plugin_catalog, related, search, usercmd, Vault};
 use serde_json::json;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -166,6 +166,21 @@ enum Cmd {
 enum PluginCmd {
     /// プラグインの一覧（読めなかったものは理由も）
     List,
+    /// プラグインの一覧（catalog.json）から探す
+    Search {
+        /// 名前・id・説明に含む語（省くとすべて）
+        query: Vec<String>,
+        /// 一覧の URL（省くと環境変数 ROB_PLUGIN_CATALOG）
+        #[arg(long)]
+        catalog: Option<String>,
+    },
+    /// プラグインの一覧から入れる（同じ id があれば置き換える。使う前の許可は別に要る）
+    Install {
+        id: String,
+        /// 一覧の URL（省くと環境変数 ROB_PLUGIN_CATALOG）
+        #[arg(long)]
+        catalog: Option<String>,
+    },
     /// プラグインを1回呼び、返した JSON をそのまま出す
     Run {
         /// プラグインの id（フォルダ名）
@@ -594,7 +609,44 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Plugin { action } => {
             let (plugins, broken) = plugin::discover(vault.root());
+            let catalog_url = |c: Option<String>| -> Result<String> {
+                c.or_else(|| std::env::var("ROB_PLUGIN_CATALOG").ok())
+                    .filter(|c| !c.trim().is_empty())
+                    .context("一覧の URL を --catalog か ROB_PLUGIN_CATALOG で指定してください")
+            };
             match action {
+                PluginCmd::Search { query, catalog } => {
+                    let url = catalog_url(catalog)?;
+                    let c = plugin_catalog::load(&url)?;
+                    let hits = plugin_catalog::search(&c, &query.join(" "));
+                    if out.json {
+                        out.value(&serde_json::to_value(&hits)?)?;
+                    } else {
+                        out.lines(hits.iter().map(|e| {
+                            format!(
+                                "{}\t{}\t{}\t{}",
+                                e.id,
+                                e.name,
+                                e.version.as_deref().unwrap_or("-"),
+                                e.description.as_deref().unwrap_or("")
+                            )
+                        }))?;
+                    }
+                }
+                PluginCmd::Install { id, catalog } => {
+                    let url = catalog_url(catalog)?;
+                    let c = plugin_catalog::load(&url)?;
+                    let Some(entry) = c.plugins.iter().find(|e| e.id == id) else {
+                        bail!("一覧にありません: {id}");
+                    };
+                    let dir = plugin_catalog::install(vault.root(), entry, &url)?;
+                    eprintln!(
+                        "{}（{}）を入れました: {}\n使う前に、Robsidian の設定の「プラグイン」で中身を確かめて許可してください。",
+                        entry.name,
+                        entry.id,
+                        dir.display()
+                    );
+                }
                 PluginCmd::List => {
                     if out.json {
                         let ok: Vec<_> = plugins
@@ -670,10 +722,10 @@ fn run(cli: Cli) -> Result<()> {
                     }
                     let res = match p.manifest.mode {
                         plugin::Mode::Once => plugin::execute(p, &req)?,
-                        // 常駐するプラグイン: 起動して1回だけ頼む（待つあいだの問い合わせにも答える）
-                        plugin::Mode::Server => {
-                            let server = plugin::Server::start(p, vault.root())?;
-                            plugin::request_blocking(&server, &req, &mut vault)?
+                        // 常駐するプラグイン・WASM: 起動して1回だけ頼む（待つあいだの問い合わせにも答える）
+                        plugin::Mode::Server | plugin::Mode::Wasm => {
+                            let server = plugin::start_resident(p, vault.root())?;
+                            plugin::request_blocking(server.as_ref(), &req, &mut vault)?
                         }
                     };
                     out.value(&serde_json::to_value(&res)?)?;
