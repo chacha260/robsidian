@@ -1155,6 +1155,49 @@ pub fn completion_start(text: &str, cursor: usize) -> Option<usize> {
     Some(line_start + open + 2)
 }
 
+/// 文字の位置（何文字目か）から、組み立てた文の上の位置を引く表。
+///
+/// egui の `Galley::pos_from_cursor` は先頭の行から順にたどるので、長いノートで装飾ごとに呼ぶと遅い
+/// （行数 × 装飾の数）。行ごとの先頭の文字位置を覚えておき、二分探索で引く。
+pub struct RowIndex {
+    /// 各行の先頭の文字位置
+    starts: Vec<usize>,
+}
+
+impl RowIndex {
+    pub fn new(galley: &egui::Galley) -> Self {
+        let mut at = 0;
+        let starts = galley
+            .rows
+            .iter()
+            .map(|row| {
+                let start = at;
+                at += row.char_count_including_newline().0;
+                start
+            })
+            .collect();
+        Self { starts }
+    }
+
+    /// `galley.pos_from_cursor(CCursor::new(ch))` と同じ結果
+    pub fn pos(&self, galley: &egui::Galley, ch: usize) -> egui::Rect {
+        use egui::epaint::text::cursor::LayoutCursor;
+        if self.starts.is_empty() {
+            return galley.pos_from_cursor(egui::text::CCursor::new(ch));
+        }
+        let mut row = self.starts.partition_point(|&s| s <= ch).saturating_sub(1);
+        // 折り返した行の境目（改行で終わらない行の末尾）は、egui と同じく前の行の末尾とみなす
+        if row > 0 && ch == self.starts[row] && !galley.rows[row - 1].ends_with_newline {
+            row -= 1;
+        }
+        let column = ch - self.starts[row];
+        galley.pos_from_layout_cursor(&LayoutCursor {
+            row,
+            column: egui::text::CharIndex(column),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,5 +1695,33 @@ mod tests {
         assert_eq!(image_only("![alt](https://x/y.png)"), None);
         assert_eq!(image_only("text ![[a.png]]"), None);
         assert!(is_rule("---") && is_rule("* * *") && !is_rule("--") && !is_rule("-a-"));
+    }
+
+    #[test]
+    fn row_index_matches_egui() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // 折り返しのある行・空の行・改行で終わる行を混ぜる
+            let text = "短い\n折り返すとても長い行です。折り返すとても長い行です。折り返す\n\n最後";
+            let galley = ui.fonts_mut(|f| {
+                f.layout(
+                    text.to_string(),
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                    60.0,
+                )
+            });
+            assert!(galley.rows.len() > 4, "折り返していない");
+            let index = RowIndex::new(&galley);
+            for ch in 0..=text.chars().count() + 1 {
+                assert_eq!(
+                    index.pos(&galley, ch),
+                    galley.pos_from_cursor(egui::text::CCursor::new(ch)),
+                    "{ch} 文字目"
+                );
+            }
+        });
+        // テストでは描かないので、フォントのテクスチャの更新は捨てる
+        out.textures_delta.clear();
     }
 }

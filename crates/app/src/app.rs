@@ -400,6 +400,8 @@ struct Tab {
     counts: std::cell::Cell<Option<(u64, robsidian_core::text::Counts)>>,
     /// 保存した回数（プラグインのパネルを作り直す目安）
     saves: u64,
+    /// 脚注の一覧（本文の版ごと）
+    footnotes: Option<(u64, Vec<robsidian_core::text::Footnote>)>,
     /// プラグインが本文を書き換えた直後の版（その内容の保存では、保存のイベントを呼ばない）
     plugin_edit: Option<u64>,
 }
@@ -427,6 +429,7 @@ impl Tab {
             counts: std::cell::Cell::new(None),
             saves: 0,
             plugin_edit: None,
+            footnotes: None,
         }
     }
 
@@ -435,9 +438,16 @@ impl Tab {
         name.strip_suffix(".md").unwrap_or(name)
     }
 
+    /// 入力の途中か（最後の編集から少ししか経っていない）。長いノートでは、文字数・脚注・アウトラインのような
+    /// 本文全体から作る情報を入力のたびに作り直すと重いので、途中のあいだは前の結果を見せる
+    fn typing(&self) -> bool {
+        self.edited_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(400))
+    }
+
     fn counts(&self) -> robsidian_core::text::Counts {
         match self.counts.get() {
-            Some((v, c)) if v == self.version => c,
+            Some((v, c)) if v == self.version || self.typing() => c,
             _ => {
                 let c = robsidian_core::text::count(&self.text);
                 self.counts.set(Some((self.version, c)));
@@ -658,6 +668,7 @@ pub struct App {
     plugin_events: Vec<(String, robsidian_core::plugin::EventKind)>,
     /// プラグインのパネルを描く Markdown のキャッシュ
     plugin_md: CommonMarkCache,
+
     git: external::GitState,
     /// コミットメッセージの入力中
     commit_message: Option<String>,
@@ -742,6 +753,7 @@ impl App {
             plugin_trust: None,
             plugin_events: Vec::new(),
             plugin_md: CommonMarkCache::default(),
+
             git: Default::default(),
             commit_message: None,
             theme: Default::default(),
@@ -1913,7 +1925,9 @@ impl App {
         // パネル: 開いているノートが変わったか、保存したら作り直す
         if self.cfg.show_right {
             if let Some(tab) = self.tabs.get(self.active) {
-                let (path, saves, text) = (tab.path.clone(), tab.saves, tab.text.clone());
+                // 本文は、パネルを作り直すときだけ複製する（描画のたびに長いノートを複製しないように）
+                let (path, saves) = (tab.path.clone(), tab.saves);
+                let active = self.active;
                 for p in self.plugins.list.clone() {
                     if crate::plugins::usable(&self.cfg, root, &p) != Usable::Yes {
                         continue;
@@ -1939,7 +1953,7 @@ impl App {
                         let mut req = Request::new(Kind::Panel, &panel.id, root);
                         req.note = Some(NoteInfo {
                             path: path.clone(),
-                            text: Some(text.clone()),
+                            text: self.tabs.get(active).map(|t| t.text.clone()),
                             selection: None,
                             line: None,
                         });
@@ -3917,7 +3931,15 @@ impl App {
 
             // 脚注（あるときだけ）。定義の行へ移動する
             let notes = if features.footnotes {
-                robsidian_core::text::footnotes(&tab.text)
+                // 本文が変わったら作り直す（入力の途中は前の結果のまま）
+                let stale = tab
+                    .footnotes
+                    .as_ref()
+                    .is_none_or(|(v, _)| *v != tab.version && !tab.typing());
+                if stale {
+                    tab.footnotes = Some((tab.version, robsidian_core::text::footnotes(&tab.text)));
+                }
+                tab.footnotes.as_ref().map(|(_, n)| n.clone()).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -3980,7 +4002,11 @@ impl App {
             ui.separator();
             ui.strong("アウトライン");
             ui.add_space(2.0);
-            if tab.outline.as_ref().is_none_or(|(v, _)| *v != tab.version) {
+            if tab
+                .outline
+                .as_ref()
+                .is_none_or(|(v, _)| *v != tab.version && !tab.typing())
+            {
                 tab.outline = Some((tab.version, parse::parse(&tab.text).headings));
             }
             let headings = tab.outline.as_ref().map_or(&[][..], |(_, h)| h.as_slice());
@@ -4081,7 +4107,10 @@ impl App {
         if self.vault.is_none() {
             return self.welcome(ui, actions);
         }
-        self.toolbar(ui, actions);
+        {
+            let _t = crate::profile::span("toolbar");
+            self.toolbar(ui, actions);
+        }
         ui.separator();
 
         if let (Some(view), Some(vault)) = (self.canvas_view.as_mut(), self.vault.as_ref()) {
@@ -4212,6 +4241,7 @@ impl App {
     }
 
     fn editor_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>, live: bool) {
+        let _t = crate::profile::span("editor_ui");
         let Self {
             tabs,
             vault,
@@ -4581,7 +4611,9 @@ impl App {
         }
         let Tab { text, layout, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+            let _t = crate::profile::span("editor.layouter");
             if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
+                let _t = crate::profile::span("editor.decorate");
                 let math_size = |tex: &str, display: bool| {
                     let b = math_view::layout(
                         &ctx,
@@ -4610,8 +4642,11 @@ impl App {
                 };
                 *layout = editor::layout(buf.as_str(), &options);
             }
+            // 組み立て済みの文は egui が段落ごとに覚えている。毎回 egui に頼むこと
+            // （頼まない描画があると、egui は使われなかった段落を捨て、次の編集で全体を組み直すことになる）
             let mut job = layout.job.clone();
             job.wrap.max_width = wrap_width;
+            let _t = crate::profile::span("editor.galley");
             ui.fonts_mut(|f| f.layout_job(job))
         };
 
@@ -4656,6 +4691,7 @@ impl App {
                                     // ノーマルモードは下でブロック型のカーソルを描く
                                     ui.visuals_mut().text_cursor.stroke.width = 0.0;
                                 }
+                                let _t = crate::profile::span("editor.textedit");
                                 let output = TextEdit::multiline(text)
                                     .id(id)
                                     .frame(egui::Frame::NONE)
@@ -4711,15 +4747,13 @@ impl App {
         let left = output.galley_pos.x;
         // 右端はエディタ自身の幅で決める（分割表示で隣の列にはみ出さないように）
         let right = output.response.response.rect.right().max(left + 40.0);
-        let row = |ch: usize| {
-            output
-                .galley
-                .pos_from_cursor(CCursor::new(ch))
-                .translate(origin)
-        };
+        // 装飾の位置は、行の表から二分探索で引く（pos_from_cursor は先頭から順にたどるので、長いノートで遅い）
+        let rows = editor::RowIndex::new(&output.galley);
+        let row = |ch: usize| rows.pos(&output.galley, ch).translate(origin);
         let mut behind = Vec::new();
         let mut toggle = None;
         let mut fold_toggle = None;
+        let _deco_t = crate::profile::span("editor.paint_decos");
         for deco in &tab.layout.decos {
             let (a, b) = (row(deco.chars.start), row(deco.chars.end));
             if b.bottom() < clip.top() || a.top() > clip.bottom() {
@@ -6689,10 +6723,26 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
+        self.ui_inner(ui);
+        crate::profile::frame_end(frame_start.elapsed(), std::time::Duration::from_millis(8));
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.on_exit_inner();
+    }
+}
+
+impl App {
+    fn ui_inner(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+
         self.poll_watcher(&ctx);
         self.autosave(&ctx);
-        self.poll_external(&ctx);
+        {
+            let _t = crate::profile::span("poll_external");
+            self.poll_external(&ctx);
+        }
         self.apply_style(&ctx);
         if self.slideshow.is_some() {
             self.slides_ui(ui, &ctx);
@@ -6742,7 +6792,10 @@ impl eframe::App for App {
             }
         }
 
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("status").show(ui, |ui| {
+            let _t = crate::profile::span("status_bar");
+            self.status_bar(ui)
+        });
         if self.vault.is_some() && self.cfg.show_ribbon {
             egui::Panel::left("ribbon")
                 .exact_size(40.0)
@@ -6753,7 +6806,10 @@ impl eframe::App for App {
             egui::Panel::left("left")
                 .default_size(250.0)
                 .size_range(160.0..=500.0)
-                .show(ui, |ui| self.left_panel(ui, &mut actions));
+                .show(ui, |ui| {
+                    let _t = crate::profile::span("left_panel");
+                    self.left_panel(ui, &mut actions)
+                });
         }
         // 右サイドバーに出すものが1つも無ければ（コアプラグインをオフにした）、出さない
         let f = self.cfg.features;
@@ -6776,9 +6832,15 @@ impl eframe::App for App {
             egui::Panel::right("right")
                 .default_size(240.0)
                 .size_range(160.0..=500.0)
-                .show(ui, |ui| self.right_panel(ui, &mut actions));
+                .show(ui, |ui| {
+                    let _t = crate::profile::span("right_panel");
+                    self.right_panel(ui, &mut actions)
+                });
         }
-        egui::CentralPanel::default().show(ui, |ui| self.central(ui, &mut actions));
+        egui::CentralPanel::default().show(ui, |ui| {
+            let _t = crate::profile::span("central");
+            self.central(ui, &mut actions)
+        });
 
         self.palette_ui(&ctx, &mut actions);
         self.dialog_ui(&ctx);
@@ -6800,7 +6862,7 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit_inner(&mut self) {
         self.save_all();
         self.cfg.open_tabs = self.tabs.iter().map(|t| t.path.clone()).collect();
         self.cfg.active_tab = self.active;

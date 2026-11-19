@@ -615,3 +615,9 @@ cargo test --workspace
 ```bash
 cargo clippy --workspace --all-targets
 ```
+
+重さを調べるときは、環境変数 `ROBSIDIAN_PROFILE=1` を付けて起動すると、8ms を超えた描画の内訳（エディタの組み立て・装飾・サイドバーなど）を標準エラーに出します。
+
+```bash
+ROBSIDIAN_PROFILE=1 cargo run --release -p robsidian -- /path/to/vault
+```
