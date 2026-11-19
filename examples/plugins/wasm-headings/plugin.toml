@@ -1,0 +1,15 @@
+# WASM のプラグインの例（段階3）。plugin.wasm は README の手順でビルドする
+name = "見出しとつながり（WASM）"
+version = "0.1.0"
+description = "見出しの一覧をパネルに出す。このノートへのつながりを数える"
+mode = "wasm"
+wasm = "plugin.wasm"
+permissions = ["read"]       # vault/backlinks を使うので「ノートを読む」が要る
+
+[[panel]]
+id = "headings"
+title = "見出し（WASM）"
+
+[[command]]
+id = "links"
+name = "このノートへのつながりを数える"

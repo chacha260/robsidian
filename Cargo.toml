@@ -2,10 +2,10 @@
 resolver = "2"
 members = ["crates/core", "crates/cli", "crates/app"]
 # 取り込んだ外部のクレート（手を入れたもの）。fmt と clippy の対象にしない
-exclude = ["vendor"]
+exclude = ["vendor", "examples"]
 
 [workspace.package]
-version = "0.2.14"
+version = "0.2.15"
 edition = "2021"
 license = "MIT"
 

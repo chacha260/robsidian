@@ -75,7 +75,7 @@ pub struct Plugins {
     /// パネルの中身（(プラグイン, パネル) → 中身）
     pub panels: HashMap<(String, String), Panel>,
     /// 起動したままのプラグイン（段階2。id → プロセス）
-    servers: HashMap<String, plugin::Server>,
+    servers: HashMap<String, Box<dyn plugin::Resident>>,
 }
 
 /// 許可を覚えておくキー（vault とプラグインごと）
@@ -174,14 +174,16 @@ impl Plugins {
                 rx
             }
             // 常駐するプラグイン: 起動していなければ起動し、依頼を送る（返事は poll で受け取る）
-            plugin::Mode::Server => match self.server(plugin, Path::new(&req.vault)) {
-                Ok(server) => server.request(&req),
-                Err(e) => {
-                    let (tx, rx) = mpsc::channel();
-                    let _ = tx.send(Err(e));
-                    rx
+            plugin::Mode::Server | plugin::Mode::Wasm => {
+                match self.server(plugin, Path::new(&req.vault)) {
+                    Ok(server) => server.request(&req),
+                    Err(e) => {
+                        let (tx, rx) = mpsc::channel();
+                        let _ = tx.send(Err(e));
+                        rx
+                    }
                 }
-            },
+            }
         };
         self.jobs.push(Job {
             name: plugin.manifest.name.clone(),
@@ -192,15 +194,15 @@ impl Plugins {
     }
 
     /// 起動したままのプラグイン（落ちていたら起動し直す）
-    fn server(&mut self, plugin: &Plugin, vault: &Path) -> anyhow::Result<&plugin::Server> {
+    fn server(&mut self, plugin: &Plugin, vault: &Path) -> anyhow::Result<&dyn plugin::Resident> {
         if self.servers.get(&plugin.id).is_some_and(|s| !s.alive()) {
             self.servers.remove(&plugin.id);
         }
         if !self.servers.contains_key(&plugin.id) {
-            let server = plugin::Server::start(plugin, vault)?;
+            let server = plugin::start_resident(plugin, vault)?;
             self.servers.insert(plugin.id.clone(), server);
         }
-        Ok(&self.servers[&plugin.id])
+        Ok(self.servers[&plugin.id].as_ref())
     }
 
     /// 起動したままのプラグインを止める（オフにした・許可を取り消したとき）
@@ -412,10 +414,26 @@ pub fn trust_ui(ctx: &egui::Context, p: &Plugin) -> Option<TrustOutcome> {
         ui.set_width((size.x * 0.7).min(760.0));
         ui.heading(format!("プラグイン「{}」を許可しますか？", p.manifest.name));
         ui.add_space(4.0);
-        ui.label(
-            "このプラグインは、下の run のコマンドをあなたの権限で実行します。\
-             他人から受け取った vault なら、プラグインのフォルダの中身（スクリプト）を確かめてから許可してください。",
-        );
+        ui.label(match p.manifest.mode {
+            plugin::Mode::Wasm if p.manifest.permissions.is_empty() => {
+                "このプラグインは箱の中（WASM）で動き、ファイルやネットワークには直接触れません。\
+                 permissions が無いので、Robsidian への問い合わせもできません。"
+                    .to_string()
+            }
+            plugin::Mode::Wasm => format!(
+                "このプラグインは箱の中（WASM）で動き、ファイルやネットワークには直接触れません。\
+                 Robsidian への問い合わせは、次の権限の分だけ通します: {}",
+                p.manifest
+                    .permissions
+                    .iter()
+                    .map(|x| x.label())
+                    .collect::<Vec<_>>()
+                    .join("・")
+            ),
+            _ => "このプラグインは、下の run のコマンドをあなたの権限で実行します。\
+                  他人から受け取った vault なら、プラグインのフォルダの中身（スクリプト）を確かめてから許可してください。"
+                .to_string(),
+        });
         ui.weak(p.dir.join("plugin.toml").display().to_string());
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {

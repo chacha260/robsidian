@@ -77,6 +77,36 @@ pub enum Mode {
     Once,
     /// 起動したままにして、JSON-RPC で話す（段階2）
     Server,
+    /// WASM を箱の中で動かす（段階3。`plugin_wasm`）
+    Wasm,
+}
+
+/// WASM のプラグインに与える権限（問い合わせのうち、どれを通すか）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// vault/read・list・search・backlinks
+    Read,
+    /// vault/write
+    Write,
+}
+
+impl Permission {
+    /// この問い合わせに要る権限（知らない問い合わせは None）
+    pub fn needed_for(method: &str) -> Option<Permission> {
+        Some(match method {
+            "vault/read" | "vault/list" | "vault/search" | "vault/backlinks" => Permission::Read,
+            "vault/write" => Permission::Write,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Permission::Read => "ノートを読む",
+            Permission::Write => "ノートを書く",
+        }
+    }
 }
 
 /// `plugin.toml` の中身
@@ -90,7 +120,15 @@ pub struct Manifest {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// 外部プロセスのプラグイン（once / server）で起動するコマンド
+    #[serde(default)]
     pub run: String,
+    /// WASM のプラグインのファイル（プラグインのフォルダから。省くと plugin.wasm）
+    #[serde(default)]
+    pub wasm: Option<String>,
+    /// WASM のプラグインに与える権限
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
     #[serde(default)]
     pub command: Vec<CommandDef>,
     #[serde(default)]
@@ -108,7 +146,8 @@ pub struct Plugin {
     pub id: String,
     pub dir: PathBuf,
     pub manifest: Manifest,
-    /// `plugin.toml` の本文（許可したときの内容と比べる）
+    /// 許可したときの内容と比べるもの: `plugin.toml` の本文。WASM のプラグインは、その後ろに `.wasm` の sha256 の行を足す
+    /// （中身が差し替わったら、もう一度許可を求めるように）
     pub text: String,
 }
 
@@ -130,13 +169,38 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// バイト列を16進の文字列にする（sha256 の表示用）
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn parse_manifest(text: &str) -> Result<Manifest> {
     let m: Manifest = toml::from_str(text)?;
     if m.name.trim().is_empty() {
         bail!("name が空です");
     }
-    if m.run.trim().is_empty() {
-        bail!("run が空です");
+    match m.mode {
+        Mode::Wasm => {
+            if !m.run.trim().is_empty() {
+                bail!("WASM のプラグインに run は書けません（wasm にファイルを書きます）");
+            }
+            let w = m.wasm.as_deref().unwrap_or("plugin.wasm");
+            if w.is_empty()
+                || w.starts_with('/')
+                || w.contains('\\')
+                || w.split('/').any(|seg| seg == ".." || seg.is_empty())
+            {
+                bail!("wasm には、プラグインのフォルダの中のファイルを書いてください: {w}");
+            }
+        }
+        Mode::Once | Mode::Server => {
+            if m.run.trim().is_empty() {
+                bail!("run が空です");
+            }
+            if !m.permissions.is_empty() {
+                bail!("permissions は WASM のプラグインだけに書けます（外部プロセスのプラグインは制限できません）");
+            }
+        }
     }
     for c in &m.command {
         if !valid_id(&c.id) {
@@ -189,6 +253,26 @@ pub fn discover(root: &Path) -> (Vec<Plugin>, Vec<(String, String)>) {
             }
         };
         match parse_manifest(&text) {
+            Ok(manifest) if manifest.mode == Mode::Wasm => {
+                let file = manifest
+                    .wasm
+                    .clone()
+                    .unwrap_or_else(|| "plugin.wasm".into());
+                match std::fs::read(d.join(&file)) {
+                    Ok(bytes) => {
+                        use sha2::Digest;
+                        let hash = hex(&sha2::Sha256::digest(&bytes));
+                        let text = format!("{}\n# {file} の sha256: {hash}\n", text.trim_end());
+                        ok.push(Plugin {
+                            id,
+                            dir: d,
+                            manifest,
+                            text,
+                        })
+                    }
+                    Err(e) => bad.push((id, format!("{file} を読めません: {e}"))),
+                }
+            }
             Ok(manifest) => ok.push(Plugin {
                 id,
                 dir: d,
@@ -412,6 +496,26 @@ pub struct HostCall {
 
 type Pending = std::collections::HashMap<u64, std::sync::mpsc::Sender<Result<Response>>>;
 
+/// 起動したままのプラグイン（外部プロセスの `Server` と、WASM の `plugin_wasm::WasmPlugin`）。
+/// アプリと CLI は、どちらも同じに扱う
+pub trait Resident: Send {
+    /// 依頼を送る。返事は戻り値の受け口に届く
+    fn request(&self, req: &Request) -> std::sync::mpsc::Receiver<Result<Response>>;
+    /// プラグインからの問い合わせ・通知（届いた分）
+    fn calls(&self) -> Vec<HostCall>;
+    /// 問い合わせに返事をする
+    fn reply(&self, id: serde_json::Value, result: Result<serde_json::Value>);
+    fn alive(&self) -> bool;
+}
+
+/// 起動したままのプラグインを始める（WASM なら読み込む）
+pub fn start_resident(plugin: &Plugin, vault: &Path) -> Result<Box<dyn Resident>> {
+    Ok(match plugin.manifest.mode {
+        Mode::Wasm => Box::new(crate::plugin_wasm::WasmPlugin::load(plugin)?),
+        Mode::Server | Mode::Once => Box::new(Server::start(plugin, vault)?),
+    })
+}
+
 /// 起動したままのプラグイン。行区切りの JSON-RPC 2.0 で話す。
 /// 落とすと止める
 pub struct Server {
@@ -553,9 +657,11 @@ impl Server {
         stdin.flush()?;
         Ok(())
     }
+}
 
+impl Resident for Server {
     /// 依頼を送る。返事は戻り値の受け口に届く
-    pub fn request(&self, req: &Request) -> std::sync::mpsc::Receiver<Result<Response>> {
+    fn request(&self, req: &Request) -> std::sync::mpsc::Receiver<Result<Response>> {
         use std::sync::atomic::Ordering;
         let (tx, rx) = std::sync::mpsc::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -578,12 +684,12 @@ impl Server {
     }
 
     /// プラグインからの問い合わせ・通知（届いた分）
-    pub fn calls(&self) -> Vec<HostCall> {
+    fn calls(&self) -> Vec<HostCall> {
         self.calls.try_iter().collect()
     }
 
     /// 問い合わせに返事をする
-    pub fn reply(&self, id: serde_json::Value, result: Result<serde_json::Value>) {
+    fn reply(&self, id: serde_json::Value, result: Result<serde_json::Value>) {
         let msg = match result {
             Ok(r) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": r}),
             Err(e) => serde_json::json!({
@@ -595,7 +701,7 @@ impl Server {
         let _ = self.send(&msg);
     }
 
-    pub fn alive(&self) -> bool {
+    fn alive(&self) -> bool {
         !self.dead.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -611,7 +717,7 @@ impl Drop for Server {
 /// 常駐するプラグインに依頼して、返事が来るまで待つ（CLI とテスト用）。
 /// 待つあいだに来た問い合わせには `host_call` で答え、`ui/notice` の通知は返事の actions に足す
 pub fn request_blocking(
-    server: &Server,
+    server: &dyn Resident,
     req: &Request,
     vault: &mut crate::Vault,
 ) -> Result<Response> {

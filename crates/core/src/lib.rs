@@ -10,6 +10,8 @@ pub mod history;
 pub mod math;
 pub mod parse;
 pub mod plugin;
+pub mod plugin_catalog;
+pub mod plugin_wasm;
 pub mod props;
 pub mod related;
 pub mod search;
