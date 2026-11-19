@@ -995,9 +995,75 @@ title = "要約"
 
 ### E3（段階3）: WASM のプラグインと配布
 
-- 配って使ってもらうなら、WASM（Extism）で動かし、`plugin.toml` に書いた権限（`read` / `write` / `network`）だけを与える
-- プラグインの一覧（git のリポジトリに置いた JSON）から、検索して入れられるようにする
-- 段階1・2のやりとり（JSON の形）はそのまま使い、WASM でも外部プロセスでも同じプラグインの書き方にする
+**WASM のプラグイン**（`mode = "wasm"`）: 配って使ってもらうプラグインを、手元の権限で何でもできる外部プロセスではなく、
+箱（サンドボックス）の中で動かす。
+
+```toml
+name = "見出しの数"
+mode = "wasm"
+wasm = "plugin.wasm"           # プラグインのフォルダからのパス（省くと plugin.wasm）
+permissions = ["read"]         # read: vault/read・list・search・backlinks、write: vault/write。書かなければ問い合わせできない
+[[panel]]
+id = "headings"
+title = "見出し"
+```
+
+- 実行には wasmi（Rust だけで書かれた WASM の実行器）を使う。当初の案の Extism（wasmtime）は、アプリが 10MB 以上大きくなりビルドも重いので採らない
+- 一度読み込んだら、段階2の常駐するプラグインと同じく状態を持ち続ける（`core::plugin::Resident` として同じに扱う）。実行は別スレッド
+- WASM には WASI を与えない（ファイル・ネットワーク・時計・プロセスに直接は触れない）。外とのやりとりは、下の取り込み関数だけ
+- 計算量（fuel）とメモリ（256MB）に上限を付ける。止まらない・食い尽くすプラグインで固まらないように
+- 許可は `plugin.toml` の中身に、`.wasm` の sha256 も含めて記録する（中身が差し替わったら、もう一度許可を求める）
+
+**WASM との約束（ABI）**: 文字列はすべて UTF-8 の JSON。メモリ上の場所は (ポインタ, 長さ)、返す値は `(ポインタ << 32) | 長さ` の i64。
+
+| 方向 | 名前 | 型 | 意味 |
+|---|---|---|---|
+| プラグインが出す | `memory` | メモリ | |
+| プラグインが出す | `alloc(len: i32) -> i32` | 関数 | Robsidian が書き込む場所を用意する |
+| プラグインが出す | `handle(ptr: i32, len: i32) -> i64` | 関数 | 依頼（段階1のリクエスト）を受け、レスポンスの JSON を返す |
+| Robsidian が渡す | `robsidian.call(mptr, mlen, pptr, plen) -> i64` | 取り込み | 問い合わせ（段階2と同じ method・params）。返事は `{"ok": 結果}` か `{"error": "…"}` |
+| Robsidian が渡す | `robsidian.notify(mptr, mlen, pptr, plen)` | 取り込み | 通知（`ui/notice`・`panel/refresh`） |
+| Robsidian が渡す | `robsidian.log(ptr, len)` | 取り込み | 開発用の出力（標準エラーへ） |
+
+権限の無い問い合わせは `{"error": "権限がありません: …"}` を返す（WASM の側で扱える）。
+
+**プラグインの一覧から入れる**
+
+```json
+{
+  "plugins": [
+    {
+      "id": "headings",
+      "name": "見出しの数",
+      "version": "0.1.0",
+      "description": "…",
+      "author": "…",
+      "homepage": "https://…",
+      "files": {
+        "plugin.toml": {"url": "headings/plugin.toml", "sha256": "…"},
+        "plugin.wasm": {"url": "headings/plugin.wasm", "sha256": "…"}
+      }
+    }
+  ]
+}
+```
+
+- 一覧（`catalog.json`）は、git のリポジトリなどに置いた JSON。`files` の URL は、一覧からの相対でも、絶対でもよい
+- 取得は、各 OS に入っている `curl` で行う（TLS のライブラリを足さずに済み、プロキシや社内の証明書の設定もそのまま効く）。`file://` とローカルのパスも読める
+- 入れるときは、すべてのファイルの sha256 を確かめてから `.robsidian/plugins/.install-<id>` に書き、`plugin.toml` が読めたら `<id>` に置き換える。
+  ファイルのパスは、プラグインのフォルダの中だけ（`..` や絶対パスは断る）
+- 入れても許可はしない（使う前に、段階1と同じく中身を見せて許可を求める）
+- CLI：`rob plugin search [語] --catalog <URL>`、`rob plugin install <id> --catalog <URL>`（`ROB_PLUGIN_CATALOG` でも指定できる）。
+  GUI：設定の「プラグイン」に、一覧の URL・検索・入れるボタン
+- 公式の一覧はまだ無い。書き方の例は `examples/catalog/`
+
+**実現の方法**
+
+- `core::plugin_wasm`：wasmi で読み込み、`Resident`（依頼・問い合わせ・返事）を実装する。取り込み関数の `call` は、
+  権限を確かめてから問い合わせを外へ渡し、返事を待って WASM のメモリに書く
+- `core::plugin_catalog`：一覧の読み込み・検索・取得（`curl`）・sha256 の確かめ・入れ替え
+- アプリ：`plugins.rs` の常駐するプラグインの持ち方を `Box<dyn Resident>` にして、外部プロセスと WASM を同じに扱う。設定に一覧の欄
+- 例：`examples/plugins/wasm-headings/`（Rust で書く WASM のプラグイン。助けの関数つき）
 
 ## 8. 見送る・後回しにするもの
 
