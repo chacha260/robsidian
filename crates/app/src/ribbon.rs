@@ -32,6 +32,10 @@ pub enum Icon {
     UniqueNote,
     /// 設定（歯車）
     Gear,
+    /// 左サイドバー（左に仕切りのある枠）
+    SidebarLeft,
+    /// 右サイドバー（右に仕切りのある枠）
+    SidebarRight,
 }
 
 /// アイコンのボタン。`size` はボタンの一辺、`active` なら色を付ける（録音中など）
@@ -183,6 +187,14 @@ pub fn paint(p: &egui::Painter, r: Rect, icon: Icon, color: Color32, bg: Color32
             ));
             line((0.5, 0.46), (0.5, 0.78));
             line((0.34, 0.62), (0.66, 0.62));
+        }
+        Icon::SidebarLeft => {
+            rect(0.06, 0.12, 0.94, 0.88, 2.5);
+            line((0.38, 0.12), (0.38, 0.88));
+        }
+        Icon::SidebarRight => {
+            rect(0.06, 0.12, 0.94, 0.88, 2.5);
+            line((0.62, 0.12), (0.62, 0.88));
         }
         Icon::Gear => {
             let c = r.center();

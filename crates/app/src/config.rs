@@ -30,7 +30,7 @@ impl ViewMode {
         match self {
             Self::Live => "ライブ",
             Self::Edit => "ソース",
-            Self::Split => "分割",
+            Self::Split => "ソースとプレビュー",
             Self::Preview => "プレビュー",
         }
     }

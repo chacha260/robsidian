@@ -197,7 +197,7 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::NextTab, "次のタブ", Some((CTRL, Key::Tab))),
     (
         Command::ToggleView,
-        "表示切替（編集 → 分割 → プレビュー）",
+        "表示モードの切り替え（ライブ → ソース → ソースとプレビュー → プレビュー）",
         Some((CTRL, Key::E)),
     ),
     (Command::ToggleGraph, "グラフビュー", Some((CTRL, Key::G))),
@@ -3404,6 +3404,8 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // 項目のあいだを広げて、区切りを見分けやすくする
+                ui.spacing_mut().item_spacing.x = 14.0;
                 if let Some(tab) = self.tabs.get(self.active) {
                     ui.weak(if tab.dirty {
                         "● 未保存"
@@ -4025,24 +4027,34 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        use crate::ribbon::{button as icon_button, Icon};
         ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.cfg.show_left, "一覧")
-                .on_hover_text("サイドバー (Ctrl+\\)")
-                .clicked()
+            let on = ui.visuals().selection.bg_fill;
+            if icon_button(
+                ui,
+                Icon::SidebarLeft,
+                24.0,
+                self.cfg.show_left.then_some(on),
+            )
+            .on_hover_text("左サイドバーの表示切替 (Ctrl+\\)")
+            .clicked()
             {
                 self.cfg.show_left = !self.cfg.show_left;
             }
-            let mode = self.cfg.view_mode;
+            let mut mode = self.cfg.view_mode;
+            egui::ComboBox::from_id_salt("view_mode")
+                .selected_text(mode.label())
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    for m in ViewMode::ALL {
+                        ui.selectable_value(&mut mode, m, m.label());
+                    }
+                })
+                .response
+                .on_hover_text("表示モード（Ctrl+E で順に切り替え）");
+            self.cfg.view_mode = mode;
             if ui
-                .button(mode.label())
-                .on_hover_text("表示切替 (Ctrl+E)")
-                .clicked()
-            {
-                self.cfg.view_mode = mode.next();
-            }
-            if ui
-                .selectable_label(self.other.is_some(), "分割")
+                .selectable_label(self.other.is_some(), "ペイン分割")
                 .on_hover_text("ペインを左右に分割（もう一度押すと閉じる）")
                 .clicked()
             {
@@ -4051,53 +4063,72 @@ impl App {
             if self.cfg.features.graph
                 && ui
                     .selectable_label(self.show_graph, "グラフ")
-                    .on_hover_text("Ctrl+G")
+                    .on_hover_text("グラフビュー (Ctrl+G)")
                     .clicked()
             {
                 self.show_graph = !self.show_graph;
             }
             ui.separator();
-            ScrollArea::horizontal().id_salt("tabs").show(ui, |ui| {
-                for (i, tab) in self.tabs.iter().enumerate() {
-                    let selected = i == self.active && !self.show_graph;
-                    let mark = if tab.dirty { " ●" } else { "" };
-                    let label = ui
-                        .selectable_label(selected, format!("{}{mark}", tab.title()))
-                        .on_hover_text(&tab.path);
-                    if label.clicked() {
-                        actions.push(Action::Activate(i));
-                    }
-                    if label.middle_clicked() {
-                        actions.push(Action::Close(i));
-                    }
-                    label.context_menu(|ui| {
-                        if ui.button("閉じる").clicked() {
+            // 右端に右サイドバーのボタンを置く分を残す
+            let tabs_width = (ui.available_width() - 32.0).max(0.0);
+            ScrollArea::horizontal()
+                .id_salt("tabs")
+                .max_width(tabs_width)
+                .show(ui, |ui| {
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let selected = i == self.active && !self.show_graph;
+                        let mark = if tab.dirty { " ●" } else { "" };
+                        let label = ui
+                            .selectable_label(selected, format!("{}{mark}", tab.title()))
+                            .on_hover_text(&tab.path);
+                        if label.clicked() {
+                            actions.push(Action::Activate(i));
+                        }
+                        if label.middle_clicked() {
                             actions.push(Action::Close(i));
                         }
-                        if self.cfg.features.bookmarks
-                            && ui.button("ブックマークに追加 / 解除").clicked()
+                        label.context_menu(|ui| {
+                            if ui.button("閉じる").clicked() {
+                                actions.push(Action::Close(i));
+                            }
+                            if self.cfg.features.bookmarks
+                                && ui.button("ブックマークに追加 / 解除").clicked()
+                            {
+                                actions.push(Action::ToggleBookmark(tab.path.clone()));
+                            }
+                            if self.cfg.features.file_recovery && ui.button("履歴…").clicked() {
+                                actions.push(Action::History(tab.path.clone()));
+                            }
+                            if ui.button("改名/移動…").clicked() {
+                                let d = Dialog::Rename {
+                                    path: tab.path.clone(),
+                                    new: tab.path.clone(),
+                                };
+                                actions.push(Action::Dialog(d));
+                            }
+                        });
+                        if selected
+                            && ui
+                                .small_button("×")
+                                .on_hover_text("閉じる (Ctrl+W)")
+                                .clicked()
                         {
-                            actions.push(Action::ToggleBookmark(tab.path.clone()));
+                            actions.push(Action::Close(i));
                         }
-                        if self.cfg.features.file_recovery && ui.button("履歴…").clicked() {
-                            actions.push(Action::History(tab.path.clone()));
-                        }
-                        if ui.button("改名/移動…").clicked() {
-                            let d = Dialog::Rename {
-                                path: tab.path.clone(),
-                                new: tab.path.clone(),
-                            };
-                            actions.push(Action::Dialog(d));
-                        }
-                    });
-                    if selected
-                        && ui
-                            .small_button("×")
-                            .on_hover_text("閉じる (Ctrl+W)")
-                            .clicked()
-                    {
-                        actions.push(Action::Close(i));
                     }
+                });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let on = ui.visuals().selection.bg_fill;
+                if icon_button(
+                    ui,
+                    Icon::SidebarRight,
+                    24.0,
+                    self.cfg.show_right.then_some(on),
+                )
+                .on_hover_text("右サイドバーの表示切替 (Ctrl+J)")
+                .clicked()
+                {
+                    self.cfg.show_right = !self.cfg.show_right;
                 }
             });
         });
