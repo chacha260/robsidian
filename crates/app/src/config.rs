@@ -70,9 +70,11 @@ pub struct Config {
     pub vim: bool,
     /// モーダル編集を Helix風（選択してから操作する）にする
     pub helix: bool,
-    /// 分割したもう一方のペインのノート
+    /// 分割したもう一方のペインのノート（前の版。今は `panes` に入れる）
     pub split: Option<String>,
     pub split_focus_right: bool,
+    /// ペインの分割と、ペインごとのタブ
+    pub panes: Option<crate::panes::Panes>,
     /// 実行を許可したユーザーコマンドの設定ファイル（vaultのパス → 許可したときの内容）。
     /// vaultの外に置くことで、vaultを受け取っただけでは許可されない
     pub trusted_commands: std::collections::BTreeMap<String, String>,
@@ -325,6 +327,7 @@ impl Default for Config {
             helix: false,
             split: None,
             split_focus_right: false,
+            panes: None,
             trusted_commands: Default::default(),
             mermaid_command: "mmdc".into(),
             features: Features::default(),

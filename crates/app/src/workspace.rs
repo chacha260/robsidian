@@ -20,9 +20,11 @@ pub struct Workspace {
 pub struct Layout {
     pub tabs: Vec<String>,
     pub active: usize,
-    /// 分割したもう一方のペインのノート
+    /// 分割したもう一方のペインのノート（前の版。今は `panes` に入れる）
     pub split: Option<String>,
     pub focus_right: bool,
+    /// ペインの分割と、ペインごとのタブ
+    pub panes: Option<crate::panes::Panes>,
 }
 
 fn file(root: &Path) -> PathBuf {
