@@ -93,6 +93,7 @@ pub fn to_preview(text: &str, from: &str, vault: &Vault) -> String {
         expanded
     };
     let expanded = split_callout_titles(&expanded);
+    let expanded = hard_line_breaks(&expanded);
     let text = expanded.as_str();
     let parsed = parse::parse(text);
     let mut out = text.to_string();
@@ -288,15 +289,48 @@ fn render_query(query: &str, vault: &Vault, today: chrono::NaiveDate) -> String 
     md
 }
 
-/// プレビューの描画と同じ解析で、タスクのチェックボックス `[ ]` の位置を順に返す。
-pub fn task_markers(text: &str) -> Vec<Range<usize>> {
-    use pulldown_cmark::{Event, Options, Parser};
-    let options = Options::ENABLE_TABLES
+/// プレビューの描画と同じ解析の設定
+fn md_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options;
+    Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_DEFINITION_LIST;
-    Parser::new_ext(text, options)
+        | Options::ENABLE_DEFINITION_LIST
+}
+
+/// Obsidian の既定（「厳密な改行」がオフ）と同じく、段落の中の改行を、そのまま改行として見せる。
+/// 段落の中の改行（SoftBreak）の前に空白を2つ足して、Markdown の強制改行にする。
+/// コードブロックの中は SoftBreak にならないので変わらない。
+pub fn hard_line_breaks(text: &str) -> String {
+    use pulldown_cmark::{Event, Parser};
+    let mut out = String::new();
+    let mut last = 0;
+    for (e, r) in Parser::new_ext(text, md_options()).into_offset_iter() {
+        if !matches!(e, Event::SoftBreak) {
+            continue;
+        }
+        // コールアウトの種類だけの行（`> [!NOTE]`）の後は変えない（コールアウトと見なされなくなるので）
+        let line_start = text[..r.start].rfind('\n').map_or(0, |i| i + 1);
+        let line = text[line_start..r.start].trim_start_matches(['>', ' ', '\t']);
+        if line.trim_end().starts_with("[!") {
+            continue;
+        }
+        out.push_str(&text[last..r.start]);
+        out.push_str("  ");
+        last = r.start;
+    }
+    if last == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// プレビューの描画と同じ解析で、タスクのチェックボックス `[ ]` の位置を順に返す。
+pub fn task_markers(text: &str) -> Vec<Range<usize>> {
+    use pulldown_cmark::{Event, Parser};
+    Parser::new_ext(text, md_options())
         .into_offset_iter()
         .filter_map(|(e, r)| matches!(e, Event::TaskListMarker(_)).then_some(r))
         .collect()
@@ -497,6 +531,19 @@ pub fn alerts() -> egui_commonmark::AlertBundle {
 #[cfg(test)]
 mod callout_tests {
     use super::*;
+
+    #[test]
+    fn soft_breaks_become_line_breaks() {
+        assert_eq!(hard_line_breaks("a\nb\n\nc\n"), "a  \nb\n\nc\n");
+        // コードブロックの中は変えない
+        let code = "```\na\nb\n```\n";
+        assert_eq!(hard_line_breaks(code), code);
+        // コールアウトの種類の行の後は変えないが、本文の改行は変える
+        assert_eq!(
+            hard_line_breaks("> [!NOTE]\n> a\n> b\n"),
+            "> [!NOTE]\n> a  \n> b\n"
+        );
+    }
 
     #[test]
     fn callout_titles_are_split() {

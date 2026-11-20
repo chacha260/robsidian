@@ -6,6 +6,7 @@
 //! （`.` の繰り返しで挿入を再生するときだけ、エンジン自身が文字を入れる）。
 
 use crate::edit::indent_unit;
+use std::collections::HashMap;
 
 mod helix;
 
@@ -15,6 +16,8 @@ pub enum Mode {
     Insert,
     Visual,
     VisualLine,
+    /// 矩形選択（Ctrl+V）
+    VisualBlock,
 }
 
 impl Mode {
@@ -24,7 +27,12 @@ impl Mode {
             Mode::Insert => "INSERT",
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
+            Mode::VisualBlock => "V-BLOCK",
         }
+    }
+
+    pub fn is_visual(self) -> bool {
+        matches!(self, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
     }
 }
 
@@ -39,6 +47,11 @@ pub enum Key {
     /// Ctrl+D / Ctrl+U（半画面移動）
     CtrlD,
     CtrlU,
+    /// Ctrl+O / Ctrl+I（Tab）: ジャンプリストを戻る / 進む
+    CtrlO,
+    CtrlI,
+    /// Ctrl+V（Ctrl+Q）: 矩形選択
+    CtrlV,
 }
 
 /// エディタ側で行ってほしいこと。
@@ -59,6 +72,8 @@ pub enum Cmd {
     ClearSearch,
     /// 知らない `:` コマンド
     Unknown(String),
+    /// 知らせること（置換で見つからなかったなど）
+    Message(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -74,6 +89,19 @@ pub struct Effects {
 struct Register {
     text: String,
     linewise: bool,
+    /// 矩形選択でヤンクしたもの（行ごとに、同じ列に貼る）
+    block: bool,
+}
+
+/// 矩形選択からの挿入（I / A / c）。Esc で、最初の行に入れた文字を残りの行にも入れる
+#[derive(Debug, Clone, Copy)]
+struct BlockInsert {
+    /// 残りの行（行番号）
+    lines: (usize, usize),
+    /// 入れる列（文字数）
+    col: usize,
+    /// 行が短ければ空白で埋める（A）
+    pad: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +131,22 @@ pub struct Vim {
     /// エディタに最後に反映した選択（主, 副のバイト位置）と、そのときの頭（カーソル）の位置。
     /// エディタの選択がこのままなら頭の位置を使い、変わっていればマウスで動かしたとみなす
     pub synced: Option<(usize, usize, usize)>,
+    /// 名前付きのレジスタ（a〜z）と、最後にヤンクしたもの（0）
+    registers: HashMap<char, Register>,
+    /// `"a` で指定した、次のコマンドが使うレジスタ
+    pending_register: Option<char>,
+    /// 記録中のマクロ（レジスタ, キー）
+    recording: Option<(char, Vec<Key>)>,
+    macros: HashMap<char, Vec<Key>>,
+    last_macro: Option<char>,
+    /// マクロの再生の深さ（再生中のキーは記録しない。再帰しすぎないように）
+    macro_depth: usize,
+    /// マーク（バイト位置）。`'` は最後のジャンプの前の位置、`<` `>` は最後のビジュアル選択
+    marks: HashMap<char, usize>,
+    /// ジャンプリスト（バイト位置）と、いまの位置（末尾なら jumps.len()）
+    jumps: Vec<usize>,
+    jump_at: usize,
+    block_insert: Option<BlockInsert>,
 }
 
 impl Default for Vim {
@@ -120,6 +164,16 @@ impl Default for Vim {
             cmdline: None,
             helix: false,
             synced: None,
+            registers: HashMap::new(),
+            pending_register: None,
+            recording: None,
+            macros: HashMap::new(),
+            last_macro: None,
+            macro_depth: 0,
+            marks: HashMap::new(),
+            jumps: Vec::new(),
+            jump_at: 0,
+            block_insert: None,
         }
     }
 }
@@ -180,6 +234,11 @@ fn at_col(t: &str, ls: usize, c: usize) -> usize {
     } else {
         p
     }
+}
+/// 行内の `c` 列目のバイト位置（行が短ければ行末）。
+fn col_byte(t: &str, ls: usize, c: usize) -> usize {
+    let le = line_end(t, ls);
+    t[ls..le].char_indices().nth(c).map_or(le, |(i, _)| ls + i)
 }
 /// ノーマルモードではカーソルを改行の上に置かない（空行を除く）。
 pub fn clamp_normal(t: &str, p: usize) -> usize {
@@ -521,6 +580,8 @@ enum Motion {
     Match,
     HalfDown,
     HalfUp,
+    /// `'a`（行の最初の文字へ、行単位）/ `` `a ``（その位置へ）
+    Mark(char, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -568,6 +629,12 @@ enum Action {
     FindNext(bool),
     SearchWord(bool),
     Cmdline,
+    /// `qa`: マクロの記録を始める
+    Record(char),
+    /// `@a` / `@@`: マクロを再生する
+    Play(char),
+    /// `ma`: マークを付ける
+    SetMark(char),
 }
 
 /// キー列（数値プレフィックスを除く）を解釈する。
@@ -646,6 +713,13 @@ fn parse(keys: &[char]) -> Parsed {
         '*' => Done(Action::SearchWord(true)),
         '#' => Done(Action::SearchWord(false)),
         ':' => Done(Action::Cmdline),
+        'q' => rest
+            .first()
+            .map_or(Incomplete, |&c| Done(Action::Record(c))),
+        '@' => rest.first().map_or(Incomplete, |&c| Done(Action::Play(c))),
+        'm' => rest
+            .first()
+            .map_or(Incomplete, |&c| Done(Action::SetMark(c))),
         _ => motion(keys),
     }
 }
@@ -698,6 +772,10 @@ fn motion(keys: &[char]) -> Parsed {
             None => return Parsed::Incomplete,
             Some(&x) => Find(x, c == 'f' || c == 't', c == 't' || c == 'T'),
         },
+        '\'' | '`' => match keys.get(1) {
+            None => return Parsed::Incomplete,
+            Some(&x) => Mark(x, c == '`'),
+        },
         _ => return Parsed::Invalid,
     };
     Parsed::Done(Action::Move(m))
@@ -745,8 +823,72 @@ impl Vim {
         }
     }
 
+    /// 記録中のマクロのレジスタ
+    pub fn recording(&self) -> Option<char> {
+        self.recording.as_ref().map(|(r, _)| *r)
+    }
+
     /// キーを1つ処理する。
     pub fn handle(&mut self, t: &mut String, cursor: &mut usize, key: Key) -> Effects {
+        // マクロの記録（再生中のキーは記録しない）
+        if self.macro_depth == 0 {
+            if let Some((_, rec)) = self.recording.as_mut() {
+                rec.push(key);
+            }
+        }
+        // マークとジャンプリストの位置を本文の変更に合わせて動かすため、変更前の本文を覚えておく
+        let before = (!self.marks.is_empty() || !self.jumps.is_empty()).then(|| t.clone());
+        let fx = self.handle_inner(t, cursor, key);
+        if fx.changed {
+            if let Some(old) = before {
+                self.follow_edit(&old, t);
+            }
+        }
+        fx
+    }
+
+    /// 本文の変更（old → new）に合わせて、マークとジャンプリストの位置を動かす
+    fn follow_edit(&mut self, old: &str, new: &str) {
+        let (a, b) = (old.as_bytes(), new.as_bytes());
+        let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        let max = a.len().min(b.len()) - prefix;
+        let suffix = a
+            .iter()
+            .rev()
+            .zip(b.iter().rev())
+            .take(max)
+            .take_while(|(x, y)| x == y)
+            .count();
+        self.shift_positions(prefix, a.len() - prefix - suffix, b.len() - prefix - suffix);
+    }
+
+    /// `at` から `removed` バイトが `inserted` バイトに変わった
+    fn shift_positions(&mut self, at: usize, removed: usize, inserted: usize) {
+        let mv = |x: &mut usize| {
+            if *x >= at + removed {
+                *x = *x + inserted - removed;
+            } else if *x > at {
+                *x = at;
+            }
+        };
+        self.marks.values_mut().for_each(mv);
+        self.jumps.iter_mut().for_each(mv);
+    }
+
+    /// ジャンプする前の位置を、ジャンプリストと `'` マークに入れる
+    fn push_jump(&mut self, t: &str, p: usize) {
+        self.jumps.truncate(self.jump_at);
+        let line = line_no(t, p.min(t.len()));
+        self.jumps.retain(|&j| line_no(t, j.min(t.len())) != line);
+        self.jumps.push(p);
+        if self.jumps.len() > 100 {
+            self.jumps.remove(0);
+        }
+        self.jump_at = self.jumps.len();
+        self.marks.insert('\'', p);
+    }
+
+    fn handle_inner(&mut self, t: &mut String, cursor: &mut usize, key: Key) -> Effects {
         let mut fx = Effects::default();
         *cursor = (*cursor).min(t.len());
         if let Some(line) = self.cmdline.as_mut() {
@@ -783,8 +925,39 @@ impl Vim {
         match key {
             Key::Esc => {
                 self.keys.clear();
-                if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
-                    self.mode = Mode::Normal;
+                self.pending_register = None;
+                if self.mode.is_visual() {
+                    self.leave_visual(t, *cursor);
+                }
+                return fx;
+            }
+            Key::CtrlO | Key::CtrlI => {
+                self.keys.clear();
+                let p = *cursor;
+                if key == Key::CtrlO && self.jump_at > 0 {
+                    if self.jump_at == self.jumps.len() {
+                        // 今の位置も入れておき、Ctrl+I で戻れるようにする
+                        self.push_jump(t, p);
+                        self.jump_at = self.jumps.len() - 1;
+                    }
+                    self.jump_at -= 1;
+                } else if key == Key::CtrlI && self.jump_at + 1 < self.jumps.len() {
+                    self.jump_at += 1;
+                } else {
+                    return fx;
+                }
+                *cursor = clamp_normal(t, self.jumps[self.jump_at]);
+                return fx;
+            }
+            Key::CtrlV => {
+                self.keys.clear();
+                if self.mode == Mode::VisualBlock {
+                    self.leave_visual(t, *cursor);
+                } else {
+                    if !self.mode.is_visual() {
+                        self.anchor = *cursor;
+                    }
+                    self.mode = Mode::VisualBlock;
                 }
                 return fx;
             }
@@ -816,7 +989,50 @@ impl Vim {
             }
             Key::Char(_) => self.keys.push(key),
         }
-        if matches!(self.mode, Mode::Visual | Mode::VisualLine) && self.keys.len() == 1 {
+        // レジスタの指定（`"a`）。次のコマンドが使う
+        if self.keys.first() == Some(&Key::Char('"')) {
+            match self.keys.get(1) {
+                None => return fx,
+                Some(&Key::Char(r)) => {
+                    self.keys.clear();
+                    if r.is_ascii_alphanumeric() || matches!(r, '"' | '_' | '+' | '*') {
+                        self.pending_register = Some(r);
+                    }
+                    return fx;
+                }
+                Some(_) => {
+                    self.keys.clear();
+                    return fx;
+                }
+            }
+        }
+        // マクロの記録の終わり（記録中の `q`）
+        if self.recording.is_some() && self.keys == [Key::Char('q')] {
+            self.keys.clear();
+            if let Some((r, mut rec)) = self.recording.take() {
+                rec.pop(); // 終わりの q
+                self.macros.insert(r, rec);
+            }
+            return fx;
+        }
+        // 矩形選択だけのキー
+        if self.mode == Mode::VisualBlock {
+            match self.keys[..] {
+                [Key::Char(c @ ('I' | 'A'))] => {
+                    self.keys.clear();
+                    self.block_insert_start(t, cursor, c == 'A');
+                    return fx;
+                }
+                [Key::Char('r')] => return fx,
+                [Key::Char('r'), Key::Char(c)] => {
+                    self.keys.clear();
+                    self.block_replace(c, t, cursor, &mut fx);
+                    return fx;
+                }
+                _ => {}
+            }
+        }
+        if self.mode.is_visual() && self.keys.len() == 1 {
             let Key::Char(c) = key else { unreachable!() };
             let op = match c {
                 'd' | 'x' => Some(Op::Delete),
@@ -872,6 +1088,7 @@ impl Vim {
                 // gg / G に数値が付いたら行番号
                 let action = match (action, count) {
                     (Action::Move(Motion::Top | Motion::Bottom), Some(line)) => {
+                        self.push_jump(t, *cursor);
                         *cursor = first_nonblank(t, nth_line(t, line.saturating_sub(1)));
                         self.want_col = None;
                         return fx;
@@ -893,6 +1110,160 @@ impl Vim {
             }
         }
         fx
+    }
+
+    /// ビジュアルモードを抜ける（`'<` `'>` に選択の範囲を覚える）
+    fn leave_visual(&mut self, t: &str, cursor: usize) {
+        let (a, b) = (self.anchor.min(cursor), self.anchor.max(cursor));
+        self.marks.insert('<', a.min(t.len()));
+        self.marks.insert('>', b.min(t.len()));
+        self.mode = Mode::Normal;
+    }
+
+    /// 矩形選択の範囲: (最初の行, 最後の行, 左の列, 右の列)。列は文字数で、右の列も含む
+    fn block_rect(&self, t: &str, cursor: usize) -> (usize, usize, usize, usize) {
+        let (a, b) = (self.anchor.min(t.len()), cursor.min(t.len()));
+        let (la, lb) = (line_no(t, a), line_no(t, b));
+        let (ca, cb) = (col(t, a), col(t, b));
+        (la.min(lb), la.max(lb), ca.min(cb), ca.max(cb))
+    }
+
+    /// 矩形選択の、各行の部分（バイト範囲。行が短ければ空）
+    pub fn block_ranges(&self, t: &str, cursor: usize) -> Vec<(usize, usize)> {
+        if self.mode != Mode::VisualBlock || self.helix {
+            return Vec::new();
+        }
+        let (l0, l1, c0, c1) = self.block_rect(t, cursor);
+        (l0..=l1)
+            .map(|l| {
+                let ls = nth_line(t, l);
+                (col_byte(t, ls, c0), col_byte(t, ls, c1 + 1))
+            })
+            .collect()
+    }
+
+    fn block_op(&mut self, op: Op, t: &mut String, cursor: &mut usize, fx: &mut Effects) {
+        let (l0, l1, c0, _) = self.block_rect(t, *cursor);
+        let ranges = self.block_ranges(t, *cursor);
+        self.leave_visual(t, *cursor);
+        let top = |t: &str| col_byte(t, nth_line(t, l0), c0);
+        match op {
+            Op::Yank | Op::Delete | Op::Change => {
+                let text = ranges
+                    .iter()
+                    .map(|&(a, b)| &t[a..b])
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let reg = Register {
+                    text,
+                    linewise: false,
+                    block: true,
+                };
+                self.store_register(reg, op == Op::Yank, fx);
+                if op == Op::Yank {
+                    *cursor = top(t);
+                    return;
+                }
+                for &(a, b) in ranges.iter().rev() {
+                    t.replace_range(a..b, "");
+                }
+                fx.changed = true;
+                if op == Op::Change {
+                    *cursor = top(t);
+                    self.enter_insert(t, *cursor);
+                    self.block_insert = (l1 > l0).then_some(BlockInsert {
+                        lines: (l0 + 1, l1),
+                        col: c0,
+                        pad: false,
+                    });
+                } else {
+                    *cursor = clamp_normal(t, top(t));
+                }
+            }
+            Op::Indent | Op::Outdent => {
+                let (a, b) = (nth_line(t, l0), line_end(t, nth_line(t, l1)));
+                self.apply(op, a, b, true, t, cursor, fx);
+            }
+            Op::Lower | Op::Upper | Op::Toggle => {
+                for &(a, b) in ranges.iter().rev() {
+                    let src = &t[a..b];
+                    let out = match op {
+                        Op::Lower => src.to_lowercase(),
+                        Op::Upper => src.to_uppercase(),
+                        _ => toggle_case(src),
+                    };
+                    if out != src {
+                        t.replace_range(a..b, &out);
+                        fx.changed = true;
+                    }
+                }
+                *cursor = clamp_normal(t, top(t));
+            }
+        }
+    }
+
+    /// 矩形選択の `I`（左の列の前）/ `A`（右の列の後ろ）。最初の行で入力し、Esc で残りの行にも入れる
+    fn block_insert_start(&mut self, t: &mut String, cursor: &mut usize, append: bool) {
+        let (l0, l1, c0, c1) = self.block_rect(t, *cursor);
+        self.leave_visual(t, *cursor);
+        let col = if append { c1 + 1 } else { c0 };
+        let ls = nth_line(t, l0);
+        let len = t[ls..line_end(t, ls)].chars().count();
+        if append && len < col {
+            let le = line_end(t, ls);
+            t.insert_str(le, &" ".repeat(col - len));
+        }
+        *cursor = col_byte(t, ls, col);
+        self.enter_insert(t, *cursor);
+        self.block_insert = (l1 > l0).then_some(BlockInsert {
+            lines: (l0 + 1, l1),
+            col,
+            pad: append,
+        });
+    }
+
+    /// 矩形選択の `r`: 選んだ文字をすべて `c` にする
+    fn block_replace(&mut self, c: char, t: &mut String, cursor: &mut usize, fx: &mut Effects) {
+        let (l0, _, c0, _) = self.block_rect(t, *cursor);
+        let ranges = self.block_ranges(t, *cursor);
+        self.leave_visual(t, *cursor);
+        for &(a, b) in ranges.iter().rev() {
+            let n = t[a..b].chars().count();
+            if n > 0 {
+                t.replace_range(a..b, &c.to_string().repeat(n));
+                fx.changed = true;
+            }
+        }
+        *cursor = clamp_normal(t, col_byte(t, nth_line(t, l0), c0));
+    }
+
+    /// 矩形でヤンクしたものを、カーソルの列から下の行へ1行ずつ貼る
+    fn block_put(
+        &mut self,
+        reg: &Register,
+        after: bool,
+        n: usize,
+        t: &mut String,
+        cursor: &mut usize,
+    ) {
+        let p = *cursor;
+        let line = line_no(t, p);
+        let c = col(t, p) + usize::from(after && line_end(t, p) > p);
+        for (i, piece) in reg.text.split('\n').enumerate() {
+            let target = line + i;
+            while line_count(t) <= target {
+                t.push('\n');
+            }
+            let ls = nth_line(t, target);
+            let le = line_end(t, ls);
+            let len = t[ls..le].chars().count();
+            if len < c {
+                t.insert_str(le, &" ".repeat(c - len));
+            }
+            let at = col_byte(t, nth_line(t, target), c);
+            t.insert_str(at, &piece.repeat(n.max(1)));
+        }
+        *cursor = col_byte(t, nth_line(t, line), c);
     }
 
     fn records(&self, a: &Action) -> bool {
@@ -917,24 +1288,58 @@ impl Vim {
         match key {
             Key::Esc => {
                 self.mode = Mode::Normal;
+                let block = self.block_insert.take();
                 if let Some((mut keys, start, len)) = self.insert_record.take() {
+                    // 続けて入力した文字列（エディタが入れたもの）
+                    let grown = t.len().saturating_sub(len);
+                    let typed = t
+                        .get(start..start + grown)
+                        .filter(|_| *cursor == start + grown)
+                        .map(str::to_string);
+                    let as_keys = |typed: &str| -> Vec<Key> {
+                        typed
+                            .chars()
+                            .map(|c| if c == '\n' { Key::Enter } else { Key::Char(c) })
+                            .collect()
+                    };
+                    if self.macro_depth == 0 {
+                        // マクロの記録にも、入力した文字を入れる（Esc の前）
+                        if let (Some((_, rec)), Some(typed)) = (self.recording.as_mut(), &typed) {
+                            let at = rec.len().saturating_sub(1);
+                            rec.splice(at..at, as_keys(typed));
+                        }
+                        if grown > 0 && typed.is_some() {
+                            self.shift_positions(start, 0, grown);
+                        }
+                    }
                     if !self.replaying {
                         // 挿入した文字列を記録して、`.` で再生できるようにする
-                        let grown = t.len().saturating_sub(len);
-                        let typed = t
-                            .get(start..start + grown)
-                            .filter(|_| *cursor == start + grown);
-                        if let Some(typed) = typed {
-                            keys.extend(typed.chars().map(|c| {
-                                if c == '\n' {
-                                    Key::Enter
-                                } else {
-                                    Key::Char(c)
-                                }
-                            }));
+                        if let Some(typed) = &typed {
+                            keys.extend(as_keys(typed));
                         }
                         keys.push(Key::Esc);
                         self.last_change = keys;
+                    }
+                    // 矩形選択からの挿入: 残りの行の同じ列にも入れる
+                    if let (Some(b), Some(typed)) = (block, typed.filter(|s| !s.contains('\n'))) {
+                        if !typed.is_empty() {
+                            for l in b.lines.0..=b.lines.1.min(line_count(t) - 1) {
+                                let ls = nth_line(t, l);
+                                let le = line_end(t, ls);
+                                let len = t[ls..le].chars().count();
+                                if len < b.col {
+                                    if !b.pad {
+                                        continue;
+                                    }
+                                    t.insert_str(le, &" ".repeat(b.col - len));
+                                }
+                                let at = col_byte(t, nth_line(t, l), b.col);
+                                t.insert_str(at, &typed);
+                            }
+                            fx.changed = true;
+                            *cursor = start;
+                            return;
+                        }
                     }
                 }
                 if *cursor > line_start(t, *cursor) {
@@ -1083,6 +1488,15 @@ impl Vim {
                 (i, Kind::Exclusive)
             }
             Match => (match_pair(t, p)?, Kind::Inclusive),
+            Mark(c, exact) => {
+                let key = if matches!(c, '\'' | '`') { '\'' } else { *c };
+                let pos = (*self.marks.get(&key)?).min(t.len());
+                if *exact {
+                    (pos, Kind::Exclusive)
+                } else {
+                    (first_nonblank(t, pos), Kind::Linewise)
+                }
+            }
         };
         Some(r)
     }
@@ -1117,10 +1531,22 @@ impl Vim {
         fx: &mut Effects,
     ) {
         let p = *cursor;
-        let visual = matches!(self.mode, Mode::Visual | Mode::VisualLine);
+        let visual = self.mode.is_visual();
         match action {
             Action::Move(m) => {
+                let jump = matches!(
+                    m,
+                    Motion::Top
+                        | Motion::Bottom
+                        | Motion::Match
+                        | Motion::ParaFwd
+                        | Motion::ParaBack
+                        | Motion::Mark(..)
+                );
                 if let Some((target, _)) = self.motion_target(&m, n, t, p) {
+                    if jump && target != p {
+                        self.push_jump(t, p);
+                    }
                     *cursor = if visual {
                         target.min(t.len())
                     } else {
@@ -1220,20 +1646,20 @@ impl Vim {
                                 e = next(t, e);
                             }
                         }
-                        self.yank_text(&t[p..e], false, fx);
+                        self.yank_text(&t[p..e], false, false, fx);
                         t.replace_range(p..e, "");
                         fx.changed |= e > p;
                         p
                     }
                     'S' => {
                         let fnb = first_nonblank(t, p);
-                        self.yank_text(&t[ls..le], true, fx);
+                        self.yank_text(&t[ls..le], true, false, fx);
                         t.replace_range(fnb..le, "");
                         fx.changed = true;
                         fnb
                     }
                     'C' => {
-                        self.yank_text(&t[p..le], false, fx);
+                        self.yank_text(&t[p..le], false, false, fx);
                         t.replace_range(p..le, "");
                         fx.changed |= le > p;
                         p
@@ -1256,7 +1682,7 @@ impl Vim {
                     }
                 }
                 if b > a {
-                    self.yank_text(&t[a..b], false, fx);
+                    self.yank_text(&t[a..b], false, false, fx);
                     t.replace_range(a..b, "");
                     fx.changed = true;
                 }
@@ -1276,8 +1702,21 @@ impl Vim {
                 }
             }
             Action::Put(after) => {
-                let reg = self.register.clone();
+                let reg = match self.pending_register.take() {
+                    None | Some('"' | '+' | '*') => self.register.clone(),
+                    Some('_') => return,
+                    Some(r) => self
+                        .registers
+                        .get(&r.to_ascii_lowercase())
+                        .cloned()
+                        .unwrap_or_default(),
+                };
                 if reg.text.is_empty() {
+                    return;
+                }
+                if reg.block {
+                    self.block_put(&reg, after, n, t, cursor);
+                    fx.changed = true;
                     return;
                 }
                 let body = reg.text.repeat(n);
@@ -1341,7 +1780,7 @@ impl Vim {
             Action::Visual(line) => {
                 let mode = if line { Mode::VisualLine } else { Mode::Visual };
                 if self.mode == mode {
-                    self.mode = Mode::Normal;
+                    self.leave_visual(t, p);
                 } else {
                     if !visual {
                         self.anchor = p;
@@ -1378,20 +1817,120 @@ impl Vim {
                     }
                 }
             }
-            Action::Cmdline => self.cmdline = Some(String::new()),
+            Action::Cmdline => {
+                if visual {
+                    // ビジュアルモードの範囲を、行の範囲として渡す
+                    self.leave_visual(t, p);
+                    self.cmdline = Some("'<,'>".to_string());
+                } else {
+                    self.cmdline = Some(String::new());
+                }
+            }
+            Action::Record(r) => {
+                if r.is_ascii_alphanumeric() || r == '"' {
+                    let lower = r.to_ascii_lowercase();
+                    // 大文字なら、今あるマクロに続けて記録する
+                    let keys = if r.is_ascii_uppercase() {
+                        self.macros.get(&lower).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    self.recording = Some((lower, keys));
+                }
+            }
+            Action::Play(r) => {
+                let r = if r == '@' {
+                    let Some(last) = self.last_macro else { return };
+                    last
+                } else {
+                    r.to_ascii_lowercase()
+                };
+                // 記録したマクロが無ければ、レジスタの文字列をキーとして使う
+                let keys = self.macros.get(&r).cloned().or_else(|| {
+                    self.registers.get(&r).map(|reg| {
+                        reg.text
+                            .chars()
+                            .map(|c| if c == '\n' { Key::Enter } else { Key::Char(c) })
+                            .collect()
+                    })
+                });
+                let Some(keys) = keys else { return };
+                if self.macro_depth >= 20 {
+                    return;
+                }
+                self.last_macro = Some(r);
+                self.macro_depth += 1;
+                for _ in 0..n {
+                    for &k in &keys {
+                        let r = self.handle(t, cursor, k);
+                        fx.changed |= r.changed;
+                        if r.yank.is_some() {
+                            fx.yank = r.yank;
+                        }
+                        if r.cmd.is_some() {
+                            fx.cmd = r.cmd;
+                        }
+                    }
+                }
+                self.macro_depth -= 1;
+            }
+            Action::SetMark(m) => {
+                if m.is_ascii_alphabetic() || matches!(m, '\'' | '`') {
+                    let m = if m == '`' { '\'' } else { m };
+                    self.marks.insert(m, p);
+                }
+            }
         }
     }
 
-    fn yank_text(&mut self, s: &str, linewise: bool, fx: &mut Effects) {
+    /// 消した / ヤンクした文字列をレジスタに入れる（`is_yank` はヤンクか）
+    fn yank_text(&mut self, s: &str, linewise: bool, is_yank: bool, fx: &mut Effects) {
         let mut text = s.to_string();
         if linewise && !text.ends_with('\n') {
             text.push('\n');
         }
-        self.register = Register {
-            text: text.clone(),
+        let reg = Register {
+            text,
             linewise,
+            block: false,
         };
-        fx.yank = Some(text);
+        self.store_register(reg, is_yank, fx);
+    }
+
+    /// `"a` で指定したレジスタ（無ければ無名のレジスタ）に入れる。
+    /// 大文字（`"A`）は追加、`"_` は捨てる。ヤンクは `"0` にも入れる。システムのクリップボードにも入れる
+    fn store_register(&mut self, reg: Register, is_yank: bool, fx: &mut Effects) {
+        let target = self.pending_register.take();
+        let reg = match target {
+            Some('_') => return,
+            Some(c) if c.is_ascii_lowercase() => {
+                self.registers.insert(c, reg.clone());
+                reg
+            }
+            Some(c) if c.is_ascii_uppercase() => {
+                let e = self.registers.entry(c.to_ascii_lowercase()).or_default();
+                if e.linewise || reg.linewise {
+                    if !e.text.is_empty() && !e.text.ends_with('\n') {
+                        e.text.push('\n');
+                    }
+                    e.text.push_str(&reg.text);
+                    if !e.text.ends_with('\n') {
+                        e.text.push('\n');
+                    }
+                    e.linewise = true;
+                } else {
+                    e.text.push_str(&reg.text);
+                }
+                e.block = false;
+                e.clone()
+            }
+            _ => reg,
+        };
+        if is_yank && matches!(target, None | Some('"' | '+' | '*')) {
+            self.registers.insert('0', reg.clone());
+        }
+        fx.yank = Some(reg.text.clone());
+        self.register = reg;
     }
 
     /// 演算子を範囲に適用する。`b` は含まない。行単位なら a..b は行の内容（改行を含まない）。
@@ -1409,11 +1948,11 @@ impl Vim {
         let (a, b) = (a.min(t.len()), b.min(t.len()));
         match op {
             Op::Yank => {
-                self.yank_text(&t[a..b], linewise, fx);
+                self.yank_text(&t[a..b], linewise, true, fx);
                 *cursor = a;
             }
             Op::Delete => {
-                self.yank_text(&t[a..b], linewise, fx);
+                self.yank_text(&t[a..b], linewise, false, fx);
                 if linewise {
                     let (s, e) = linewise_range(t, a, b.max(a));
                     t.replace_range(s..e, "");
@@ -1437,7 +1976,7 @@ impl Vim {
                 fx.changed = true;
             }
             Op::Change => {
-                self.yank_text(&t[a..b], linewise, fx);
+                self.yank_text(&t[a..b], linewise, false, fx);
                 let start = if linewise { first_nonblank(t, a) } else { a };
                 let end = if linewise { line_end(t, b) } else { b };
                 t.replace_range(start..end, "");
@@ -1488,30 +2027,224 @@ impl Vim {
     }
 
     fn visual_op(&mut self, op: Op, t: &mut String, cursor: &mut usize, fx: &mut Effects) {
+        if self.mode == Mode::VisualBlock {
+            return self.block_op(op, t, cursor, fx);
+        }
         let Some((a, b)) = self.selection(t, *cursor) else {
             return;
         };
         let linewise = self.mode == Mode::VisualLine;
-        self.mode = Mode::Normal;
+        self.leave_visual(t, *cursor);
         self.apply(op, a, b, linewise, t, cursor, fx);
     }
 
     /// `:` コマンド。
-    fn ex(&mut self, line: &str, t: &str, cursor: &mut usize, fx: &mut Effects) {
+    fn ex(&mut self, line: &str, t: &mut String, cursor: &mut usize, fx: &mut Effects) {
         fx.cmd = Some(match line {
             "w" | "w!" => Cmd::Save,
             "q" | "q!" => Cmd::Close,
             "wq" | "x" | "wq!" => Cmd::SaveClose,
             "noh" | "nohl" | "nohlsearch" => Cmd::ClearSearch,
             "" => return,
-            n if n.chars().all(|c| c.is_ascii_digit()) => {
-                let n: usize = n.parse().unwrap_or(1);
-                *cursor = first_nonblank(t, nth_line(t, n.saturating_sub(1)));
-                return;
+            _ => {
+                let (range, rest) = self.ex_range(line, t, *cursor);
+                let rest = rest.trim_start();
+                if rest.is_empty() {
+                    // `:12` などは、その行へ移る
+                    if let Some((_, last)) = range {
+                        self.push_jump(t, *cursor);
+                        *cursor = first_nonblank(t, nth_line(t, last));
+                        return;
+                    }
+                }
+                let sub = rest
+                    .strip_prefix("substitute")
+                    .or_else(|| rest.strip_prefix('s'))
+                    .filter(|a| {
+                        a.chars()
+                            .next()
+                            .is_some_and(|d| !d.is_alphanumeric() && d != ' ')
+                    });
+                match sub {
+                    Some(args) => {
+                        let cur = line_no(t, *cursor);
+                        let range = range.unwrap_or((cur, cur));
+                        match self.substitute(range, args, t, cursor) {
+                            Ok(()) => {
+                                fx.changed = true;
+                                return;
+                            }
+                            Err(message) => Cmd::Message(message),
+                        }
+                    }
+                    None => Cmd::Unknown(line.to_string()),
+                }
             }
-            other => Cmd::Unknown(other.to_string()),
         });
     }
+
+    /// `:` コマンドの行の範囲（0始まりの行番号、両端を含む）と、残りの文字列。
+    /// `%`、`12`、`.`、`$`、`'a`（マーク）、`'<,'>`、`+2` などと、それを `,` でつないだもの
+    fn ex_range<'a>(
+        &self,
+        s: &'a str,
+        t: &str,
+        cursor: usize,
+    ) -> (Option<(usize, usize)>, &'a str) {
+        let last = line_count(t) - 1;
+        if let Some(rest) = s.strip_prefix('%') {
+            return (Some((0, last)), rest);
+        }
+        let Some((a, rest)) = self.ex_address(s, t, cursor) else {
+            return (None, s);
+        };
+        if let Some((b, rest)) = rest
+            .strip_prefix(',')
+            .and_then(|r| self.ex_address(r, t, cursor))
+        {
+            return (Some((a.min(b), a.max(b))), rest);
+        }
+        (Some((a, a)), rest)
+    }
+
+    fn ex_address<'a>(&self, s: &'a str, t: &str, cursor: usize) -> Option<(usize, &'a str)> {
+        let last = line_count(t) - 1;
+        let cur = line_no(t, cursor.min(t.len()));
+        let digits = s.chars().take_while(char::is_ascii_digit).count();
+        let (mut line, mut rest) = if digits > 0 {
+            (
+                s[..digits].parse::<usize>().ok()?.saturating_sub(1),
+                &s[digits..],
+            )
+        } else if let Some(r) = s.strip_prefix('.') {
+            (cur, r)
+        } else if let Some(r) = s.strip_prefix('$') {
+            (last, r)
+        } else if let Some(r) = s.strip_prefix('\'') {
+            let m = r.chars().next()?;
+            let pos = *self.marks.get(&m)?;
+            (line_no(t, pos.min(t.len())), &r[m.len_utf8()..])
+        } else if s.starts_with(['+', '-']) {
+            (cur, s)
+        } else {
+            return None;
+        };
+        // `+2` / `-1` のずらし
+        while let Some(sign) = rest.chars().next().filter(|c| matches!(c, '+' | '-')) {
+            let r = &rest[1..];
+            let n = r.chars().take_while(char::is_ascii_digit).count();
+            let by = if n == 0 {
+                1
+            } else {
+                r[..n].parse::<usize>().ok()?
+            };
+            line = if sign == '+' {
+                line + by
+            } else {
+                line.saturating_sub(by)
+            };
+            rest = &r[n..];
+        }
+        Some((line.min(last), rest))
+    }
+
+    /// `:s/パターン/置き換え/フラグ`。パターンは Rust（regex クレート）の正規表現で、
+    /// Vim の `\<` `\>` は単語の境目として読む。置き換えの `&` と `\0` は一致した全体、`\1`〜`\9` はグループ。
+    /// フラグは `g`（行のすべて）・`i`（大文字小文字を区別しない）・`I`（区別する）
+    fn substitute(
+        &mut self,
+        (l0, l1): (usize, usize),
+        args: &str,
+        t: &mut String,
+        cursor: &mut usize,
+    ) -> Result<(), String> {
+        let delim = args.chars().next().ok_or("パターンがありません")?;
+        let parts = split_unescaped(&args[delim.len_utf8()..], delim);
+        let pat = parts
+            .first()
+            .filter(|p| !p.is_empty())
+            .ok_or("パターンがありません")?;
+        let replacement = vim_replacement(parts.get(1).map_or("", String::as_str));
+        let flags = parts.get(2).map_or("", String::as_str);
+        let pattern = pat.replace("\\<", "\\b").replace("\\>", "\\b");
+        let re = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(flags.contains('i') && !flags.contains('I'))
+            .build()
+            .map_err(|e| format!("パターンが正しくありません: {e}"))?;
+        let all = flags.contains('g');
+        let start = nth_line(t, l0);
+        let end = line_end(t, nth_line(t, l1));
+        let mut out = String::with_capacity(end - start);
+        let mut last = None;
+        for (i, line) in t[start..end].split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            if re.is_match(line) {
+                last = Some(l0 + i);
+                let replaced = if all {
+                    re.replace_all(line, replacement.as_str())
+                } else {
+                    re.replacen(line, 1, replacement.as_str())
+                };
+                out.push_str(&replaced);
+            } else {
+                out.push_str(line);
+            }
+        }
+        let last = last.ok_or_else(|| format!("見つかりません: {pat}"))?;
+        // 置き換えで行が増えることがある（\n）ので、最後に置き換えた行は、増えた行数を足して求める
+        let grown = out.matches('\n').count() - t[start..end].matches('\n').count();
+        t.replace_range(start..end, &out);
+        *cursor = first_nonblank(t, nth_line(t, last + grown));
+        Ok(())
+    }
+}
+
+/// `delim` で区切る（`\` + `delim` は区切りにしない）
+fn split_unescaped(s: &str, delim: char) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(d) if d == delim => parts.last_mut().expect("一つはある").push(d),
+                Some(d) => {
+                    let p = parts.last_mut().expect("一つはある");
+                    p.push('\\');
+                    p.push(d);
+                }
+                None => parts.last_mut().expect("一つはある").push('\\'),
+            }
+        } else if c == delim {
+            parts.push(String::new());
+        } else {
+            parts.last_mut().expect("一つはある").push(c);
+        }
+    }
+    parts
+}
+
+/// Vim の置き換えの文字列を、regex クレートの置き換えの書き方にする
+fn vim_replacement(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '&' => out.push_str("${0}"),
+            '$' => out.push_str("$$"),
+            '\\' => match chars.next() {
+                Some(d @ '0'..='9') => out.push_str(&format!("${{{d}}}")),
+                Some('n' | 'r') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('&') => out.push('&'),
+                Some(d) => out.push(d),
+                None => out.push('\\'),
+            },
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn toggle_case(s: &str) -> String {
@@ -1567,6 +2300,12 @@ mod tests {
                 (Key::Backspace, 4)
             } else if rest.starts_with("<c-r>") {
                 (Key::CtrlR, 5)
+            } else if rest.starts_with("<c-o>") {
+                (Key::CtrlO, 5)
+            } else if rest.starts_with("<c-i>") {
+                (Key::CtrlI, 5)
+            } else if rest.starts_with("<c-v>") {
+                (Key::CtrlV, 5)
             } else {
                 let c = rest.chars().next().unwrap();
                 (Key::Char(c), c.len_utf8())
@@ -1693,6 +2432,84 @@ mod tests {
         assert_eq!(vim.selection("abc", 1), Some((0, 2)));
         let (_, vim) = run("|abc", "vl<esc>");
         assert_eq!(vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn registers() {
+        // 名前付きのレジスタは、無名のレジスタを上書きしても残る
+        assert_eq!(t("|one two", "\"ayiwwdiw\"ap"), "one on|e");
+        // 大文字は追加
+        assert_eq!(t("|ab cd", "\"ayl\"Aylw\"ap"), "ab ca|ad");
+        // 行単位の追加
+        assert_eq!(t("|a\nb", "\"ayyj\"Ayy\"ap"), "a\nb\n|a\nb");
+        // "_ は捨てる（無名のレジスタは変わらない）
+        assert_eq!(t("|ab cd", "yiww\"_diwP"), "aba|b ");
+        // "0 は最後のヤンク（消しても変わらない）
+        assert_eq!(t("|ab cd", "yiwwdiw\"0P"), "aba|b ");
+        // 消したものは無名のレジスタに入る
+        assert_eq!(t("|ab cd", "yiwwdiwP"), "abc|d ");
+    }
+
+    #[test]
+    fn macros() {
+        // 記録して再生する（挿入した文字も記録する）
+        assert_eq!(t("|a\nb\nc", "qqA;<esc>jq@q@@"), "a;\nb;\nc|;");
+        assert_eq!(t("|1 2 3 4", "qwxlq2@w"), "   |4");
+        let (_, vim) = run("|abc", "qa");
+        assert_eq!(vim.recording(), Some('a'));
+        let (_, vim) = run("|abc", "qaxq");
+        assert_eq!(vim.recording(), None);
+        // 記録の無いレジスタは、その文字列をキーとして使う
+        assert_eq!(t("|dw\nabc def", "\"ay$j@a"), "dw\n|def");
+    }
+
+    #[test]
+    fn marks_and_jumps() {
+        assert_eq!(t("a|bc\nd\nef", "majj`a"), "a|bc\nd\nef");
+        assert_eq!(t("  a|bc\nd\nef", "majj'a"), "  |abc\nd\nef");
+        assert_eq!(t("a|bc\nd\nef", "mbjjd'b"), "|");
+        // '' は最後のジャンプの前へ戻る
+        assert_eq!(t("a|b\nc\nd", "G''"), "|ab\nc\nd");
+        // ジャンプリスト
+        assert_eq!(t("|a\nb\nc", "G<c-o>"), "|a\nb\nc");
+        assert_eq!(t("|a\nb\nc", "G<c-o><c-i>"), "a\nb\n|c");
+        assert_eq!(t("|a\nb\nc\nd", "2GG<c-o><c-o>"), "|a\nb\nc\nd");
+        // 上で行を足すと、マークも下へずれる
+        assert_eq!(t("a\n|b", "maggOx<esc>`a"), "x\na\n|b");
+    }
+
+    #[test]
+    fn visual_block() {
+        assert_eq!(t("|abc\ndef\nghi", "<c-v>jld"), "|c\nf\nghi");
+        assert_eq!(t("|abc\ndef", "<c-v>jIX<esc>"), "|Xabc\nXdef");
+        assert_eq!(t("|ab\nc\nde", "<c-v>jjlA!<esc>"), "ab|!\nc !\nde!");
+        assert_eq!(t("|abc\ndef", "<c-v>jlrx"), "|xxc\nxxf");
+        assert_eq!(t("|abc\ndef", "<c-v>jlc-<esc>"), "|-c\n-f");
+        assert_eq!(t("|abc\ndef", "<c-v>jUl").replace('|', ""), "Abc\nDef");
+        // 矩形のヤンクと貼り付け
+        assert_eq!(t("|ab\ncd\n", "<c-v>jy$p"), "ab|a\ncdc\n");
+        let (_, vim) = run("|abc\ndef", "<c-v>jl");
+        assert_eq!(vim.mode, Mode::VisualBlock);
+        assert_eq!(vim.block_ranges("abc\ndef", 5), vec![(0, 2), (4, 6)]);
+    }
+
+    #[test]
+    fn substitute() {
+        assert_eq!(t("|foo foo\nfoo", ":s/foo/bar/<cr>"), "|bar foo\nfoo");
+        assert_eq!(t("|foo foo\nfoo", ":s/foo/bar/g<cr>"), "|bar bar\nfoo");
+        assert_eq!(t("|foo\nfoo\nfoo", ":%s/foo/x/<cr>"), "x\nx\n|x");
+        assert_eq!(t("|a\nb\nc\nd", ":2,3s/$/;/<cr>"), "a\nb;\n|c;\nd");
+        assert_eq!(t("|Foo", ":s/foo/x/i<cr>"), "|x");
+        // & と \1
+        assert_eq!(t("|ab12", ":s/(\\d+)/[\\1&]/<cr>"), "|ab[1212]");
+        // 区切りを変える・区切りを \ で入れる
+        assert_eq!(t("|a/b", ":s#/#-#<cr>"), "|a-b");
+        assert_eq!(t("|a/b", ":s/\\//-/<cr>"), "|a-b");
+        // ビジュアルモードの範囲
+        assert_eq!(t("a\n|b\nc\nd", "Vj:s/^/> /<cr>"), "a\n> b\n|> c\nd");
+        // 見つからなければ知らせる
+        let (_, fx) = feed(&mut Vim::default(), "|abc", ":s/z/y/<cr>");
+        assert!(matches!(fx.last().unwrap().cmd, Some(Cmd::Message(_))));
     }
 
     #[test]

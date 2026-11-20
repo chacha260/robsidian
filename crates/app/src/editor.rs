@@ -2,7 +2,7 @@
 
 use crate::fonts;
 use crate::highlight;
-use eframe::egui::text::{LayoutJob, TextFormat};
+use eframe::egui::text::{LayoutJob, LayoutSection, TextFormat};
 use eframe::egui::{Align, Color32, FontFamily, FontId, Stroke, Vec2};
 use robsidian_core::{parse, LinkKind};
 use std::ops::Range;
@@ -715,7 +715,17 @@ fn is_rule(trimmed: &str) -> bool {
     matches!(first, '-' | '*' | '_') && chars.clone().all(|c| c == first) && chars.count() >= 2
 }
 
+/// 本文全体を一度に組む（[`BlockCache::layout`] の結果と同じになることをテストで確かめる）
+#[cfg(test)]
 pub fn layout(text: &str, opt: &Options) -> Layout {
+    let mut out = layout_part(text, opt, true, 0);
+    paint_marks(&mut out.job, opt.marks, opt.current_mark, opt.colors);
+    out
+}
+
+/// 本文の一部（`line_base` 行目から）を組む。位置は `text` の先頭からの相対。
+/// `frontmatter` は、`text` が本文の先頭で frontmatter を持ちうるか。検索の一致の色は付けない。
+fn layout_part(text: &str, opt: &Options, frontmatter: bool, line_base: usize) -> Layout {
     let mut p = Painter {
         job: LayoutJob::default(),
         decos: Vec::new(),
@@ -728,7 +738,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         image: opt.image,
     };
     let size = opt.size;
-    let mut in_frontmatter = text.starts_with("---\n") || text.starts_with("---\r\n");
+    let mut in_frontmatter =
+        frontmatter && (text.starts_with("---\n") || text.starts_with("---\r\n"));
     let mut fence: Option<(u8, usize)> = None;
     // 処理中の表: (最後の行, 整形表示するか, 表の開始文字位置, 集めた行) と、その最初の行
     let mut table: Option<(usize, bool, usize, Vec<TableRow>)> = None;
@@ -971,8 +982,8 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
             } else if callout.is_none() && opt.live {
                 callout = callout_kind(line).map(|(kind, _)| {
                     // `[!種類]-` は閉じた状態、`+` は開いた状態で始まる折りたためるコールアウト
-                    let open =
-                        callout_fold(line).map(|default| (opt.callout_open)(n).unwrap_or(default));
+                    let open = callout_fold(line)
+                        .map(|default| (opt.callout_open)(line_base + n).unwrap_or(default));
                     let end = (n + 1..lines.len())
                         .take_while(|&k| content(lines[k]).trim_start().starts_with('>'))
                         .last()
@@ -1022,7 +1033,7 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
                     let fold = (first == n)
                         .then_some(open)
                         .flatten()
-                        .map(|_| (n, !collapsed));
+                        .map(|_| (line_base + n, !collapsed));
                     p.deco(
                         DecoKind::Callout {
                             color: accent,
@@ -1043,11 +1054,439 @@ pub fn layout(text: &str, opt: &Options) -> Layout {
         }
         p.push(eol, p.fmt(p.c.text));
     }
-    let mut job = p.job;
-    paint_marks(&mut job, opt.marks, opt.current_mark, opt.colors);
     Layout {
-        job,
+        job: p.job,
         decos: p.decos,
+    }
+}
+
+/// 長いノートの組版を速くするため、本文をブロック（ふつうは1行）に分けて組み、前回の組版のうち
+/// 変わったブロックだけを組み直して差し替える。カーソルが触れているブロックも組み直す
+/// （記法を見せる範囲が変わるので）。
+///
+/// 文字サイズ・テーマ・幅・画像の大きさなどが変わったら [`BlockCache::clear`] で捨てる。
+/// カーソルと検索の一致は、ここで扱う。
+#[derive(Default)]
+pub struct BlockCache {
+    /// 前回組んだ本文
+    text: String,
+    /// 組んだもの（検索の一致の色は付けていない）
+    job: LayoutJob,
+    decos: Vec<Deco>,
+    blocks: Vec<Block>,
+    /// 検索の一致の色を付けたもの（一致があるときだけ）
+    marked: Option<LayoutJob>,
+    /// 次に必ず組み直す
+    dirty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Block {
+    bytes: Range<usize>,
+    chars: Range<usize>,
+    line_base: usize,
+    /// ブロックの中でのカーソルの位置（触れていなければ None）
+    cursor: Option<(usize, usize)>,
+    /// 折りたためるコールアウトを含む（行番号が変わったら組み直す）
+    folds: bool,
+    /// 毎回組み直す（[`blocks`]）
+    volatile: bool,
+    /// `job.sections` と `decos` の中の、このブロックの分
+    sections: Range<usize>,
+    decos: Range<usize>,
+}
+
+/// 本文の `from` バイト目（`line0` 行目の先頭）からをブロックに分ける:
+/// (バイト範囲, 最初の行の番号, 毎回組み直すか)。ふつうは1行が1ブロック。
+/// `from` が 0 でなければ、ブロックの区切り（組版の状態が空の所）であること。
+/// 区切りの位置ごとに `stop(バイト位置, 行)` を呼び、true なら、そこで止めて区切りの位置を返す。
+///
+/// 組版（[`layout_part`]）が複数の行をまとめて扱うもの（frontmatter・コードブロック・表示数式・
+/// 表・コールアウトや引用）の途中では分けない。そのため [`layout_part`] と同じ順に行を見分けて、
+/// 状態を多めに見積もって追う（見積もりが外れても、ブロックが大きくなるだけ）。
+/// 閉じの無い `$$` の行は、後ろの行（ブロックの外）を書き換えると数式になりうるので、毎回組み直す。
+type Split = (Range<usize>, usize, bool);
+
+fn blocks(
+    text: &str,
+    from: usize,
+    line0: usize,
+    mut stop: impl FnMut(usize, usize) -> bool,
+) -> (Vec<Split>, Option<(usize, usize)>) {
+    let lines: Vec<&str> = text[from..].split_inclusive('\n').collect();
+    let mut out = Vec::new();
+    let mut start = from;
+    let mut first = line0;
+    let mut volatile = false;
+    let mut at = from;
+    let mut frontmatter = from == 0 && (text.starts_with("---\n") || text.starts_with("---\r\n"));
+    let mut fence: Option<(u8, usize)> = None;
+    // 表示数式の最後の行（組版では、最後の行を過ぎても次に数式の分岐に来る行までは残る）
+    let mut math: Option<usize> = None;
+    // コールアウト（引用）の中かもしれない
+    let mut callout = false;
+    // 前の行が `|` で始まる（表かどうかを、次の行で決める）
+    let mut prev_pipe = false;
+    for (n, raw) in lines.iter().enumerate() {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        if n > 0 && !frontmatter && fence.is_none() && math.is_none() && !callout && !prev_pipe {
+            out.push((start..at, first, volatile));
+            if stop(at, line0 + n) {
+                return (out, Some((at, line0 + n)));
+            }
+            start = at;
+            first = line0 + n;
+            volatile = false;
+        }
+        prev_pipe = trimmed.starts_with('|');
+        at += raw.len();
+        if frontmatter {
+            if n > 0 && matches!(line.trim_end(), "---" | "...") {
+                frontmatter = false;
+            }
+            continue;
+        }
+        // コードブロック
+        let marker = {
+            let b = trimmed.as_bytes();
+            b.first()
+                .filter(|&&c| c == b'`' || c == b'~')
+                .map(|&c| (c, b.iter().take_while(|&&x| x == c).count()))
+                .filter(|&(_, len)| len >= 3)
+        };
+        if fence.is_some() || marker.is_some() {
+            fence = match (fence, marker) {
+                (Some((oc, ol)), Some((c, l))) if c == oc && l >= ol => None,
+                (Some(f), _) => Some(f),
+                (None, m) => m,
+            };
+            continue;
+        }
+        // 見出し・水平線・画像や埋め込みだけの行は、数式・表・引用の分岐に来ない
+        let level = trimmed.bytes().take_while(|&c| c == b'#').count();
+        let heading = (1..=6).contains(&level)
+            && (trimmed.len() == level || trimmed[level..].starts_with(' '));
+        if heading || is_rule(trimmed) || image_only(line).is_some() || embed_only(line).is_some() {
+            continue;
+        }
+        // 表示数式。終わったと見積もった行が `$$` で始まるなら、組版ではそこで次の数式が
+        // 始まっているかもしれない（上で多めに飛ばした行で、組版の数式はもう終わっていることがある）
+        if let Some(end) = math {
+            if n < end {
+                continue;
+            }
+            math = None;
+            if !trimmed.starts_with("$$") {
+                continue;
+            }
+        }
+        if trimmed.starts_with("$$") {
+            match display_math(&lines, n) {
+                Some((end, _)) => {
+                    if n < end {
+                        math = Some(end);
+                    }
+                    continue;
+                }
+                None => volatile = true,
+            }
+        }
+        // 表は `|` の行が続く間（分けるかどうかは prev_pipe で決める）
+        if trimmed.starts_with('|') {
+            continue;
+        }
+        callout = trimmed.starts_with('>');
+    }
+    out.push((start..text.len(), first, volatile));
+    (out, None)
+}
+
+/// 先頭から同じバイト数
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    // 64バイトずつ比べてから、1バイトずつ
+    while i + 64 <= n && a[i..i + 64] == b[i..i + 64] {
+        i += 64;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// 末尾から同じバイト数（`max` まで）
+fn common_suffix(a: &[u8], b: &[u8], max: usize) -> usize {
+    let (la, lb) = (a.len(), b.len());
+    let mut i = 0;
+    while i + 64 <= max && a[la - i - 64..la - i] == b[lb - i - 64..lb - i] {
+        i += 64;
+    }
+    while i < max && a[la - i - 1] == b[lb - i - 1] {
+        i += 1;
+    }
+    i
+}
+
+impl Deco {
+    fn shift(&mut self, by: isize) {
+        let mv = |x: usize| (x as isize + by) as usize;
+        self.chars = mv(self.chars.start)..mv(self.chars.end);
+        match &mut self.kind {
+            DecoKind::Table(rows) => {
+                for r in rows {
+                    r.chars = mv(r.chars.start)..mv(r.chars.end);
+                }
+            }
+            DecoKind::Callout {
+                label: Some((_, at)),
+                ..
+            } => *at = mv(*at),
+            _ => {}
+        }
+    }
+}
+
+impl BlockCache {
+    /// 覚えている組版を捨てる
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 次の [`Self::update`] で、本文が同じでも組み直す（カーソルや検索の一致が変わったとき）
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    /// `text` を組み直す必要があるか
+    pub fn needs(&self, text: &str) -> bool {
+        self.dirty || self.text != text || (self.job.sections.is_empty() && !text.is_empty())
+    }
+
+    /// 組んだもの（検索の一致の色を含む）
+    pub fn job(&self) -> &LayoutJob {
+        self.marked.as_ref().unwrap_or(&self.job)
+    }
+
+    pub fn decos(&self) -> &[Deco] {
+        &self.decos
+    }
+
+    /// 本文全体を組んだもの（[`layout`] と同じ）にする。前回と同じブロックは組み直さない
+    pub fn update(&mut self, text: &str, opt: &Options) {
+        self.dirty = false;
+        let old = std::mem::take(&mut self.text);
+        let olds = std::mem::take(&mut self.blocks);
+        let prefix = common_prefix(old.as_bytes(), text.as_bytes());
+        let suffix = common_suffix(
+            old.as_bytes(),
+            text.as_bytes(),
+            old.len().min(text.len()) - prefix,
+        );
+        let delta = text.len() as isize - old.len() as isize;
+        let old_chars = olds.last().map_or(0, |b| b.chars.end);
+
+        // 1. ブロックの区切り。変わった所より前で終わるブロックと、変わった所より後ろで前回の区切りに
+        //    出会ってからのブロックは、前回の区切りを使う（区切りでは組版の状態が空なので、その後ろが同じなら
+        //    区切りも同じ）。閉じの無い `$$` を含むブロックと最後のブロックは、後ろ次第で変わりうるので区切り直す
+        let unchanged = !olds.is_empty() && old == text;
+        let keep = if unchanged {
+            olds.len()
+        } else {
+            olds.iter()
+                .position(|b| b.bytes.end > prefix || b.volatile)
+                .unwrap_or(olds.len())
+                .min(olds.len().saturating_sub(1))
+        };
+        let (from, line) = olds
+            .get(keep)
+            .map_or((0, 0), |b| (b.bytes.start, b.line_base));
+        let suffix_start = text.len() - suffix;
+        let mut synced: Option<usize> = None;
+        let (scanned, sync) = if unchanged {
+            (Vec::new(), None)
+        } else {
+            blocks(text, from, line, |pos, _| {
+                if pos < suffix_start || pos <= from {
+                    return false;
+                }
+                let old_pos = (pos as isize - delta) as usize;
+                let i = olds[keep..].partition_point(|b| b.bytes.start < old_pos) + keep;
+                let hit = olds.get(i).is_some_and(|b| b.bytes.start == old_pos);
+                if hit {
+                    synced = Some(i);
+                }
+                hit
+            })
+        };
+        // 区切り直した部分の後ろ（前回のブロック synced.. を動かして使う）
+        let tail_from = synced.unwrap_or(olds.len());
+        let line_delta = sync.map_or(0, |(_, l)| l as isize - olds[tail_from].line_base as isize);
+        let mut chars = olds.get(keep).map_or(0, |b| b.chars.start);
+        let scanned_from = chars;
+        let mut new: Vec<Block> = Vec::with_capacity(olds.len() + scanned.len());
+        new.extend(olds[..keep].iter().cloned());
+        for (bytes, line_base, volatile) in scanned {
+            let len = text[bytes.clone()].chars().count();
+            new.push(Block {
+                bytes,
+                chars: chars..chars + len,
+                line_base,
+                cursor: None,
+                folds: false,
+                volatile,
+                sections: 0..0,
+                decos: 0..0,
+            });
+            chars += len;
+        }
+        let old_scanned_chars =
+            olds.get(tail_from).map_or(old_chars, |b| b.chars.start) - scanned_from;
+        let char_delta = (chars - scanned_from) as isize - old_scanned_chars as isize;
+        let first_tail = new.len();
+        let mv = |x: usize, by: isize| (x as isize + by) as usize;
+        for o in &olds[tail_from..] {
+            let mut b = o.clone();
+            b.bytes = mv(o.bytes.start, delta)..mv(o.bytes.end, delta);
+            b.chars = mv(o.chars.start, char_delta)..mv(o.chars.end, char_delta);
+            b.line_base = mv(o.line_base, line_delta);
+            new.push(b);
+        }
+        // 前回のブロックとの対応（区切り直したブロックは無し）
+        let old_of = |i: usize| -> Option<usize> {
+            if i < keep {
+                Some(i)
+            } else if i >= first_tail {
+                Some(tail_from + i - first_tail)
+            } else {
+                None
+            }
+        };
+        for b in &mut new {
+            b.cursor = opt.cursor.and_then(|(x, y)| {
+                (x <= b.chars.end && b.chars.start <= y)
+                    .then(|| (x.saturating_sub(b.chars.start), y - b.chars.start))
+            });
+        }
+        // 2. 前回の組版をそのまま使えるか（カーソルの位置が同じで、折りたたみの行番号も変わらない）
+        let reusable = |i: usize, b: &Block| {
+            old_of(i).is_some_and(|j| {
+                let o = &olds[j];
+                !o.volatile && o.cursor == b.cursor && (!o.folds || o.line_base == b.line_base)
+            })
+        };
+        let dirty: Vec<usize> = (0..new.len()).filter(|&i| !reusable(i, &new[i])).collect();
+        // 組み直す範囲（新しいブロックの番号）。区切り直したブロックは必ず含める
+        let mut r0 = dirty.first().copied().unwrap_or(new.len()).min(keep);
+        let mut r1 = dirty.last().map_or(0, |&i| i + 1).max(first_tail);
+        if dirty.is_empty() && keep == first_tail {
+            // 区切りも組版も変わらない（本文の長さが変わらず、カーソルも変わらない）
+            r0 = keep;
+            r1 = keep;
+        }
+        // 前回のブロックでの範囲
+        let o0 = r0;
+        let o1 = if r1 >= first_tail {
+            tail_from + (r1 - first_tail)
+        } else {
+            r1
+        };
+        let sec_at = |j: usize| -> usize {
+            olds.get(j)
+                .map_or(self.job.sections.len(), |b| b.sections.start)
+        };
+        let deco_at =
+            |j: usize| -> usize { olds.get(j).map_or(self.decos.len(), |b| b.decos.start) };
+        let (sec_from, sec_to) = (sec_at(o0), sec_at(o1));
+        let (deco_from, deco_to) = (deco_at(o0), deco_at(o1));
+
+        let mut sections: Vec<LayoutSection> = Vec::new();
+        let mut decos: Vec<Deco> = Vec::new();
+        for (i, n) in new.iter_mut().enumerate().take(r1).skip(r0) {
+            let s0 = sec_from + sections.len();
+            let d0 = deco_from + decos.len();
+            match old_of(i).filter(|_| !dirty.contains(&i)) {
+                Some(j) => {
+                    let o = &olds[j];
+                    let shift = n.bytes.start as isize - o.bytes.start as isize;
+                    let cshift = n.chars.start as isize - o.chars.start as isize;
+                    for sec in &self.job.sections[o.sections.clone()] {
+                        let mut sec = sec.clone();
+                        sec.byte_range = mv(sec.byte_range.start.0, shift).into()
+                            ..mv(sec.byte_range.end.0, shift).into();
+                        sections.push(sec);
+                    }
+                    for d in &self.decos[o.decos.clone()] {
+                        let mut d = d.clone();
+                        d.shift(cshift);
+                        decos.push(d);
+                    }
+                }
+                None => {
+                    let sub = Options {
+                        cursor: n.cursor,
+                        ..*opt
+                    };
+                    let part = layout_part(
+                        &text[n.bytes.clone()],
+                        &sub,
+                        n.bytes.start == 0,
+                        n.line_base,
+                    );
+                    let off = n.bytes.start;
+                    sections.extend(part.job.sections.into_iter().map(|mut sec| {
+                        sec.byte_range = (sec.byte_range.start.0 + off).into()
+                            ..(sec.byte_range.end.0 + off).into();
+                        sec
+                    }));
+                    n.folds = part
+                        .decos
+                        .iter()
+                        .any(|d| matches!(d.kind, DecoKind::Callout { fold: Some(_), .. }));
+                    decos.extend(part.decos.into_iter().map(|mut d| {
+                        d.shift(n.chars.start as isize);
+                        d
+                    }));
+                }
+            }
+            n.sections = s0..sec_from + sections.len();
+            n.decos = d0..deco_from + decos.len();
+        }
+
+        // 3. 前回の組版の範囲を差し替え、後ろを動かす
+        let sec_shift = sections.len() as isize - (sec_to - sec_from) as isize;
+        let deco_shift = decos.len() as isize - (deco_to - deco_from) as isize;
+        let sec_after = sec_from + sections.len();
+        let deco_after = deco_from + decos.len();
+        self.job.sections.splice(sec_from..sec_to, sections);
+        self.decos.splice(deco_from..deco_to, decos);
+        if delta != 0 {
+            for sec in &mut self.job.sections[sec_after..] {
+                sec.byte_range = mv(sec.byte_range.start.0, delta).into()
+                    ..mv(sec.byte_range.end.0, delta).into();
+            }
+        }
+        if char_delta != 0 {
+            for d in &mut self.decos[deco_after..] {
+                d.shift(char_delta);
+            }
+        }
+        for n in &mut new[r1..] {
+            n.sections = mv(n.sections.start, sec_shift)..mv(n.sections.end, sec_shift);
+            n.decos = mv(n.decos.start, deco_shift)..mv(n.decos.end, deco_shift);
+        }
+        self.blocks = new;
+        self.job.text.clear();
+        self.job.text.push_str(text);
+        self.text = old;
+        self.text.clear();
+        self.text.push_str(text);
+        self.marked = (!opt.marks.is_empty()).then(|| {
+            let mut job = self.job.clone();
+            paint_marks(&mut job, opt.marks, opt.current_mark, opt.colors);
+            job
+        });
     }
 }
 
@@ -1247,6 +1686,166 @@ mod tests {
                 hide_frontmatter: false,
             },
         )
+    }
+
+    fn options_for_test<'a>(
+        colors: &'a Colors,
+        cursor: Option<(usize, usize)>,
+        callout_open: &'a dyn Fn(usize) -> Option<bool>,
+    ) -> Options<'a> {
+        Options {
+            marks: &[],
+            current_mark: None,
+            size: 14.0,
+            colors,
+            live: true,
+            cursor,
+            image: &|t: &str| (t == "pic.png").then_some(Vec2::new(100.0, 50.0)),
+            note_embed: &|_: &str| None,
+            callout_open,
+            math: &|tex: &str, display: bool| {
+                Some(Vec2::new(
+                    tex.len() as f32 * 7.0,
+                    if display { 40.0 } else { 18.0 },
+                ))
+            },
+            hide_frontmatter: true,
+        }
+    }
+
+    #[test]
+    fn block_cache_matches_full_layout() {
+        let doc = "---\na: b\n\nc: d\n---\n# 見出し\n\n本文 **太字** [[リンク]]\n続き\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\n$$\nx\n\ny\n$$\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> [!note]- 畳む\n> 中身\n\n> [!tip]\n> 本文\n\n- [ ] タスク\n- 項目\n\n---\n\n![[pic.png]]\n\n```\n閉じない\n\nコード";
+        // 空行を挟まずに書いたもの（表やコールアウトのすぐ後に本文、見出しの連続など）
+        let tight = "# 一\n## 二\n本文\n| a | b |\n|---|---|\n| 1 | 2 |\n続き\n> [!note]+ 開く\n> 中\n後\n> 引用\n- [x] 済\n```\nx\n```\n$$\nz\n$$\n終わり $y$ **b**\n";
+        for doc in [doc, tight] {
+            for live in [true, false] {
+                check_block_cache(doc, live);
+            }
+        }
+    }
+
+    fn check_block_cache(doc: &str, live: bool) {
+        let colors = Colors::new(true);
+        let folds = |line: usize| (line == 30 || line == 7).then_some(true);
+        let mut cache = BlockCache::default();
+        let mut text = doc.to_string();
+        let total = |t: &str| t.chars().count();
+        // 編集とカーソルの移動を繰り返して、毎回全体を組んだものと比べる
+        // (カーソル, 編集: (文字位置, そこの1文字と置き換える文字列))
+        type Step<'a> = (Option<(usize, usize)>, Option<(usize, &'a str)>);
+        let mut steps: Vec<Step> = vec![(None, None)];
+        for at in [0, 5, 12, 20, 40, 60, 80, 100, 120, 150] {
+            steps.push((Some((at, at)), None));
+            steps.push((Some((at, at + 3)), Some((at, "x\n\n"))));
+            steps.push((Some((at, at)), Some((at, ""))));
+        }
+        // 乱数（線形合同法）で、記法の文字を入れたり消したり、カーソルを飛ばしたりする
+        let pieces = [
+            "",
+            "a",
+            "\n",
+            "\n\n",
+            "```",
+            "~~~\n",
+            "| x |\n",
+            "|---|\n",
+            "> ",
+            "> [!tip]-\n",
+            "$$",
+            "$$\n",
+            "---\n",
+            "# ",
+            "- [ ] ",
+            "**",
+            "[[",
+            "]]",
+            "あ",
+            "\t",
+            "![[pic.png]]\n",
+            "```rust\n",
+            "$x$",
+            "***\n",
+        ];
+        let mut seed: u64 = 12345;
+        let mut rand = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n.max(1)
+        };
+        for _ in 0..400 {
+            let at = rand(doc.chars().count() + 20);
+            let cursor = match rand(4) {
+                0 => None,
+                1 => Some((at, at)),
+                _ => Some((at, at + rand(30))),
+            };
+            let edit =
+                (rand(3) > 0).then(|| (rand(doc.chars().count() + 20), pieces[rand(pieces.len())]));
+            steps.push((cursor, edit));
+        }
+        let mut prev = String::new();
+        let mut prev_cursor = None;
+        for (cursor, edit) in steps {
+            if let Some((at, insert)) = edit {
+                let n = total(&text);
+                if at < n {
+                    let b = byte_of_char(&text, at);
+                    let e = byte_of_char(&text, (at + 1).min(n));
+                    text.replace_range(b..e, insert);
+                }
+            }
+            let cursor = cursor.map(|(a, b)| (a.min(total(&text)), b.min(total(&text))));
+            let opt = Options {
+                live,
+                ..options_for_test(&colors, cursor, &folds)
+            };
+            let full = layout(&text, &opt);
+            cache.update(&text, &opt);
+            let fast = Layout {
+                job: cache.job().clone(),
+                decos: cache.decos().to_vec(),
+            };
+            assert_eq!(fast.job.text, full.job.text);
+            // ブロックの継ぎ目で同じ書式の区間が分かれていることがある（描いた結果は同じ）ので、つなげて比べる
+            let merged = |l: &Layout| {
+                let mut out: Vec<LayoutSection> = Vec::new();
+                for sec in &l.job.sections {
+                    match out.last_mut() {
+                        Some(last)
+                            if sec.leading_space == 0.0
+                                && last.format == sec.format
+                                && last.byte_range.end == sec.byte_range.start =>
+                        {
+                            last.byte_range.end = sec.byte_range.end;
+                        }
+                        _ => out.push(sec.clone()),
+                    }
+                }
+                out
+            };
+            let (a, b) = (merged(&fast), merged(&full));
+            if let Some(i) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) {
+                let show = |v: &[LayoutSection]| {
+                    v.get(i).map(|s| {
+                        format!(
+                            "{:?} {:?}",
+                            s.byte_range,
+                            &text[s.byte_range.start.0..s.byte_range.end.0],
+                        )
+                    })
+                };
+                panic!(
+                    "{cursor:?} {i}: {:?} != {:?}\nOLD {prev_cursor:?} {prev:?}\nNEW {text:?}",
+                    show(&a),
+                    show(&b)
+                );
+            }
+            assert_eq!(fast.decos, full.decos, "{cursor:?} {text:?}");
+            prev = text.clone();
+            prev_cursor = cursor;
+        }
     }
 
     const SAMPLE: &str = "---\na: b\n---\n# H\n- [ ] `c` [[l|別名]] **b** *i* ~~s~~ ==m== #tag [x](y)\n- item\n> quote\n---\n![[pic.png]]\n```\ncode\n```\n| a | b |\n|---|---|\n| 1 | x \\| y |\nsnake_case_name tail";

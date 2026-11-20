@@ -53,6 +53,11 @@ impl Vim {
                 }
                 return fx;
             }
+            // ジャンプリストと矩形選択は Vim 風のときだけ
+            Key::CtrlO | Key::CtrlI | Key::CtrlV => {
+                self.keys.clear();
+                return fx;
+            }
             Key::Char(_) => self.keys.push(key),
         }
         let chars: Vec<char> = self.pending().chars().collect();
@@ -173,7 +178,7 @@ impl Vim {
             }
             // ---- 選択への操作 ----
             'd' | 'c' => {
-                self.yank_text(&t[a..b], false, &mut fx);
+                self.yank_text(&t[a..b], false, false, &mut fx);
                 t.replace_range(a..b, "");
                 fx.changed = b > a;
                 self.mode = Mode::Normal;
@@ -185,7 +190,7 @@ impl Vim {
                 }
                 self.anchor = *cursor;
             }
-            'y' => self.yank_text(&t[a..b], false, &mut fx),
+            'y' => self.yank_text(&t[a..b], false, true, &mut fx),
             'p' | 'P' => {
                 let text = self.register.text.clone();
                 if !text.is_empty() {

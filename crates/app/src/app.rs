@@ -66,6 +66,8 @@ enum Command {
     Settings,
     ToggleVim,
     ToggleSplit,
+    SplitDown,
+    ClosePane,
     SwapPane,
     AddProperty,
     ToggleTheme,
@@ -122,8 +124,10 @@ impl Command {
             Command::FindPrev => "find previous match",
             Command::Settings => "settings preferences options config",
             Command::ToggleVim => "vim modal keybindings normal mode",
-            Command::ToggleSplit => "split pane side by side",
-            Command::SwapPane => "switch pane focus other",
+            Command::ToggleSplit => "split pane right side by side",
+            Command::SplitDown => "split pane down below vertical",
+            Command::ClosePane => "close pane unsplit",
+            Command::SwapPane => "switch pane focus next other",
             Command::AddProperty => "add property frontmatter metadata yaml",
             Command::OpenVault => "open vault folder",
             Command::ToggleTheme => "theme dark light",
@@ -197,7 +201,7 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::NextTab, "次のタブ", Some((CTRL, Key::Tab))),
     (
         Command::ToggleView,
-        "表示切替（編集 → 分割 → プレビュー）",
+        "表示モードの切り替え（ライブ → ソース → ソースとプレビュー → プレビュー）",
         Some((CTRL, Key::E)),
     ),
     (Command::ToggleGraph, "グラフビュー", Some((CTRL, Key::G))),
@@ -252,10 +256,12 @@ const COMMANDS: &[CommandEntry] = &[
     (Command::ToggleVim, "Vimキーバインドの切り替え", None),
     (
         Command::ToggleSplit,
-        "ペインを左右に分割 / 分割を閉じる",
+        "右に分割（ペインを左右に並べる）",
         None,
     ),
-    (Command::SwapPane, "もう一方のペインへ移る", None),
+    (Command::SplitDown, "下に分割（ペインを上下に並べる）", None),
+    (Command::ClosePane, "このペインを閉じる", None),
+    (Command::SwapPane, "次のペインへ移る", None),
     (Command::AddProperty, "プロパティを追加", None),
     (Command::OpenVault, "別のvaultを開く", Some((CTRL, Key::O))),
     (Command::ToggleTheme, "ダーク/ライト切替", None),
@@ -302,6 +308,9 @@ enum Action {
         from: String,
     },
     Activate(usize),
+    /// タブ（パス）を、そのペインの、そのタブの前（無ければ最後）に移す
+    MoveTab(String, usize, Option<String>),
+    ClosePane(usize),
     Close(usize),
     Search(String),
     Dialog(Dialog),
@@ -390,8 +399,11 @@ struct Tab {
     select: Option<std::ops::Range<usize>>,
     /// 最後に確認したカーソル位置（バイト）
     cursor: usize,
-    layout: editor::Layout,
     layout_key: Option<LayoutKey>,
+    /// ブロックごとの組版（変わったブロックだけ組み直す）と、それを組んだときの設定
+    /// （文字サイズ・テーマ・ライブ表示か・幅・テーマの版）
+    blocks: editor::BlockCache,
+    blocks_key: Option<(f32, bool, bool, u32, u64)>,
     /// 画像の読み込み待ちなどで、次の描画で組版をやり直す必要がある
     layout_stale: bool,
     preview: Option<(u64, u64, String)>,
@@ -421,7 +433,8 @@ impl Tab {
             place_cursor: None,
             select: None,
             cursor: 0,
-            layout: editor::Layout::default(),
+            blocks: editor::BlockCache::default(),
+            blocks_key: None,
             layout_key: None,
             layout_stale: false,
             preview: None,
@@ -647,14 +660,12 @@ pub struct App {
     /// 最後に当てたスタイル: (ダーク, 文字サイズ, テーマの世代)
     applied_style: Option<(bool, f32, u64)>,
     /// 最後に設定ファイルへ書いたタブ構成（変化したら書き直す）
-    saved_session: (Vec<String>, usize, Option<String>),
+    saved_session: (Vec<String>, usize, crate::panes::Panes),
     props_panel: PropsPanel,
-    /// 分割したもう一方のペインに表示しているノート
-    other: Option<String>,
-    /// フォーカスのあるペインが右側か（`active` が右のペインに出ている）
-    focus_right: bool,
+    /// ペインの分割と、ペインごとのタブ
+    panes: crate::panes::Panes,
     /// このフレームでクリックされた、フォーカスの無いペイン
-    pane_clicked: bool,
+    pane_clicked: Option<usize>,
     user_cmds: external::UserCommands,
     jobs: Vec<external::Job>,
     /// 実行の許可を待っているユーザーコマンド
@@ -741,11 +752,10 @@ impl App {
             rescan_at: None,
             toast: None,
             applied_style: None,
-            saved_session: (Vec::new(), 0, None),
+            saved_session: (Vec::new(), 0, crate::panes::Panes::default()),
             props_panel: PropsPanel::default(),
-            other: None,
-            focus_right: false,
-            pane_clicked: false,
+            panes: crate::panes::Panes::default(),
+            pane_clicked: None,
             user_cmds: Default::default(),
             jobs: Vec::new(),
             trust_prompt: None,
@@ -780,10 +790,16 @@ impl App {
                     app.open_note(&path, None);
                 }
                 app.active = active.min(app.tabs.len().saturating_sub(1));
-                // 分割の状態を戻す
-                let split = app.cfg.split.clone();
-                app.other = split.filter(|p| app.tabs.iter().any(|t| t.path == *p));
-                app.focus_right = app.cfg.split_focus_right && app.other.is_some();
+                // 分割の状態を戻す（前の版の設定なら、もう一方のペインのノートから作る）
+                let paths: Vec<String> = app.tabs.iter().map(|t| t.path.clone()).collect();
+                app.panes = app.cfg.panes.clone().unwrap_or_else(|| {
+                    crate::panes::Panes::from_legacy(
+                        &paths,
+                        app.cfg.split.as_deref(),
+                        app.cfg.split_focus_right,
+                    )
+                });
+                app.sync_panes();
             }
         }
         app
@@ -794,13 +810,13 @@ impl App {
         let session = (
             self.tabs.iter().map(|t| t.path.clone()).collect(),
             self.active,
-            self.other.clone(),
+            self.panes.clone(),
         );
         if session != self.saved_session {
             self.cfg.open_tabs.clone_from(&session.0);
             self.cfg.active_tab = session.1;
-            self.cfg.split.clone_from(&session.2);
-            self.cfg.split_focus_right = self.focus_right;
+            self.cfg.panes = Some(session.2.clone());
+            self.cfg.split = None;
             self.cfg.save();
             self.saved_session = session;
         }
@@ -1007,15 +1023,7 @@ impl App {
     }
 
     fn open_note(&mut self, path: &str, line: Option<usize>) {
-        if self.other.as_deref() == Some(path) {
-            // もう一方のペインに出ているノートなら、そのペインに移る
-            self.swap_panes();
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                tab.jump = line.or(tab.jump);
-                tab.focus = true;
-            }
-            return;
-        }
+        // ほかのペインに出ているノートなら、そのペインに移る（`active` の移動でフォーカスも移る）
         if self.vault.as_ref().is_some_and(|v| v.note(path).is_some()) {
             self.record_navigation(path);
             self.workspace.touch(path);
@@ -1395,11 +1403,8 @@ impl App {
                     .find(|p| vault.note(p).is_some() || vault.abs(p).is_dir())
                     .unwrap_or_else(|| new.to_string());
                 self.workspace.renamed(old, &new_path);
-                if let Some(other) = self.other.as_mut() {
-                    if let Some(moved) = workspace::moved_path(other, old, &new_path) {
-                        *other = moved;
-                    }
-                }
+                self.panes
+                    .rename(|p| workspace::moved_path(p, old, &new_path));
                 for (path, _) in self.nav_back.iter_mut().chain(self.nav_forward.iter_mut()) {
                     if let Some(moved) = workspace::moved_path(path, old, &new_path) {
                         *path = moved;
@@ -1488,10 +1493,12 @@ impl App {
             Command::Save => self.save_all(),
             Command::CloseTab => self.close_tab(self.active),
             Command::NextTab | Command::PrevTab => {
-                let n = self.tabs.len();
-                if n > 0 {
-                    let step = if cmd == Command::NextTab { 1 } else { n - 1 };
-                    self.active = (self.active + step) % n;
+                // 同じペインのタブを順に
+                let next = self
+                    .current()
+                    .and_then(|t| self.panes.cycle(&t.path, cmd == Command::NextTab));
+                if let Some(i) = next.and_then(|p| self.tabs.iter().position(|t| t.path == p)) {
+                    self.active = i;
                     self.show_graph = false;
                 }
             }
@@ -1563,11 +1570,15 @@ impl App {
             }
             Command::FindNext | Command::FindPrev => self.find_step(cmd == Command::FindNext),
             Command::Settings => self.settings = Some(SettingsView::new(&self.cfg)),
-            Command::ToggleSplit => self.toggle_split(),
+            Command::ToggleSplit => self.split_pane(crate::panes::Dir::Row),
+            Command::SplitDown => self.split_pane(crate::panes::Dir::Column),
+            Command::ClosePane => {
+                let id = self.panes.focused;
+                self.close_pane(id);
+            }
             Command::SwapPane => {
-                self.swap_panes();
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.focus = true;
+                if let Some(id) = self.panes.next_pane() {
+                    self.focus_pane(id);
                 }
             }
             Command::AddProperty => {
@@ -3015,6 +3026,7 @@ impl App {
             }
             vim::Cmd::Undo(_) | vim::Cmd::Redo(_) => {}
             vim::Cmd::Unknown(c) => self.toast(format!("未対応のコマンド: :{c}")),
+            vim::Cmd::Message(m) => self.toast(m),
         }
     }
 
@@ -3033,38 +3045,50 @@ impl App {
         });
     }
 
-    /// フォーカスのあるペインと、もう一方のペインを入れ替える。
-    fn swap_panes(&mut self) {
-        let Some(other) = self.other.clone() else {
-            return;
-        };
-        let Some(idx) = self.tabs.iter().position(|t| t.path == other) else {
-            self.other = None;
-            return;
-        };
-        self.other = self.tabs.get(self.active).map(|t| t.path.clone());
-        self.active = idx;
-        self.focus_right = !self.focus_right;
-        self.completion = None;
+    /// ペインの並びを、開いているタブとアクティブなタブに合わせる（毎回の描画の前）
+    fn sync_panes(&mut self) {
+        let open: Vec<String> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        let active = self.tabs.get(self.active).map(|t| t.path.clone());
+        self.panes.sync(&open, active.as_deref());
     }
 
-    /// ペインを分割する（分割中なら閉じる）。もう一方には、最近開いた別のノートを出す。
-    fn toggle_split(&mut self) {
-        if self.other.take().is_some() {
-            self.focus_right = false;
+    /// そのペインに移る（表示中のタブをアクティブにする）
+    fn focus_pane(&mut self, id: usize) {
+        let Some(path) = self.panes.current(id).map(str::to_string) else {
             return;
+        };
+        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
+            self.active = i;
+            self.tabs[i].focus = true;
+            self.panes.focused = id;
+            self.completion = None;
+            self.show_graph = false;
         }
+    }
+
+    /// フォーカスのあるペインを分ける。新しいペインには、最近開いた別のノートを出す
+    fn split_pane(&mut self, dir: crate::panes::Dir) {
         let Some(current) = self.current().map(|t| t.path.clone()) else {
             self.toast("ノートを開いてから分割してください");
             return;
         };
-        let candidate = self
-            .workspace
-            .recent
-            .iter()
-            .chain(self.tabs.iter().map(|t| &t.path))
-            .find(|p| **p != current && self.vault.as_ref().is_some_and(|v| v.note(p).is_some()))
-            .cloned();
+        // 同じペインにほかのタブがあれば、表示中のタブの次のものを移す。無ければ最近開いたノート
+        let in_pane = self.panes.cycle(&current, true).filter(|p| *p != current);
+        let candidate = in_pane.or_else(|| {
+            self.workspace
+                .recent
+                .iter()
+                .chain(self.tabs.iter().map(|t| &t.path))
+                .find(|p| {
+                    **p != current
+                        && self
+                            .panes
+                            .pane_of(p)
+                            .is_none_or(|id| self.panes.tabs(id).len() > 1)
+                        && self.vault.as_ref().is_some_and(|v| v.note(p).is_some())
+                })
+                .cloned()
+        });
         let Some(path) = candidate else {
             self.toast("分割して並べる、もう1つのノートを開いてください");
             return;
@@ -3074,43 +3098,245 @@ impl App {
                 self.tabs.push(Tab::new(path.clone(), note.text.clone()));
             }
         }
-        self.other = Some(path);
-        self.focus_right = false;
+        let id = self.panes.split(dir, &path);
+        self.focus_pane(id);
     }
 
-    /// 1つのペイン（見出しと本文）を描く。`show` が Some なら、フォーカスの無いペインとしてそのタブを描く。
-    fn pane_ui(&mut self, ui: &mut egui::Ui, show: Option<usize>, actions: &mut Vec<Action>) {
-        let idx = show.unwrap_or(self.active);
-        let Some(tab) = self.tabs.get(idx) else {
+    /// ペインを閉じる（タブは隣のペインに移す）
+    fn close_pane(&mut self, id: usize) {
+        if !self.panes.is_split() {
             return;
-        };
-        let focused = show.is_none();
-        let title = tab.title().to_string();
-        ui.horizontal(|ui| {
-            let text = if focused {
-                RichText::new(&title).strong()
-            } else {
-                RichText::new(&title).weak()
+        }
+        self.panes.close(id);
+        let to = self.panes.focused;
+        self.focus_pane(to);
+    }
+
+    /// タブの並び。ドラッグで並べ替えたり、ほかのペインへ移したりできる
+    fn tab_bar(&mut self, ui: &mut egui::Ui, pane: usize, actions: &mut Vec<Action>) {
+        #[derive(Clone)]
+        struct TabDrag(String);
+        let paths = self.panes.tabs(pane).to_vec();
+        let current = self.panes.current(pane).map(str::to_string);
+        let focused = pane == self.panes.focused;
+        let accent = ui.visuals().selection.stroke.color;
+        for path in &paths {
+            let Some(i) = self.tabs.iter().position(|t| &t.path == path) else {
+                continue;
             };
-            if ui.add(egui::Button::new(text).frame(false)).clicked() && !focused {
-                self.pane_clicked = true;
+            let tab = &self.tabs[i];
+            let selected = current.as_ref() == Some(path) && !(focused && self.show_graph);
+            let mark = if tab.dirty { " ●" } else { "" };
+            let title = format!("{}{mark}", tab.title());
+            let drag = ui.dnd_drag_source(
+                egui::Id::unique(("tab-drag", path)),
+                TabDrag(path.clone()),
+                |ui| {
+                    let text = if selected && !focused {
+                        RichText::new(title).weak()
+                    } else {
+                        RichText::new(title)
+                    };
+                    ui.selectable_label(selected, text).on_hover_text(path)
+                },
+            );
+            let label = drag.inner;
+            // ほかのタブをこのタブの上に落としたら、その前に移す
+            if let Some(dragged) = drag.response.dnd_hover_payload::<TabDrag>() {
+                if dragged.0 != *path {
+                    let r = drag.response.rect;
+                    ui.painter()
+                        .vline(r.left() - 2.0, r.y_range(), egui::Stroke::new(2.0, accent));
+                }
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("×").on_hover_text("分割を閉じる").clicked() {
-                    actions.push(Action::Run(Command::ToggleSplit));
+            if let Some(dragged) = drag.response.dnd_release_payload::<TabDrag>() {
+                actions.push(Action::MoveTab(dragged.0.clone(), pane, Some(path.clone())));
+            }
+            if label.clicked() {
+                actions.push(Action::Activate(i));
+            }
+            if label.middle_clicked() {
+                actions.push(Action::Close(i));
+            }
+            label.context_menu(|ui| {
+                if ui.button("閉じる").clicked() {
+                    actions.push(Action::Close(i));
+                }
+                if self.cfg.features.bookmarks && ui.button("ブックマークに追加 / 解除").clicked()
+                {
+                    actions.push(Action::ToggleBookmark(tab.path.clone()));
+                }
+                if self.cfg.features.file_recovery && ui.button("履歴…").clicked() {
+                    actions.push(Action::History(tab.path.clone()));
+                }
+                if ui.button("改名/移動…").clicked() {
+                    let d = Dialog::Rename {
+                        path: tab.path.clone(),
+                        new: tab.path.clone(),
+                    };
+                    actions.push(Action::Dialog(d));
                 }
             });
+            if selected
+                && ui
+                    .small_button("×")
+                    .on_hover_text("閉じる (Ctrl+W)")
+                    .clicked()
+            {
+                actions.push(Action::Close(i));
+            }
+        }
+        // 並びの後ろに落としたら、このペインの最後に移す
+        let rest = ui.available_size_before_wrap();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(rest.x.max(8.0), ui.spacing().interact_size.y),
+            egui::Sense::hover(),
+        );
+        if resp.dnd_hover_payload::<TabDrag>().is_some() {
+            ui.painter().vline(
+                rect.left() + 2.0,
+                rect.y_range(),
+                egui::Stroke::new(2.0, accent),
+            );
+        }
+        if let Some(dragged) = resp.dnd_release_payload::<TabDrag>() {
+            actions.push(Action::MoveTab(dragged.0.clone(), pane, None));
+        }
+    }
+
+    /// 分割の木を描く。`path` は木の中の位置（仕切りの大きさを変えるのに使う）
+    fn node_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &crate::panes::Node,
+        path: Vec<usize>,
+        actions: &mut Vec<Action>,
+    ) {
+        use crate::panes::{Dir, Node};
+        let Node::Split {
+            dir,
+            children,
+            sizes,
+        } = node
+        else {
+            if let Node::Pane(id) = node {
+                self.pane_ui(ui, *id, actions);
+            }
+            return;
+        };
+        let rect = ui.available_rect_before_wrap();
+        let gap = 8.0;
+        let n = children.len();
+        let row = *dir == Dir::Row;
+        let total = if row { rect.width() } else { rect.height() } - gap * (n - 1) as f32;
+        let mut at = if row { rect.left() } else { rect.top() };
+        let span = |a: f32, b: f32| {
+            if row {
+                egui::Rect::from_min_max(egui::pos2(a, rect.top()), egui::pos2(b, rect.bottom()))
+            } else {
+                egui::Rect::from_min_max(egui::pos2(rect.left(), a), egui::pos2(rect.right(), b))
+            }
+        };
+        for (i, child) in children.iter().enumerate() {
+            let len = (total * sizes.get(i).copied().unwrap_or(1.0 / n as f32)).max(40.0);
+            let child_rect = span(at, at + len);
+            let mut child_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(child_rect)
+                    .layout(Layout::top_down(Align::Min))
+                    .id_salt(("pane-node", path.clone(), i)),
+            );
+            child_ui.set_clip_rect(child_rect.intersect(ui.clip_rect()));
+            let mut child_path = path.clone();
+            child_path.push(i);
+            self.node_ui(&mut child_ui, child, child_path, actions);
+            at += len;
+            if i + 1 < n {
+                // 仕切り。ドラッグで両側の大きさを変える
+                let sep = span(at, at + gap);
+                let id = egui::Id::unique(("pane-sep", path.clone(), i));
+                let resp = ui.interact(sep, id, egui::Sense::drag());
+                let hot = resp.hovered() || resp.dragged();
+                if hot {
+                    ui.ctx().set_cursor_icon(if row {
+                        egui::CursorIcon::ResizeHorizontal
+                    } else {
+                        egui::CursorIcon::ResizeVertical
+                    });
+                }
+                let stroke = if hot {
+                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color)
+                } else {
+                    ui.visuals().widgets.noninteractive.bg_stroke
+                };
+                let mid = at + gap / 2.0;
+                if row {
+                    ui.painter().vline(mid, sep.y_range(), stroke);
+                } else {
+                    ui.painter().hline(sep.x_range(), mid, stroke);
+                }
+                if resp.dragged() && total > 0.0 {
+                    let d = if row {
+                        resp.drag_delta().x
+                    } else {
+                        resp.drag_delta().y
+                    };
+                    self.panes.resize(&path, i, d / total);
+                }
+                at += gap;
+            }
+        }
+        ui.allocate_rect(rect, egui::Sense::hover());
+    }
+
+    /// 1つのペイン（タブの並びと本文）を描く
+    fn pane_ui(&mut self, ui: &mut egui::Ui, id: usize, actions: &mut Vec<Action>) {
+        let focused = id == self.panes.focused;
+        let Some(idx) = self
+            .panes
+            .current(id)
+            .and_then(|p| self.tabs.iter().position(|t| t.path == p))
+        else {
+            return;
+        };
+        let rect = ui.max_rect();
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button("×")
+                    .on_hover_text("このペインを閉じる")
+                    .clicked()
+                {
+                    actions.push(Action::ClosePane(id));
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ScrollArea::horizontal()
+                        .id_salt(("pane-tabs", id))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| self.tab_bar(ui, id, actions));
+                        });
+                });
+            });
         });
+        // フォーカスのあるペインは、上に色の線を引く
+        if focused {
+            let top = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 2.0));
+            ui.painter()
+                .rect_filled(top, 0.0, ui.visuals().selection.stroke.color);
+        }
+        ui.separator();
         if !focused {
             // フォーカスの無いペインのエディタが、フォーカスを取らないようにする
-            if let Some(tab) = self.tabs.get_mut(idx) {
-                tab.focus = false;
-            }
+            self.tabs[idx].focus = false;
         }
         let saved = self.active;
         self.active = idx;
         self.view_ui(ui, actions);
         self.active = saved;
+        // フォーカスの無いペインの中を押したら、そちらに移る
+        if !focused && ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(rect) {
+            self.pane_clicked = Some(id);
+        }
     }
 
     /// 現在のタブ（`active`）を、表示モードに合わせて描く。
@@ -3129,18 +3355,25 @@ impl App {
     }
 
     fn close_tab(&mut self, idx: usize) {
-        if self.tabs.get(idx).map(|t| &t.path) == self.other.as_ref() {
-            self.other = None;
-            self.focus_right = false;
+        if idx >= self.tabs.len() {
+            return;
         }
-        if idx < self.tabs.len() {
-            self.save_tab(idx);
-            self.tabs.remove(idx);
-            if self.active > idx || self.active >= self.tabs.len() {
-                self.active = self.active.saturating_sub(1);
+        // アクティブなタブを閉じたら、同じペインの次のタブに移る
+        let path = self.tabs[idx].path.clone();
+        let next = (idx == self.active)
+            .then(|| self.panes.cycle(&path, true).filter(|p| *p != path))
+            .flatten();
+        self.save_tab(idx);
+        self.tabs.remove(idx);
+        match next.and_then(|p| self.tabs.iter().position(|t| t.path == p)) {
+            Some(i) => self.active = i,
+            None => {
+                if self.active > idx || self.active >= self.tabs.len() {
+                    self.active = self.active.saturating_sub(1);
+                }
             }
-            self.completion = None;
         }
+        self.completion = None;
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
@@ -3174,6 +3407,15 @@ impl App {
                 self.completion = None;
             }
             Action::Close(i) => self.close_tab(i),
+            Action::MoveTab(path, pane, before) => {
+                self.panes.move_tab(&path, pane, before.as_deref());
+                if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
+                    self.active = i;
+                    self.show_graph = false;
+                    self.completion = None;
+                }
+            }
+            Action::ClosePane(id) => self.close_pane(id),
             Action::Search(_) if !self.cfg.features.search => {
                 self.toast("検索は設定（コアプラグイン）でオフになっています");
             }
@@ -3243,7 +3485,8 @@ impl App {
                 if !cmd.enabled(&self.cfg.features) {
                     continue;
                 }
-                if vim_normal && cmd == Command::Daily {
+                // Ctrl+D（半画面移動）と Ctrl+O（ジャンプリスト）はエディタに渡す
+                if vim_normal && matches!(cmd, Command::Daily | Command::OpenVault) {
                     continue;
                 }
                 if let Some((mods, key)) = shortcut {
@@ -3324,7 +3567,14 @@ impl App {
             if self.cfg.vim {
                 let label = match &self.vim.cmdline {
                     Some(line) => format!(":{line}"),
-                    None => format!("-- {} -- {}", self.vim.mode_label(), self.vim.pending()),
+                    None => {
+                        let rec = self
+                            .vim
+                            .recording()
+                            .map(|r| format!(" 記録中 @{r}"))
+                            .unwrap_or_default();
+                        format!("-- {} --{rec} {}", self.vim.mode_label(), self.vim.pending())
+                    }
                 };
                 ui.label(RichText::new(label).monospace().strong());
             }
@@ -3404,6 +3654,8 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // 項目のあいだを広げて、区切りを見分けやすくする
+                ui.spacing_mut().item_spacing.x = 14.0;
                 if let Some(tab) = self.tabs.get(self.active) {
                     ui.weak(if tab.dirty {
                         "● 未保存"
@@ -4025,79 +4277,83 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        use crate::ribbon::{button as icon_button, Icon};
         ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.cfg.show_left, "一覧")
-                .on_hover_text("サイドバー (Ctrl+\\)")
-                .clicked()
+            let on = ui.visuals().selection.bg_fill;
+            if icon_button(
+                ui,
+                Icon::SidebarLeft,
+                24.0,
+                self.cfg.show_left.then_some(on),
+            )
+            .on_hover_text("左サイドバーの表示切替 (Ctrl+\\)")
+            .clicked()
             {
                 self.cfg.show_left = !self.cfg.show_left;
             }
-            let mode = self.cfg.view_mode;
-            if ui
-                .button(mode.label())
-                .on_hover_text("表示切替 (Ctrl+E)")
-                .clicked()
-            {
-                self.cfg.view_mode = mode.next();
-            }
-            if ui
-                .selectable_label(self.other.is_some(), "分割")
-                .on_hover_text("ペインを左右に分割（もう一度押すと閉じる）")
-                .clicked()
-            {
-                self.toggle_split();
-            }
+            let mut mode = self.cfg.view_mode;
+            egui::ComboBox::from_id_salt("view_mode")
+                .selected_text(mode.label())
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    for m in ViewMode::ALL {
+                        ui.selectable_value(&mut mode, m, m.label());
+                    }
+                })
+                .response
+                .on_hover_text("表示モード（Ctrl+E で順に切り替え）");
+            self.cfg.view_mode = mode;
+            let split = self.panes.is_split();
+            ui.menu_button("ペイン分割", |ui| {
+                if ui.button("右に分割").clicked() {
+                    actions.push(Action::Run(Command::ToggleSplit));
+                }
+                if ui.button("下に分割").clicked() {
+                    actions.push(Action::Run(Command::SplitDown));
+                }
+                if ui
+                    .add_enabled(split, egui::Button::new("このペインを閉じる"))
+                    .clicked()
+                {
+                    actions.push(Action::Run(Command::ClosePane));
+                }
+            })
+            .response
+            .on_hover_text("ペインを左右・上下に分ける。タブはドラッグで並べ替えたり、ほかのペインへ移したりできる");
             if self.cfg.features.graph
                 && ui
                     .selectable_label(self.show_graph, "グラフ")
-                    .on_hover_text("Ctrl+G")
+                    .on_hover_text("グラフビュー (Ctrl+G)")
                     .clicked()
             {
                 self.show_graph = !self.show_graph;
             }
             ui.separator();
-            ScrollArea::horizontal().id_salt("tabs").show(ui, |ui| {
-                for (i, tab) in self.tabs.iter().enumerate() {
-                    let selected = i == self.active && !self.show_graph;
-                    let mark = if tab.dirty { " ●" } else { "" };
-                    let label = ui
-                        .selectable_label(selected, format!("{}{mark}", tab.title()))
-                        .on_hover_text(&tab.path);
-                    if label.clicked() {
-                        actions.push(Action::Activate(i));
-                    }
-                    if label.middle_clicked() {
-                        actions.push(Action::Close(i));
-                    }
-                    label.context_menu(|ui| {
-                        if ui.button("閉じる").clicked() {
-                            actions.push(Action::Close(i));
-                        }
-                        if self.cfg.features.bookmarks
-                            && ui.button("ブックマークに追加 / 解除").clicked()
-                        {
-                            actions.push(Action::ToggleBookmark(tab.path.clone()));
-                        }
-                        if self.cfg.features.file_recovery && ui.button("履歴…").clicked() {
-                            actions.push(Action::History(tab.path.clone()));
-                        }
-                        if ui.button("改名/移動…").clicked() {
-                            let d = Dialog::Rename {
-                                path: tab.path.clone(),
-                                new: tab.path.clone(),
-                            };
-                            actions.push(Action::Dialog(d));
-                        }
+            // 右端に右サイドバーのボタンを置く分を残す。分割しているときは、タブはペインごとに出す
+            let tabs_width = (ui.available_width() - 32.0).max(0.0);
+            if !split {
+                let pane = self.panes.focused;
+                ScrollArea::horizontal()
+                    .id_salt("tabs")
+                    .max_width(tabs_width)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| self.tab_bar(ui, pane, actions));
                     });
-                    if selected
-                        && ui
-                            .small_button("×")
-                            .on_hover_text("閉じる (Ctrl+W)")
-                            .clicked()
-                    {
-                        actions.push(Action::Close(i));
-                    }
+            } else {
+                ui.add_space(tabs_width);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let on = ui.visuals().selection.bg_fill;
+                if icon_button(
+                    ui,
+                    Icon::SidebarRight,
+                    24.0,
+                    self.cfg.show_right.then_some(on),
+                )
+                .on_hover_text("右サイドバーの表示切替 (Ctrl+J)")
+                .clicked()
+                {
+                    self.cfg.show_right = !self.cfg.show_right;
                 }
             });
         });
@@ -4107,6 +4363,7 @@ impl App {
         if self.vault.is_none() {
             return self.welcome(ui, actions);
         }
+        self.sync_panes();
         {
             let _t = crate::profile::span("toolbar");
             self.toolbar(ui, actions);
@@ -4191,31 +4448,24 @@ impl App {
         if self.cfg.view_mode != ViewMode::Preview {
             self.find_bar(ui);
         }
-        let other = self
-            .other
-            .as_ref()
-            .and_then(|p| self.tabs.iter().position(|t| &t.path == p))
-            .filter(|&i| i != self.active);
-        let Some(other) = other else {
+        if !self.panes.is_split() {
             return self.view_ui(ui, actions);
-        };
-        // 左右に分けて、フォーカスのあるペインとフォーカスの無いペインを描く
-        self.pane_clicked = false;
-        let right_focused = self.focus_right;
-        ui.columns(2, |cols| {
-            let (left, right) = cols.split_at_mut(1);
-            let (focused_ui, other_ui) = if right_focused {
-                (&mut right[0], &mut left[0])
-            } else {
-                (&mut left[0], &mut right[0])
-            };
-            self.pane_ui(focused_ui, None, actions);
-            self.pane_ui(other_ui, Some(other), actions);
+        }
+        // 分割の木に沿って、ペインを並べて描く
+        self.pane_clicked = None;
+        let root = self.panes.root.clone();
+        self.node_ui(ui, &root, Vec::new(), actions);
+        // フォーカスの無いペインを押した、またはそのエディタにフォーカスが移ったら、そちらに移る
+        let focused = self.panes.focused;
+        let editor_focus = self.panes.order().into_iter().find(|&id| {
+            id != focused
+                && self
+                    .panes
+                    .current(id)
+                    .is_some_and(|p| ui.ctx().memory(|m| m.has_focus(editor_id(p))))
         });
-        // フォーカスの無いペインのエディタをクリックしたら、そちらに移る
-        let other_path = self.tabs[other].path.clone();
-        if self.pane_clicked || ui.ctx().memory(|m| m.has_focus(editor_id(&other_path))) {
-            self.swap_panes();
+        if let Some(id) = self.pane_clicked.or(editor_focus) {
+            self.focus_pane(id);
         }
     }
 
@@ -4605,14 +4855,20 @@ impl App {
             h.finish()
         };
         let key: LayoutKey = (size, cfg.dark, live, cursor, max_width as u32, marks_key);
+        // カーソルと検索の一致のほかが変わったら、ブロックごとの組版も捨てる
+        let blocks_key = (size, cfg.dark, live, max_width as u32, theme.generation);
+        if tab.blocks_key != Some(blocks_key) || tab.layout_stale {
+            tab.blocks_key = Some(blocks_key);
+            tab.blocks.clear();
+        }
         if tab.layout_key != Some(key) || tab.layout_stale {
             tab.layout_key = Some(key);
-            tab.layout = editor::Layout::default();
+            tab.blocks.invalidate();
         }
-        let Tab { text, layout, .. } = tab;
+        let Tab { text, blocks, .. } = tab;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             let _t = crate::profile::span("editor.layouter");
-            if layout.job.text != buf.as_str() || layout.job.sections.is_empty() {
+            if blocks.needs(buf.as_str()) {
                 let _t = crate::profile::span("editor.decorate");
                 let math_size = |tex: &str, display: bool| {
                     let b = math_view::layout(
@@ -4640,11 +4896,11 @@ impl App {
                     marks,
                     current_mark,
                 };
-                *layout = editor::layout(buf.as_str(), &options);
+                blocks.update(buf.as_str(), &options);
             }
             // 組み立て済みの文は egui が段落ごとに覚えている。毎回 egui に頼むこと
             // （頼まない描画があると、egui は使われなかった段落を捨て、次の編集で全体を組み直すことになる）
-            let mut job = layout.job.clone();
+            let mut job = blocks.job().clone();
             job.wrap.max_width = wrap_width;
             let _t = crate::profile::span("editor.galley");
             ui.fonts_mut(|f| f.layout_job(job))
@@ -4754,7 +5010,7 @@ impl App {
         let mut toggle = None;
         let mut fold_toggle = None;
         let _deco_t = crate::profile::span("editor.paint_decos");
-        for deco in &tab.layout.decos {
+        for deco in tab.blocks.decos() {
             let (a, b) = (row(deco.chars.start), row(deco.chars.end));
             if b.bottom() < clip.top() || a.top() > clip.bottom() {
                 continue;
@@ -5226,6 +5482,28 @@ impl App {
             };
             let rect = egui::Rect::from_min_size(here.left_top(), egui::vec2(width, here.height()));
             painter.rect_filled(rect, 1.0, colors.accent.gamma_multiply(0.45));
+            // 矩形選択（エディタの選択では表せないので、行ごとに塗る）
+            let blocks = vim_state.block_ranges(&tab.text, tab.cursor);
+            let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.6);
+            let (mut last_byte, mut last_char) = (0, 0);
+            for (a, b) in blocks {
+                let ca = last_char + tab.text[last_byte..a].chars().count();
+                let cb = ca + tab.text[a..b].chars().count();
+                (last_byte, last_char) = (b, cb);
+                for ch in ca..cb {
+                    let (here, after) = (row(ch), row(ch + 1));
+                    let width = if (after.top() - here.top()).abs() > 1.0 {
+                        size * 0.55
+                    } else {
+                        (after.left() - here.left()).max(2.0)
+                    };
+                    let rect = egui::Rect::from_min_size(
+                        here.left_top(),
+                        egui::vec2(width, here.height()),
+                    );
+                    painter.rect_filled(rect, 0.0, fill);
+                }
+            }
         }
         if let Some((ch, _next)) = toggle {
             let byte = editor::byte_of_char(&tab.text, ch);
@@ -6119,17 +6397,19 @@ impl App {
         };
         self.save_all();
         self.tabs.clear();
-        self.other = None;
+        self.panes = crate::panes::Panes::default();
         for path in &layout.tabs {
             if self.vault.as_ref().is_some_and(|v| v.note(path).is_some()) {
                 self.open_note(path, None);
             }
         }
         self.active = layout.active.min(self.tabs.len().saturating_sub(1));
-        self.other = layout
-            .split
-            .filter(|p| self.tabs.iter().any(|t| t.path == *p));
-        self.focus_right = layout.focus_right && self.other.is_some();
+        // 分割の配置を戻す（前の版で保存したものは、もう一方のペインのノートから作る）
+        let paths: Vec<String> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        self.panes = layout.panes.clone().unwrap_or_else(|| {
+            crate::panes::Panes::from_legacy(&paths, layout.split.as_deref(), layout.focus_right)
+        });
+        self.sync_panes();
         self.show_graph = false;
         self.toast(format!("ワークスペース「{name}」を開きました"));
     }
@@ -6290,8 +6570,9 @@ impl App {
                 let layout = workspace::Layout {
                     tabs: self.tabs.iter().map(|t| t.path.clone()).collect(),
                     active: self.active,
-                    split: self.other.clone(),
-                    focus_right: self.focus_right,
+                    split: None,
+                    focus_right: false,
+                    panes: Some(self.panes.clone()),
                 };
                 self.workspace.layouts.insert(name.clone(), layout);
                 self.save_workspace();
@@ -6494,6 +6775,8 @@ fn vim_keys(event: &egui::Event) -> Option<Vec<vim::Key>> {
                 .collect(),
         ),
         Event::Ime(_) => Some(Vec::new()),
+        // Ctrl+V は貼り付けとして届く（クリップボードが空なら届かないので、Ctrl+Q も使える）
+        Event::Paste(_) | Event::PasteImage(_) => Some(vec![vim::Key::CtrlV]),
         Event::Key {
             key,
             pressed: true,
@@ -6508,6 +6791,10 @@ fn vim_keys(event: &egui::Event) -> Option<Vec<vim::Key>> {
             (Key::D, m) if m.command_only() => Some(vec![vim::Key::CtrlD]),
             (Key::U, m) if m.command_only() => Some(vec![vim::Key::CtrlU]),
             (Key::OpenBracket, m) if m.command_only() => Some(vec![vim::Key::Esc]),
+            (Key::O, m) if m.command_only() => Some(vec![vim::Key::CtrlO]),
+            (Key::I, m) if m.command_only() => Some(vec![vim::Key::CtrlI]),
+            (Key::Tab, m) if m.is_none() => Some(vec![vim::Key::CtrlI]),
+            (Key::Q, m) if m.command_only() => Some(vec![vim::Key::CtrlV]),
             _ => None,
         },
         _ => None,

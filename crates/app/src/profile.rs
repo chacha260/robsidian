@@ -1,4 +1,5 @@
 //! 開発用の時間の計測。環境変数 `ROBSIDIAN_PROFILE=1` のときだけ、時間の掛かった描画の内訳を標準エラーに出す。
+//! `ROBSIDIAN_PROFILE=0.5` のように数を渡すと、それ（ミリ秒）を超えた描画を出す（すべて見たいときは `0.01` など）。
 //!
 //! ```ignore
 //! let _t = profile::span("editor.layout");   // この行からブロックの終わりまでを測る
@@ -8,9 +9,22 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// 計測するか。するなら、出す描画の時間の下限（環境変数で数を渡したとき）
+fn setting() -> Option<Option<Duration>> {
+    static ON: OnceLock<Option<Option<Duration>>> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("ROBSIDIAN_PROFILE").ok()?;
+        if v == "0" {
+            return None;
+        }
+        // 「1」は有効にするだけ（下限は呼ぶ側の既定）
+        let ms = v.parse::<f64>().ok().filter(|&ms| ms > 0.0 && v != "1");
+        Some(ms.map(|ms| Duration::from_secs_f64(ms / 1000.0)))
+    })
+}
+
 fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ROBSIDIAN_PROFILE").is_some_and(|v| v != "0"))
+    setting().is_some()
 }
 
 thread_local! {
@@ -52,9 +66,10 @@ impl Drop for Span {
 
 /// 1回の描画の終わりに呼ぶ。全体が `threshold` を超えたら内訳を出す
 pub fn frame_end(total: Duration, threshold: Duration) {
-    if !enabled() {
+    let Some(limit) = setting() else {
         return;
-    }
+    };
+    let threshold = limit.unwrap_or(threshold);
     let spans = SPANS.with(|s| std::mem::take(&mut *s.borrow_mut()));
     if total < threshold {
         return;
